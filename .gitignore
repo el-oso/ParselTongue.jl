@@ -1,0 +1,17 @@
+# Build artifacts
+/dist/
+**/build/
+*.so
+*.o
+*.a
+img.a*
+
+# Julia
+Manifest.toml
+
+# Python
+__pycache__/
+*.pyc
+
+# Spike scratch binary (keep the .c/.jl sources)
+/spike/ctest
