@@ -1,7 +1,9 @@
 using Test
 using ParselTongue
-using ParselTongue: assert_boundary, is_boundary_type, c_abi_type, from_c, to_c,
-                    PtExport, PtBuffer, emit_ccallable, emit_entry, _EXPORTS, clear_exports!
+using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
+                    c_abi_type, from_c, to_c, Mut,
+                    PtExport, PtArray, emit_ccallable, emit_entry, emit_cshim,
+                    _EXPORTS, clear_exports!, _default_py_name, submodule_names
 
 @testset "boundary scalar impls" begin
     @test c_abi_type(Int64) === Int64
@@ -76,18 +78,30 @@ end
     Libc.free(reinterpret(Ptr{Cvoid}, cs))   # to_c malloc's; free it
 end
 
-@testset "1-D array boundary (M4)" begin
+@testset "array boundary (1-D and N-D, dual policy)" begin
     @test is_boundary_type(Vector{Float64})
-    @test is_boundary_type(Vector{Int64})
-    @test !is_boundary_type(Vector{String})        # non-numeric eltype
-    @test c_abi_type(Vector{Float64}) === PtBuffer{Float64}
+    @test is_boundary_type(Matrix{Float64})            # N-D
+    @test is_boundary_type(AbstractMatrix{Float64})    # logical policy
+    @test is_boundary_type(Vector{ComplexF64})         # complex elements
+    @test !is_boundary_type(Vector{String})            # non-numeric eltype
+    @test c_abi_type(Vector{Float64})  === PtArray{Float64,1}
+    @test c_abi_type(Matrix{Float64})  === PtArray{Float64,2}
+    @test c_abi_type(AbstractMatrix{Float64}) === PtArray{Float64,2}
+
     v = [1.0, 2.0, 3.0]
     b = to_c(v)
-    @test b isa PtBuffer{Float64}
-    @test b.len == 3
-    back = from_c(Vector{Float64}, b)
-    @test back == v
+    @test b isa PtArray{Float64,1}
+    @test b.shape == (3,)
+    @test from_c(Vector{Float64}, b) == v
     Libc.free(Ptr{Cvoid}(b.data))
+
+    # round-trip a 2-D array (returns are column-major / order=1)
+    M = [1.0 2.0; 3.0 4.0]
+    c2 = to_c(M)
+    @test c2 isa PtArray{Float64,2}
+    @test c2.shape == (2, 2) && c2.order == one(Cint)
+    @test from_c(Matrix{Float64}, c2) == M     # F-order in -> natural dense
+    Libc.free(Ptr{Cvoid}(c2.data))
 end
 
 @testset "emit_cshim handles scalars, strings, arrays" begin
@@ -99,7 +113,7 @@ end
     @test occursin("PyInit_demo", c)
     @test occursin("PyArg_ParseTuple", c)
     @test occursin("PyObject_GetBuffer", c)          # array arg
-    @test occursin("typedef struct {", c)            # PtBuffer carrier struct
+    @test occursin("typedef struct {", c)            # PtArray carrier struct
     @test occursin("frombuffer", c)                  # numpy-at-runtime return
     @test occursin("PyUnicode_FromString", c)        # string return
 end
@@ -114,4 +128,66 @@ end
     @test occursin("include(", entry)
     @test occursin("pt_add", entry)
     @test Meta.parseall(entry) isa Expr
+end
+
+# ── Scientific-computing type expansion (Phases A–F) ──────────────────
+
+@testset "complex boundary type" begin
+    @test is_boundary_type(ComplexF64) && is_boundary_type(ComplexF32)
+    @test c_abi_type(ComplexF64) === ComplexF64
+    @test to_c(1.0 + 2.0im) === 1.0 + 2.0im
+    @test is_boundary_type(Vector{ComplexF64})        # complex array elements
+    @test c_abi_type(Vector{ComplexF64}) === PtArray{ComplexF64,1}
+end
+
+@testset "void (Nothing) returns" begin
+    @test assert_ret_boundary(Nothing) === Cvoid
+    clear_exports!()
+    @pyfunc noop(n::Int64)::Nothing = nothing
+    src = emit_ccallable(_EXPORTS[1])
+    @test occursin("::Cvoid", src) && !occursin("to_c", src)
+end
+
+@testset "N-D dual policy carriers" begin
+    @test c_abi_type(Matrix{Float64})         === PtArray{Float64,2}
+    @test c_abi_type(AbstractMatrix{Float64}) === PtArray{Float64,2}
+    @test c_abi_type(Array{Float32,3})        === PtArray{Float32,3}
+    # logical view returns NumPy-shape indexing; dense returns reversed dims (C-order)
+    M = [1.0 2.0 3.0; 4.0 5.0 6.0]            # 2x3 column-major
+    c = to_c(M); @test c.shape == (2,3) && c.order == one(Cint)
+    Libc.free(Ptr{Cvoid}(c.data))
+end
+
+@testset "Mut peels to inner type + flags mutable" begin
+    clear_exports!()
+    @pyfunc scale!(x::Mut{Vector{Float64}}, k::Float64)::Nothing = (x .*= k; nothing)
+    e = _EXPORTS[1]
+    @test e.export_name == "scale"              # `!` sanitized
+    @test e.args[1].jl_type === Vector{Float64} # Mut peeled
+    @test e.args[1].mutable == true
+    v = [1.0, 2.0]; scale!(v, 3.0); @test v == [3.0, 6.0]   # still a real Julia fn
+end
+
+@testset "tuple returns" begin
+    @test c_abi_type(Tuple{Int64,Float64}) === Tuple{Int64,Float64}
+    @test assert_ret_boundary(Tuple{Float64,Vector{Float64}}) isa Type
+    clear_exports!()
+    @pyfunc mm(v::Vector{Float64})::Tuple{Float64,Float64} = (minimum(v), maximum(v))
+    c = emit_cshim("demo", _EXPORTS)
+    @test occursin("PtTuple", c) && occursin("PyTuple_Pack", c)
+end
+
+@testset "submodule namespacing + name sanitizing" begin
+    @test _default_py_name("scale!") == "scale"
+    @test _default_py_name("a!b?") == "a_b_"
+    clear_exports!()
+    @pymodule pkg.linalg begin
+        @pyfunc solve(a::Int64)::Int64 = a
+    end
+    @pymodule pkg.stats begin
+        @pyfunc mean(a::Float64)::Float64 = a
+    end
+    @test ParselTongue._MODULE_NAME[] == "pkg"
+    @test Set(submodule_names(_EXPORTS)) == Set(["linalg", "stats"])
+    @test _EXPORTS[findfirst(e -> e.export_name == "solve", _EXPORTS)].submodule == "linalg"
 end

@@ -53,6 +53,36 @@ const _CSCALARS = Dict{Type,CScalar}(
 
 isscalar(@nospecialize(C::Type)) = haskey(_CSCALARS, C)
 
+# ── Complex carriers ──────────────────────────────────────────────────
+# `Complex{T}` maps to a small `{re; im;}` C struct passed/returned by value.
+
+struct CComplex
+    cname::String   # C struct typedef name
+    celt::String    # element C type (float / double)
+    np::String      # numpy dtype
+end
+
+const _CCOMPLEX = Dict{Type,CComplex}(
+    ComplexF32 => CComplex("pt_cf32", "float",  "c8"),
+    ComplexF64 => CComplex("pt_cf64", "double", "c16"),
+)
+
+iscomplex(@nospecialize(C::Type)) = haskey(_CCOMPLEX, C)
+
+# Emit the complex struct typedefs that `exports` actually use (as scalar carriers
+# or as array element types). Must precede array structs, which reference them.
+function _complex_structs(exports::AbstractVector{PtExport})
+    used = Set{Type}()
+    for C in _all_carriers(exports)
+        iscomplex(C) && push!(used, C)
+        isarray(C) && C.parameters[1] in (ComplexF32, ComplexF64) && push!(used, C.parameters[1])
+    end
+    out = String[]
+    ComplexF32 in used && push!(out, "typedef struct { float re, im; } pt_cf32;")
+    ComplexF64 in used && push!(out, "typedef struct { double re, im; } pt_cf64;")
+    return out
+end
+
 # ── Array element info (carrier PtBuffer{T}) ──────────────────────────
 
 struct EltInfo
@@ -72,68 +102,177 @@ const _ELTINFO = Dict{Type,EltInfo}(
     UInt64  => EltInfo("uint64_t", "u8", "u64"),
     Float32 => EltInfo("float",    "f4", "f32"),
     Float64 => EltInfo("double",   "f8", "f64"),
+    ComplexF32 => EltInfo("pt_cf32", "c8",  "c8"),
+    ComplexF64 => EltInfo("pt_cf64", "c16", "c16"),
 )
 
-isarray(@nospecialize(C::Type)) = C isa DataType && C.name === PtBuffer.body.name
-_elt(@nospecialize(C::Type)) = _ELTINFO[C.parameters[1]]
-_structname(@nospecialize(C::Type)) = string("PtBuffer_", _elt(C).tag)
+isarray(@nospecialize(C::Type)) = C isa DataType && C.name === PtArray.body.body.name
+_elt(@nospecialize(C::Type)) = _ELTINFO[C.parameters[1]]      # T from PtArray{T,N}
+_ndims(@nospecialize(C::Type)) = C.parameters[2]::Int         # N from PtArray{T,N}
+_structname(@nospecialize(C::Type)) = string("PtArray_", _elt(C).tag, "_", _ndims(C))
+
+# ── Tuple carriers (Python tuple returns) ─────────────────────────────
+istuple(@nospecialize(C::Type)) = C isa DataType && C <: Tuple
+
+# A short, C-identifier-safe tag per carrier, used to name the tuple struct.
+function _carrier_tag(@nospecialize(C::Type))
+    isscalar(C) && return replace(_CSCALARS[C].ctype, r"[^A-Za-z0-9]" => "")
+    iscomplex(C) && return _CCOMPLEX[C].cname
+    C === Cstring && return "str"
+    isarray(C) && return _structname(C)
+    istuple(C) && return string("T", join((_carrier_tag(S) for S in fieldtypes(C)), ""))
+    return "x"
+end
+_tuple_structname(@nospecialize(C::Type)) =
+    string("PtTuple_", join((_carrier_tag(S) for S in fieldtypes(C)), "_"))
+
+# All carrier types used by `exports`, recursing into tuple fields.
+function _collect_carriers!(set::Set{Type}, @nospecialize(C::Type))
+    push!(set, C)
+    if istuple(C)
+        for S in fieldtypes(C); _collect_carriers!(set, S); end
+    end
+    return set
+end
+function _all_carriers(exports::AbstractVector{PtExport})
+    set = Set{Type}()
+    for e in exports
+        _collect_carriers!(set, c_abi_type(e.ret))
+        for a in e.args; _collect_carriers!(set, c_abi_type(a.jl_type)); end
+    end
+    return set
+end
 
 # ── Per-carrier C type / arg / return ─────────────────────────────────
 
 function _c_ctype(@nospecialize(C::Type))
+    C === Cvoid && return "void"
     isscalar(C) && return _CSCALARS[C].ctype
+    iscomplex(C) && return _CCOMPLEX[C].cname
     C === Cstring && return "char *"
     isarray(C) && return _structname(C)
+    istuple(C) && return _tuple_structname(C)
     error("ParselTongue: no C type for carrier `$C`.")
 end
 
-function _arg_plan(@nospecialize(C::Type), i::Int)
+function _arg_plan(@nospecialize(C::Type), i::Int; logical::Bool=false, mutable::Bool=false)
     tmp = string("a", i)
     if isscalar(C)
         cs = _CSCALARS[C]
         return ArgPlan([string(cs.tmptype, " ", tmp, ";")], cs.fmt, [string("&", tmp)],
                        string("(", cs.ctype, ")", tmp))
+    elseif iscomplex(C)
+        cc = _CCOMPLEX[C]; pc = string(tmp, "_pc")
+        decls = [string("Py_complex ", pc, ";"), string(cc.cname, " ", tmp, ";")]
+        setup = [string(tmp, ".re = (", cc.celt, ")", pc, ".real;"),
+                 string(tmp, ".im = (", cc.celt, ")", pc, ".imag;")]
+        return ArgPlan(decls, "D", [string("&", pc)], setup, tmp, String[])
     elseif C === Cstring
         return ArgPlan([string("const char *", tmp, ";")], "s", [string("&", tmp)],
                        string("(char *)", tmp))
     elseif isarray(C)
-        e = _elt(C); sn = _structname(C); obj = string(tmp, "_obj"); buf = string(tmp, "_buf")
+        e = _elt(C); sn = _structname(C); n = _ndims(C)
+        obj = string(tmp, "_obj"); buf = string(tmp, "_buf")
         decls = [string("PyObject *", obj, ";"), string("Py_buffer ", buf, ";"),
                  string(sn, " ", tmp, ";")]
-        setup = [
-            string("if (PyObject_GetBuffer(", obj, ", &", buf, ", PyBUF_CONTIG_RO) != 0) return NULL;"),
-            string("if (", buf, ".itemsize != (Py_ssize_t)sizeof(", e.ctype, ") || ", buf, ".ndim > 1) {"),
+        bufflags = mutable ? "PyBUF_STRIDES | PyBUF_FORMAT | PyBUF_WRITABLE" :
+                             "PyBUF_STRIDES | PyBUF_FORMAT"
+        setup = String[
+            string("if (PyObject_GetBuffer(", obj, ", &", buf, ", ", bufflags, ") != 0) return NULL;"),
+            string("if (", buf, ".ndim != ", n, " || ", buf,
+                   ".itemsize != (Py_ssize_t)sizeof(", e.ctype, ")) {"),
             string("    PyBuffer_Release(&", buf, ");"),
-            string("    PyErr_SetString(PyExc_TypeError, \"expected a 1-D ", e.np, " buffer\"); return NULL;"),
+            string("    PyErr_SetString(PyExc_TypeError, \"expected a ", n, "-D ", e.np,
+                   " array\"); return NULL;"),
             "}",
-            string(tmp, ".data = (", e.ctype, " *)", buf, ".buf;"),
-            string(tmp, ".len = (int64_t)(", buf, ".len / (Py_ssize_t)sizeof(", e.ctype, "));"),
         ]
+        if logical
+            # Logical (AbstractArray) policy: C-contiguous only, order always 0.
+            append!(setup, [
+                string("if (!PyBuffer_IsContiguous(&", buf, ", 'C')) {"),
+                string("    PyBuffer_Release(&", buf, ");"),
+                "    PyErr_SetString(PyExc_TypeError, \"AbstractArray argument requires a C-contiguous array (try np.ascontiguousarray)\"); return NULL;",
+                "}",
+                string(tmp, ".order = 0;"),
+            ])
+        else
+            # Dense (Array) policy: accept C- or F-contiguous, record which.
+            append!(setup, [
+                string("if (PyBuffer_IsContiguous(&", buf, ", 'C')) ", tmp, ".order = 0;"),
+                string("else if (PyBuffer_IsContiguous(&", buf, ", 'F')) ", tmp, ".order = 1;"),
+                "else {",
+                string("    PyBuffer_Release(&", buf, ");"),
+                "    PyErr_SetString(PyExc_TypeError, \"expected a contiguous array\"); return NULL;",
+                "}",
+            ])
+        end
+        append!(setup, [string(tmp, ".data = (", e.ctype, " *)", buf, ".buf;")])
+        for k in 0:n-1
+            push!(setup, string(tmp, ".shape[", k, "] = (int64_t)", buf, ".shape[", k, "];"))
+        end
         return ArgPlan(decls, "O", [string("&", obj)], setup, tmp,
                        [string("PyBuffer_Release(&", buf, ");")])
     end
     error("ParselTongue: no argument marshalling for carrier `$C`.")
 end
 
-function _ret_plan(@nospecialize(C::Type))
+# Build a PyObject named `out` from a C value expression `val` of carrier type
+# `C`. Array/string builders free their owned memory here, so this is safe to use
+# both for a function's whole result and for each field of a tuple result.
+function _build_pyobject(@nospecialize(C::Type), val::AbstractString, out::AbstractString)
     if isscalar(C)
         cs = _CSCALARS[C]
-        return RetPlan([string("return ", cs.build, "((", cs.cast, ")r);")])
+        return [string("PyObject *", out, " = ", cs.build, "((", cs.cast, ")", val, ");")]
+    elseif iscomplex(C)
+        return [string("PyObject *", out, " = PyComplex_FromDoubles((double)", val, ".re, (double)", val, ".im);")]
     elseif C === Cstring
-        return RetPlan(["PyObject *o = PyUnicode_FromString(r);", "free((void *)r);", "return o;"])
+        return [string("PyObject *", out, " = PyUnicode_FromString(", val, ");"),
+                string("free((void *)", val, ");")]
     elseif isarray(C)
-        e = _elt(C)
-        return RetPlan([
-            string("Py_ssize_t nbytes = (Py_ssize_t)r.len * (Py_ssize_t)sizeof(", e.ctype, ");"),
-            "PyObject *ba = PyByteArray_FromStringAndSize((const char *)r.data, nbytes);",
-            "free(r.data);",
-            "if (!ba) return NULL;",
-            string("PyObject *out = _pt_wrap_array(ba, \"", e.np, "\");"),
-            "Py_DECREF(ba);",
-            "return out;",
+        e = _elt(C); n = _ndims(C)
+        ne = string("nelem_", out); shp = string("shp_", out); ba = string("ba_", out)
+        stmts = [string("Py_ssize_t ", ne, " = 1;")]
+        for k in 0:n-1
+            push!(stmts, string(ne, " *= (Py_ssize_t)", val, ".shape[", k, "];"))
+        end
+        push!(stmts, string("Py_ssize_t ", shp, "[", n, "] = {",
+                            join(("(Py_ssize_t)$val.shape[$k]" for k in 0:n-1), ", "), "};"))
+        append!(stmts, [
+            string("PyObject *", ba, " = PyByteArray_FromStringAndSize((const char *)", val,
+                   ".data, ", ne, " * (Py_ssize_t)sizeof(", e.ctype, "));"),
+            string("free(", val, ".data);"),
+            # returns are always column-major (to_c tags order=1) -> reshape order 'F'
+            string("PyObject *", out, " = ", ba, " ? _pt_wrap_ndarray(", ba, ", \"", e.np,
+                   "\", ", shp, ", ", n, ", ", val, ".order) : NULL;"),
+            string("Py_XDECREF(", ba, ");"),
         ])
+        return stmts
     end
     error("ParselTongue: no return marshalling for carrier `$C`.")
+end
+
+function _ret_plan(@nospecialize(C::Type))
+    if C === Cvoid
+        return RetPlan(["Py_RETURN_NONE;"])
+    elseif istuple(C)
+        carriers = fieldtypes(C)
+        stmts = String[]; outs = String[]
+        for (i, Ci) in enumerate(carriers)
+            o = string("o", i)
+            append!(stmts, _build_pyobject(Ci, string("r.f", i), o))
+            cleanup = join((" Py_XDECREF(o$j);" for j in 1:i-1), "")
+            push!(stmts, string("if (!", o, ") {", cleanup, " return NULL; }"))
+            push!(outs, o)
+        end
+        push!(stmts, string("PyObject *rt = PyTuple_Pack(", length(carriers), ", ", join(outs, ", "), ");"))
+        for o in outs; push!(stmts, string("Py_DECREF(", o, ");")); end
+        push!(stmts, "return rt;")
+        return RetPlan(stmts)
+    else
+        stmts = _build_pyobject(C, "r", "_ret")
+        push!(stmts, "return _ret;")
+        return RetPlan(stmts)
+    end
 end
 
 # ── Codegen ───────────────────────────────────────────────────────────
@@ -153,7 +292,9 @@ function _wrapper_fn(e::PtExport)
     fmt = IOBuffer()
     addrs = String[]; callargs = String[]; setups = String[]; cleanups = String[]
     for (i, a) in enumerate(e.args)
-        plan = _arg_plan(c_abi_type(a.jl_type), i)
+        # An AbstractArray (non-concrete) argument selects the logical-view policy.
+        logical = a.jl_type <: AbstractArray && !(a.jl_type <: Array)
+        plan = _arg_plan(c_abi_type(a.jl_type), i; logical, mutable=a.mutable)
         for d in plan.decls; println(io, "    ", d); end
         print(fmt, plan.fmt)
         append!(addrs, plan.addrs); append!(setups, plan.setup); append!(cleanups, plan.cleanup)
@@ -169,45 +310,70 @@ function _wrapper_fn(e::PtExport)
     for s in setups; println(io, "    ", s); end
 
     retc = c_abi_type(e.ret)
-    println(io, "    ", _c_ctype(retc), " r = ", cabi_symbol(e), "(", join(callargs, ", "), ");")
+    if retc === Cvoid
+        println(io, "    ", cabi_symbol(e), "(", join(callargs, ", "), ");")
+    else
+        println(io, "    ", _c_ctype(retc), " r = ", cabi_symbol(e), "(", join(callargs, ", "), ");")
+    end
     for s in cleanups; println(io, "    ", s); end
     for s in _ret_plan(retc).stmts; println(io, "    ", s); end
     println(io, "}")
     return String(take!(io)), wname
 end
 
-# C struct typedefs for every PtBuffer{T} carrier appearing in `exports`.
+# C struct typedefs for every PtArray{T,N} carrier appearing in `exports`.
 function _array_structs(exports::AbstractVector{PtExport})
-    seen = Set{Type}()
     out = String[]
-    for e in exports
-        for C in (c_abi_type(e.ret), (c_abi_type(a.jl_type) for a in e.args)...)
-            if isarray(C) && !(C in seen)
-                push!(seen, C)
-                ei = _elt(C)
-                push!(out, string("typedef struct { ", ei.ctype, " *data; int64_t len; } ",
-                                  _structname(C), ";"))
-            end
+    for C in _all_carriers(exports)
+        if isarray(C)
+            ei = _elt(C); n = _ndims(C)
+            push!(out, string("typedef struct { ", ei.ctype, " *data; int64_t shape[", n,
+                              "]; int32_t order; } ", _structname(C), ";"))
         end
     end
+    sort!(out)
+    out
+end
+
+# Tuple carrier typedefs (Python tuple returns). Emitted after array/complex
+# structs, which their fields reference.
+function _tuple_structs(exports::AbstractVector{PtExport})
+    out = String[]
+    for C in _all_carriers(exports)
+        if istuple(C)
+            fields = join((string(_c_ctype(S), " f", i, ";")
+                           for (i, S) in enumerate(fieldtypes(C))), " ")
+            push!(out, string("typedef struct { ", fields, " } ", _tuple_structname(C), ";"))
+        end
+    end
+    sort!(out)
     out
 end
 
 _uses_arrays(exports) = !isempty(_array_structs(exports))
 
 const _WRAP_ARRAY_HELPER = """
-/* Turn a bytearray of raw elements into a numpy array if numpy is importable,
-   else a memoryview. The result keeps a reference to `ba`, so the caller may
-   DECREF it afterwards. numpy is resolved at runtime — never a build dependency. */
-static PyObject *_pt_wrap_array(PyObject *ba, const char *dtype) {
+/* Turn a bytearray of raw elements into an N-D numpy array (reshaped in the given
+   order: 0='C', 1='F') if numpy is importable, else a flat memoryview. The result
+   keeps a reference to `ba`, so the caller may DECREF it afterwards. numpy is
+   resolved at runtime — never a build dependency. */
+static PyObject *_pt_wrap_ndarray(PyObject *ba, const char *dtype,
+                                  const Py_ssize_t *shape, int ndim, int order) {
     PyObject *np = PyImport_ImportModule("numpy");
-    if (np) {
-        PyObject *arr = PyObject_CallMethod(np, "frombuffer", "Os", ba, dtype);
-        Py_DECREF(np);
-        return arr;
-    }
-    PyErr_Clear();
-    return PyMemoryView_FromObject(ba);
+    if (!np) { PyErr_Clear(); return PyMemoryView_FromObject(ba); }
+    PyObject *flat = PyObject_CallMethod(np, "frombuffer", "Os", ba, dtype);
+    Py_DECREF(np);
+    if (!flat) return NULL;
+    PyObject *sh = PyTuple_New(ndim);
+    if (!sh) { Py_DECREF(flat); return NULL; }
+    for (int i = 0; i < ndim; i++)
+        PyTuple_SET_ITEM(sh, i, PyLong_FromSsize_t(shape[i]));
+    PyObject *kw = Py_BuildValue("{s:s}", "order", order == 1 ? "F" : "C");
+    PyObject *args = PyTuple_Pack(1, sh);
+    PyObject *reshape = PyObject_GetAttrString(flat, "reshape");
+    PyObject *arr = (reshape && args && kw) ? PyObject_Call(reshape, args, kw) : NULL;
+    Py_XDECREF(reshape); Py_XDECREF(args); Py_XDECREF(kw); Py_DECREF(sh); Py_DECREF(flat);
+    return arr;
 }
 """
 
@@ -227,12 +393,24 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport};
     println(io, "#include <stdbool.h>")
     println(io, "#include <stdlib.h>")
     println(io)
+    cstructs = _complex_structs(exports)
+    if !isempty(cstructs)
+        println(io, "/* C-ABI carriers for complex numbers (match Julia Complex{T}) */")
+        for s in cstructs; println(io, s); end
+        println(io)
+    end
     structs = _array_structs(exports)
     if !isempty(structs)
-        println(io, "/* C-ABI carriers for 1-D numeric arrays (match Julia PtBuffer{T}) */")
+        println(io, "/* C-ABI carriers for N-D arrays (match Julia PtArray{T,N}) */")
         for s in structs; println(io, s); end
         println(io)
         println(io, _WRAP_ARRAY_HELPER)
+    end
+    tstructs = _tuple_structs(exports)
+    if !isempty(tstructs)
+        println(io, "/* C-ABI carriers for tuple returns (match Julia Tuple{...}) */")
+        for s in tstructs; println(io, s); end
+        println(io)
     end
     println(io, "/* C-ABI entry points emitted by juliac --trim */")
     for e in exports

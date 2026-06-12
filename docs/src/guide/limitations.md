@@ -14,8 +14,11 @@ import mathx     # ok
 import strx      # abort: a second libjulia is loaded
 ```
 
-Build the functions you need to use together into a **single** module. A
-shared-runtime mode (one libjulia across extensions) is future work.
+Build the functions you need to use together into a **single** module — and use
+[`@pymodule pkg.sub`](/examples/scientific#Submodules) to split one extension's API
+across Python submodules (`pkg.linalg`, `pkg.dsp`, …), all backed by one image, so
+`import pkg.linalg` and `import pkg.dsp` coexist fine. A shared-runtime mode (one
+libjulia across *separate* extensions) is future work.
 
 ## Wheel size (~100 MB)
 
@@ -27,12 +30,6 @@ since a trimmed AOT binary provably never needs them.
 
 Shrinking the wheel further requires suppressing the unused stdlib inits — a
 planned optimization.
-
-## Arrays are 1-D
-
-`Vector{T}` for numeric `T` is supported zero-copy. N-dimensional arrays are not
-yet exposed, because the column-major (Julia) vs. row-major (NumPy default)
-layout needs an explicit, unsurprising convention first.
 
 ## Array dtype checking is width-only
 

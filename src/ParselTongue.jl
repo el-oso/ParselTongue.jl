@@ -22,6 +22,6 @@ include("build.jl")
 include("wheel.jl")
 
 export @pyfunc, @pymodule, build_extension, build_wheel
-export PyBoundary, c_abi_type, from_c, to_c
+export PyBoundary, Mut, c_abi_type, from_c, to_c
 
 end # module ParselTongue

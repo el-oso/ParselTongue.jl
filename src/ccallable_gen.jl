@@ -11,10 +11,12 @@
 
 # A type rendered as parseable Julia source valid inside the generated entry
 # (which only does `using ParselTongue`). Scalars/String/Cstring print back
-# directly; the ParselTongue-owned carrier `PtBuffer{T}` is module-qualified.
+# directly; the ParselTongue-owned carrier `PtArray{T,N}` is module-qualified.
 function _type_src(@nospecialize(T::Type))
-    if T isa DataType && T.name === PtBuffer.body.name
-        return string("ParselTongue.PtBuffer{", _type_src(T.parameters[1]), "}")
+    if T isa DataType && T.name === PtArray.body.body.name
+        return string("ParselTongue.PtArray{", _type_src(T.parameters[1]), ", ", T.parameters[2], "}")
+    elseif T isa DataType && T <: Tuple
+        return string("Tuple{", join((_type_src(S) for S in fieldtypes(T)), ", "), "}")
     end
     return string(T)
 end
@@ -39,6 +41,16 @@ function emit_ccallable(e::PtExport)
         push!(conv, string("ParselTongue.from_c(", _type_src(a.jl_type), ", ", a.name, ")"))
     end
     call = string(e.jl_func, "(", join(conv, ", "), ")")
+    # `::Nothing` returns lower to a void wrapper that calls the function and returns
+    # nothing (no `to_c`); everything else wraps the result through `to_c`.
+    if e.ret === Nothing
+        return string(
+            "Base.@ccallable function ", sym, "(", join(params, ", "), ")::Cvoid\n",
+            "    ", call, "\n",
+            "    return\n",
+            "end\n",
+        )
+    end
     body = string("ParselTongue.to_c(", call, ")")
     return string(
         "Base.@ccallable function ", sym, "(", join(params, ", "), ")::", _type_src(ret_c), "\n",

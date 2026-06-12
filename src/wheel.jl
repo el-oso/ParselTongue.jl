@@ -76,6 +76,7 @@ function build_wheel(user_path::AbstractString;
                     mod_name=ext_name, outdir=pkgdir, trim, python,
                     runtime_rpaths=["\$ORIGIN/julia/lib", "\$ORIGIN/julia/lib/julia"],
                     strip_abs_rpath=true, keep_build, verbose)
+    exports = copy(_EXPORTS)   # build_extension repopulated the registry
 
     # 2. Vendor the Julia runtime, preserving the lib/ vs lib/julia/ layout so the
     #    bundled libs resolve each other through their existing RUNPATHs.
@@ -83,8 +84,8 @@ function build_wheel(user_path::AbstractString;
     _vendor_libs(libsrc, joinpath(pkgdir, "julia", "lib"))                  # libjulia.so*
     _vendor_libs(joinpath(libsrc, "julia"), joinpath(pkgdir, "julia", "lib", "julia"))
 
-    # 3. __init__.py re-exports the compiled extension.
-    write(joinpath(pkgdir, "__init__.py"), _init_py(mod, ext_name))
+    # 3. __init__.py + per-submodule re-export files over the single extension.
+    _write_pkg_pyfiles(pkgdir, ext_name, exports)
 
     # 4. dist-info metadata.
     distinfo = joinpath(stage, string(mod, "-", version, ".dist-info")); mkpath(distinfo)
@@ -100,13 +101,32 @@ function build_wheel(user_path::AbstractString;
     return whl_path
 end
 
-function _init_py(mod, ext_name)
-    """
-    \"\"\"$mod — a Julia extension built with ParselTongue (juliac --trim).\"\"\"
-    from .$ext_name import *  # noqa: F401,F403
-    from . import $ext_name as _ext
-    __all__ = [n for n in dir(_ext) if not n.startswith("_")]
-    """
+# Write `__init__.py` plus one `<sub>.py` per submodule, all re-exporting from the
+# single compiled extension `ext_name` (which holds every function). Top-level
+# functions (no submodule) are exposed on the package itself.
+function _write_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractString,
+                            exports::AbstractVector{PtExport})
+    subs = submodule_names(exports)
+    toplevel = [e.export_name for e in exports if isempty(e.submodule)]
+
+    io = IOBuffer()
+    println(io, "\"\"\"Built with ParselTongue (juliac --trim).\"\"\"")
+    isempty(toplevel) || println(io, "from .", ext_name, " import (", join(toplevel, ", "), ")")
+    for s in subs
+        println(io, "from . import ", s, "  # noqa: F401")
+    end
+    allnames = vcat(toplevel, subs)
+    println(io, "__all__ = [", join(("\"$n\"" for n in allnames), ", "), "]")
+    write(joinpath(pkgdir, "__init__.py"), String(take!(io)))
+
+    for s in subs
+        names = [e.export_name for e in exports if e.submodule == s]
+        write(joinpath(pkgdir, string(s, ".py")),
+              string("\"\"\"", s, " submodule.\"\"\"\n",
+                     "from .", ext_name, " import (", join(names, ", "), ")\n",
+                     "__all__ = [", join(("\"$n\"" for n in names), ", "), "]\n"))
+    end
+    return nothing
 end
 
 function _metadata(mod, version)

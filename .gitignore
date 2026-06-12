@@ -15,3 +15,5 @@ __pycache__/
 
 # Spike scratch binary (keep the .c/.jl sources)
 /spike/ctest
+/spike/structtest
+/spike/tuplesp

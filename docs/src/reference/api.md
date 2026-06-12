@@ -22,6 +22,7 @@ build_wheel
 
 ```@docs
 PyBoundary
+Mut
 c_abi_type
 from_c
 to_c

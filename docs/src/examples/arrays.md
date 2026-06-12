@@ -66,6 +66,28 @@ to a `memoryview`:
   NumPy is declared only as an optional extra; it is never needed to *build* the
   extension.
 
-::: tip
-Arrays are 1-D in v1. See [Limitations](/guide/limitations#Arrays-are-1-D).
-:::
+## N-dimensional arrays
+
+Matrices and tensors work too. The **argument type** picks the row/column-major
+policy (both zero-copy):
+
+```julia
+@pymodule la begin
+    # logical view: NumPy's shape and indexing (A[i,j] == a[i,j]); great for loops
+    @pyfunc rowsums(A::AbstractMatrix{Float64})::Vector{Float64} = vec(sum(A, dims=2))
+    # dense Array: BLAS-friendly, but a C-order input arrives transposed
+    @pyfunc tr(A::Matrix{Float64})::Float64 = sum(i -> A[i,i], 1:size(A,1))
+end
+```
+
+```python
+>>> import numpy as np, la
+>>> A = np.array([[1., 2., 3.], [4., 5., 6.]])   # shape (2, 3), C-order
+>>> la.rowsums(A)                                # AbstractMatrix → natural shape
+array([ 6., 15.])
+```
+
+A returned array always comes back in **natural** shape. See
+[Boundary Types → N-D arrays](/guide/boundary-types#N-D-arrays-the-dual-policy)
+for the policy rationale, and the [Statistics / scientific example](/examples/scientific)
+for matmul, complex, in-place, and tuple returns together.

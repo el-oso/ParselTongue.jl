@@ -25,15 +25,24 @@ end
 
         # Drive the extension from a clean subprocess and report pass/fail.
         script = """
-        import sys, array
+        import sys, array, cmath
         sys.path.insert(0, $(repr(outdir)))
         import feature
         assert feature.add(40, 2) == 42
         assert feature.is_even(10) is True and feature.is_even(7) is False
-        assert abs(feature.scale_f32(1.5, 2.0) - 3.0) < 1e-6
         assert feature.greet("World") == "Hello, World!"
+        assert feature.conj1(3 + 4j) == 3 - 4j
         assert feature.sum_f64(array.array("d", [1.0, 2.0, 3.0, 4.0])) == 10.0
-        assert list(feature.cumsum_i64(array.array("q", [1, 2, 3]))) == [1, 3, 6]
+        assert feature.minmax(array.array("d", [3.0, 1.0, 5.0])) == (1.0, 5.0)
+        x = array.array("d", [1.0, 2.0, 3.0])
+        assert feature.scale(x, 10.0) is None and list(x) == [10.0, 20.0, 30.0]  # in-place + void
+        try:
+            import numpy as np
+            A = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])      # 2x3 C-order
+            assert np.allclose(feature.rowsums(A), [6.0, 15.0])   # logical view: NumPy shape
+            assert list(feature.dims(A)) == [3, 2]                # dense: transposed for C-order
+        except ImportError:
+            pass
         print("FEATURE_OK")
         """
         out = read(`$(Sys.which("python3")) -c $script`, String)

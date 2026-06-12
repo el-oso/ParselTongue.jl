@@ -28,6 +28,7 @@ makedocs(;
             "Strings (strx)"         => "examples/strings.md",
             "Arrays & NumPy (arrx)"  => "examples/arrays.md",
             "A Statistics Module"    => "examples/statistics.md",
+            "Scientific Module (sci)"=> "examples/scientific.md",
         ],
         "Reference" => [
             "API Reference" => "reference/api.md",
