@@ -167,7 +167,7 @@ function _link_extension(t::BuildTools, cpath::AbstractString, img::AbstractStri
                          so_path::AbstractString, runtime_rpaths::Vector{String},
                          strip_abs_rpath::Bool, verbose::Bool)
     cc = _find_cc()
-    pyinc = _py_include_flags(t.python)
+    pyinc = t.py_includes
     # For a relocatable wheel we drop the absolute `-rpath`s julia-config bakes in
     # and add our own `$ORIGIN`-relative ones (the bundled libs find each other via
     # their existing RUNPATHs once the relative layout is preserved).

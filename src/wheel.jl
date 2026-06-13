@@ -41,11 +41,19 @@ end
 """
     build_wheel(user_path; version="0.1.0", mod_name=nothing,
                 outdir=dirname(user_path), python="python3", trim=:safe,
-                abi3=false, keep_build=false, verbose=false) -> String
+                abi3=false, runtime=:bundled, keep_build=false, verbose=false) -> String
 
-Build a self-contained, pip-installable wheel from the `@pyfunc`-annotated
-functions in `user_path`. Returns the path to the `.whl`. The wheel bundles
-libjulia, so the end user needs no Julia installation.
+Build a pip-installable wheel from the `@pyfunc`-annotated functions in `user_path`.
+Returns the path to the `.whl`.
+
+`runtime` controls how the Julia runtime is distributed:
+- `:bundled` (default) — the wheel is self-contained (~100 MB); libjulia and all
+  transitive dependencies are vendored inside the wheel. No extra install required.
+- `:shared` — the wheel is tiny (~1 MB); the Julia runtime is provided by a separate
+  `parseltongue-runtime` wheel. Install that wheel once and share it across many
+  extension wheels. The extension's `__init__.py` sets `LD_LIBRARY_PATH` to point at
+  the runtime package's `julia/lib` dirs before importing the extension `.so`.
+  Build the runtime wheel with [`build_runtime_wheel`](@ref).
 
 When `abi3=true` the extension is compiled against the stable ABI
 (`Py_LIMITED_API=0x030B0000`) and the wheel tag is `cp311-abi3-<plat>`,
@@ -58,8 +66,12 @@ function build_wheel(user_path::AbstractString;
                      python::AbstractString="python3",
                      trim::Symbol=:safe,
                      abi3::Bool=false,
+                     runtime::Symbol=:bundled,
                      keep_build::Bool=false,
                      verbose::Bool=false)
+    runtime in (:bundled, :shared) ||
+        error("ParselTongue: runtime must be :bundled or :shared, got :$runtime")
+
     user_path = abspath(user_path)
     # Resolve the user-facing module name the same way build_extension does.
     clear_exports!(); _MODULE_NAME[] = nothing
@@ -75,34 +87,46 @@ function build_wheel(user_path::AbstractString;
     stage = mktempdir(; prefix="ptwheel_", cleanup=!keep_build)
     pkgdir = joinpath(stage, mod); mkpath(pkgdir)
 
-    # 1. Build the extension as the internal submodule `_<mod>` with relative rpaths.
+    # 1. Build the extension as the internal submodule `_<mod>`.
+    #    Bundled: embed $ORIGIN rpaths so the .so finds the vendored libs.
+    #    Shared: no rpaths; resolution happens via LD_LIBRARY_PATH set at import.
     ext_name = string("_", mod)
+    rpaths = runtime === :bundled ?
+        ["\$ORIGIN/julia/lib", "\$ORIGIN/julia/lib/julia"] : String[]
     build_extension(user_path;
                     mod_name=ext_name, outdir=pkgdir, trim, python, abi3,
-                    runtime_rpaths=["\$ORIGIN/julia/lib", "\$ORIGIN/julia/lib/julia"],
+                    runtime_rpaths=rpaths,
                     strip_abs_rpath=true, keep_build, verbose)
     exports = copy(_EXPORTS)   # build_extension repopulated the registry
 
-    # 2. Vendor the Julia runtime, preserving the lib/ vs lib/julia/ layout so the
-    #    bundled libs resolve each other through their existing RUNPATHs.
-    libsrc = abspath(joinpath(Sys.BINDIR, "..", "lib"))
-    _vendor_libs(libsrc, joinpath(pkgdir, "julia", "lib"))                  # libjulia.so*
-    _vendor_libs(joinpath(libsrc, "julia"), joinpath(pkgdir, "julia", "lib", "julia"))
+    # 2. Vendor the Julia runtime (bundled only).
+    if runtime === :bundled
+        libsrc = abspath(joinpath(Sys.BINDIR, "..", "lib"))
+        _vendor_libs(libsrc, joinpath(pkgdir, "julia", "lib"))
+        _vendor_libs(joinpath(libsrc, "julia"), joinpath(pkgdir, "julia", "lib", "julia"))
+    end
 
-    # 3. __init__.py + per-submodule re-export files over the single extension.
-    _write_pkg_pyfiles(pkgdir, ext_name, exports)
+    # 3. __init__.py + per-submodule re-export files.
+    if runtime === :bundled
+        _write_pkg_pyfiles(pkgdir, ext_name, exports)
+    else
+        _write_shared_pkg_pyfiles(pkgdir, ext_name, exports, mod)
+    end
 
     # 4. dist-info metadata.
+    julia_major_minor = join(split(_julia_version_str(), '.')[1:2], '.')
+    runtime_req = runtime === :shared ?
+        "parseltongue-runtime ~= $(julia_major_minor).0" : nothing
     distinfo = joinpath(stage, string(mod, "-", version, ".dist-info")); mkpath(distinfo)
     tag = abi3 ? _wheel_tag_abi3(python) : _wheel_tag(python)
-    write(joinpath(distinfo, "METADATA"), _metadata(mod, version))
+    write(joinpath(distinfo, "METADATA"), _metadata(mod, version; runtime_requires=runtime_req))
     write(joinpath(distinfo, "WHEEL"), _wheel_meta(tag))
 
     # 5. Zip the tree into a .whl (Python helper computes RECORD hashes + zips).
     whl_name = string(mod, "-", version, "-", tag, ".whl")
     whl_path = joinpath(abspath(outdir), whl_name)
     _pack_wheel(python, stage, whl_path, string(mod, "-", version, ".dist-info"))
-    verbose && @info "ParselTongue: built wheel $whl_path"
+    verbose && @info "ParselTongue: built wheel $whl_path (runtime=$runtime)"
     return whl_path
 end
 
@@ -134,23 +158,21 @@ function _write_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractString,
     return nothing
 end
 
-function _metadata(mod, version)
-    """
-    Metadata-Version: 2.1
-    Name: $mod
-    Version: $version
-    Summary: $mod — Julia functions compiled to a native Python extension via ParselTongue
-    Provides-Extra: numpy
-    Requires-Dist: numpy; extra == "numpy"
-    """
+function _metadata(mod, version; runtime_requires::Union{Nothing,AbstractString}=nothing)
+    io = IOBuffer()
+    println(io, "Metadata-Version: 2.1")
+    println(io, "Name: $mod")
+    println(io, "Version: $version")
+    println(io, "Summary: $mod — Julia functions compiled to a native Python extension via ParselTongue")
+    println(io, "Provides-Extra: numpy")
+    println(io, "Requires-Dist: numpy; extra == \"numpy\"")
+    runtime_requires !== nothing && println(io, "Requires-Dist: $runtime_requires")
+    return String(take!(io))
 end
 
-_wheel_meta(tag) = """
-Wheel-Version: 1.0
-Generator: ParselTongue (0.1.0)
-Root-Is-Purelib: false
-Tag: $tag
-"""
+const _PT_VERSION = string(pkgversion(@__MODULE__))
+
+_wheel_meta(tag) = "Wheel-Version: 1.0\nGenerator: ParselTongue ($(_PT_VERSION))\nRoot-Is-Purelib: false\nTag: $tag\n"
 
 # CPython wheel compatibility tag, e.g. "cp314-cp314-linux_x86_64".
 function _wheel_tag(python::AbstractString)
@@ -207,3 +229,131 @@ with zipfile.ZipFile(whl_path, "w", zipfile.ZIP_DEFLATED) as z:
     z.writestr(record_arc, "\n".join(lines) + "\n")
 print(whl_path)
 """
+
+# ── Shared-runtime support ─────────────────────────────────────────────
+
+_julia_version_str() = string(VERSION)
+
+# Runtime wheel tag: "py3-none-linux_x86_64" (any Python 3, platform-specific).
+function _runtime_wheel_tag(python::AbstractString)
+    plat = readchomp(`$python -c "import sysconfig; print(sysconfig.get_platform().replace('-','_').replace('.','_'))"`)
+    return "py3-none-$plat"
+end
+
+# __init__.py for the parseltongue_runtime package: exposes the lib path constants
+# so extension __init__.py files can locate Julia libs without hard-coding paths.
+const _RUNTIME_INIT_PY = """\"\"\"Julia runtime libraries for ParselTongue extension wheels.
+
+This package vendors libjulia and its transitive dependencies. Extension wheels
+built with build_wheel(...; runtime=:shared) set LD_LIBRARY_PATH to point at
+the julia/lib directories here before importing their compiled extension .so.
+\"\"\"
+import os as _os
+_JULIA_LIB = _os.path.join(_os.path.dirname(__file__), "julia", "lib")
+_JULIA_LIB_JULIA = _os.path.join(_JULIA_LIB, "julia")
+"""
+
+function _runtime_metadata(version::AbstractString, julia_version::AbstractString)
+    io = IOBuffer()
+    println(io, "Metadata-Version: 2.1")
+    println(io, "Name: parseltongue-runtime")
+    println(io, "Version: $version")
+    println(io, "Summary: Julia runtime libraries for ParselTongue extension wheels (Julia $julia_version)")
+    return String(take!(io))
+end
+
+"""
+    build_runtime_wheel(; version=nothing, outdir=".", python="python3", verbose=false) -> String
+
+Build a platform-specific wheel that vendors the Julia runtime (`libjulia` and all
+transitive native dependencies). Extension wheels built with
+`build_wheel(...; runtime=:shared)` declare a `Requires-Dist: parseltongue-runtime`
+dependency on this wheel, keeping the extension wheel small (~1 MB vs ~100 MB).
+
+The wheel is tagged `py3-none-<plat>` (any Python 3, platform-specific). `version`
+defaults to the current Julia version string (e.g. `"1.12.6"`).
+
+Install the runtime wheel once and share it across many extension wheels built from
+the same Julia installation:
+```
+julia -e 'using ParselTongue; build_runtime_wheel(outdir="dist")'
+julia -e 'using ParselTongue; build_wheel("ext.jl"; runtime=:shared, outdir="dist")'
+pip install dist/parseltongue_runtime-*.whl dist/ext-*.whl
+```
+"""
+function build_runtime_wheel(;
+        version::Union{Nothing,AbstractString}=nothing,
+        outdir::AbstractString=".",
+        python::AbstractString="python3",
+        verbose::Bool=false)
+    julia_ver = _julia_version_str()
+    ver = version !== nothing ? String(version) : julia_ver
+    mod = "parseltongue_runtime"
+
+    stage = mktempdir(; prefix="ptruntime_", cleanup=true)
+    pkgdir = joinpath(stage, mod); mkpath(pkgdir)
+
+    libsrc = abspath(joinpath(Sys.BINDIR, "..", "lib"))
+    _vendor_libs(libsrc, joinpath(pkgdir, "julia", "lib"))
+    _vendor_libs(joinpath(libsrc, "julia"), joinpath(pkgdir, "julia", "lib", "julia"))
+
+    write(joinpath(pkgdir, "__init__.py"), _RUNTIME_INIT_PY)
+
+    tag = _runtime_wheel_tag(python)
+    distinfo = joinpath(stage, string(mod, "-", ver, ".dist-info")); mkpath(distinfo)
+    write(joinpath(distinfo, "METADATA"), _runtime_metadata(ver, julia_ver))
+    write(joinpath(distinfo, "WHEEL"), _wheel_meta(tag))
+
+    mkpath(outdir)
+    whl_name = string(mod, "-", ver, "-", tag, ".whl")
+    whl_path = joinpath(abspath(outdir), whl_name)
+    _pack_wheel(python, stage, whl_path, string(mod, "-", ver, ".dist-info"))
+    verbose && @info "ParselTongue: built runtime wheel $whl_path"
+    return whl_path
+end
+
+# Write __init__.py for a shared-runtime extension wheel: sets LD_LIBRARY_PATH
+# to point at parseltongue_runtime's julia/lib dirs before importing the .so.
+function _write_shared_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractString,
+                                   exports::AbstractVector{PtExport}, mod::AbstractString)
+    subs = submodule_names(exports)
+    toplevel = [e.export_name for e in exports if isempty(e.submodule)]
+    allnames = vcat(toplevel, subs)
+
+    imports_str = isempty(toplevel) ? "" :
+        "from .$ext_name import ($(join(toplevel, ", ")))\n"
+    submod_str = join(("from . import $s  # noqa: F401\n" for s in subs), "")
+    all_str = "__all__ = [$(join(("\"$n\"" for n in allnames), ", "))]\n"
+
+    # Python uses single-quoted strings to avoid Julia/Python double-quote conflicts.
+    # LD_LIBRARY_PATH is set before the extension import so glibc re-reads it at dlopen.
+    init_py = """
+\"\"\"$mod — built with ParselTongue. Requires parseltongue-runtime.\"\"\"
+import importlib.util as _ilu, os as _os
+def _preload():
+    _s = _ilu.find_spec('parseltongue_runtime')
+    if _s is None:
+        raise ImportError(
+            '$mod requires parseltongue-runtime. Install with:\\n'
+            '  pip install parseltongue-runtime'
+        )
+    _rt = _os.path.dirname(_s.origin)
+    _l1 = _os.path.join(_rt, 'julia', 'lib')
+    _l2 = _os.path.join(_rt, 'julia', 'lib', 'julia')
+    _prev = _os.environ.get('LD_LIBRARY_PATH', '')
+    _os.environ['LD_LIBRARY_PATH'] = ':'.join(x for x in (_l1, _l2, _prev) if x)
+_preload()
+del _preload, _ilu, _os
+$(imports_str)$(submod_str)$(all_str)"""
+
+    write(joinpath(pkgdir, "__init__.py"), lstrip(init_py))
+
+    for s in subs
+        names = [e.export_name for e in exports if e.submodule == s]
+        write(joinpath(pkgdir, string(s, ".py")),
+              string("\"\"\"", s, " submodule.\"\"\"\n",
+                     "from .", ext_name, " import (", join(names, ", "), ")\n",
+                     "__all__ = [", join(("\"$n\"" for n in names), ", "), "]\n"))
+    end
+    return nothing
+end

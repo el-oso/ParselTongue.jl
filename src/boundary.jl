@@ -328,8 +328,10 @@ function assert_boundary(T::Type)
     isempty(missing) || error(
         "ParselTongue: type `$T` cannot cross the Python boundary.\n" *
         "Missing boundary methods: $(join(missing, ", ")).\n" *
-        "Supported in v1: $(join(SCALAR_BOUNDARY_TYPES, ", ")), and (later) String / numeric arrays.\n" *
-        "Define `c_abi_type`, `from_c`, and `to_c` for `$T` to add support."
+        "Built-in boundary types: scalars ($(join(SCALAR_BOUNDARY_TYPES, ", "))), " *
+        "String, Vector{String}, Vector{<numeric>}, AbstractArray{<numeric>,N}, " *
+        "Tuple/NamedTuple of the above, and @pyhandle isbitstype structs.\n" *
+        "To add support for `$T`: define `c_abi_type`, `from_c`, and `to_c`."
     )
     return c_abi_type(T)
 end

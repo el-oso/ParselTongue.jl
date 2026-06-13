@@ -3,7 +3,9 @@ using ParselTongue
 using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     c_abi_type, from_c, to_c, Mut, PtHandle,
                     PtExport, PtArray, emit_ccallable, emit_entry, emit_cshim,
-                    _EXPORTS, clear_exports!, _default_py_name, submodule_names
+                    _EXPORTS, clear_exports!, _default_py_name, submodule_names,
+                    _julia_version_str, _runtime_wheel_tag, _runtime_metadata,
+                    _RUNTIME_INIT_PY, _write_shared_pkg_pyfiles
 
 # Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
 struct _TestHandle
@@ -353,4 +355,47 @@ end
     # Function-form equivalents ARE present (used for list/tuple operations).
     @test occursin("PyList_SetItem",  c_abi3)
     @test occursin("PyTuple_SetItem", c_abi3)
+end
+
+@testset "shared-runtime wheel helpers (item 4)" begin
+    # _julia_version_str returns the current Julia version.
+    jver = _julia_version_str()
+    @test jver == string(VERSION)
+    @test occursin(r"^\d+\.\d+\.\d+", jver)
+
+    # _runtime_wheel_tag returns "py3-none-<plat>".
+    python = get(ENV, "PYTHON3", "python3")
+    rtag = _runtime_wheel_tag(python)
+    @test startswith(rtag, "py3-none-")
+    @test !occursin("cp3", rtag)          # must NOT be CPython-specific
+
+    # _runtime_metadata has correct fields.
+    meta = _runtime_metadata("1.12.6", "1.12.6")
+    @test occursin("Name: parseltongue-runtime", meta)
+    @test occursin("Version: 1.12.6", meta)
+    @test occursin("1.12.6", meta)
+
+    # _RUNTIME_INIT_PY is valid Python that defines _JULIA_LIB.
+    @test occursin("_JULIA_LIB", _RUNTIME_INIT_PY)
+    @test occursin("_JULIA_LIB_JULIA", _RUNTIME_INIT_PY)
+    # Must be a valid Python docstring (triple double-quotes).
+    @test startswith(strip(_RUNTIME_INIT_PY), "\"\"\"")
+
+    # _write_shared_pkg_pyfiles generates __init__.py with LD_LIBRARY_PATH logic.
+    clear_exports!()
+    @pyfunc _test_shared_add(a::Float64, b::Float64)::Float64 = a + b
+    pkgdir = mktempdir()
+    try
+        _write_shared_pkg_pyfiles(pkgdir, "_mymod", _EXPORTS, "mymod")
+        init = read(joinpath(pkgdir, "__init__.py"), String)
+        @test occursin("parseltongue_runtime", init)
+        @test occursin("LD_LIBRARY_PATH", init)
+        @test occursin("_preload", init)
+        @test occursin("_test_shared_add", init)
+        @test occursin("__all__", init)
+        # Docstring uses triple double-quotes.
+        @test occursin("\"\"\"", init)
+    finally
+        rm(pkgdir; recursive=true)
+    end
 end

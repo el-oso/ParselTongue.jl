@@ -91,11 +91,17 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
 
 ## Phase 2 — broaden distribution + ergonomics
 
-- [ ] **4. Shared-runtime wheel** *(size)* — tiny extension wheels that depend on a
+- [x] **4. Shared-runtime wheel** *(size)* — tiny extension wheels that depend on a
   generated `parseltongue-runtime` wheel (vendors libjulia once, Python-agnostic tag).
-  `build_runtime_wheel()` + `build_wheel(...; runtime=:shared)`; the package
-  `__init__.py` ctypes-preloads libjulia (RTLD_GLOBAL) before importing the ext.
-  Reuses `_vendor_libs`/`_pack_wheel`. Effort M–L · Risk M.
+  `build_runtime_wheel()` + `build_wheel(...; runtime=:shared)` — shipped in v0.8.0.
+  The package `__init__.py` sets `LD_LIBRARY_PATH` to the runtime package's `julia/lib`
+  dirs before importing the extension. glibc re-reads `LD_LIBRARY_PATH` at each `dlopen`
+  call, so setting it in Python just before `from ._mod import ...` works correctly.
+  The extension .so is linked with `runtime_rpaths=[]` and `strip_abs_rpath=true` so it
+  carries no absolute rpaths; resolution happens entirely via LD_LIBRARY_PATH at import.
+  The runtime wheel tag is `py3-none-<plat>` (any Python 3, platform-specific).
+  Version defaults to the Julia version string (`VERSION`). Extension wheel METADATA adds
+  `Requires-Dist: parseltongue-runtime ~= <major>.<minor>.0`.
 - [x] **5. Keyword / default arguments** — `@pyfunc f(a; b=1.0)`; shim uses
   `PyArg_ParseTupleAndKeywords`. `macros.jl` records defaults; `cshim.jl` emits the
   keyword list. Effort M.
@@ -109,9 +115,25 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
 
 ## Phase 3 — performance & polish
 
-- [ ] **9. Shrink the bundle** *(size)* — investigate suppressing unused stdlib JLL
-  `__init__`s so OpenBLAS/SuiteSparse/networking libs can be dropped (the ~100 MB
-  driver). Depends on juliac internals — research/spike. Effort L · Risk M.
+- [ ] **9. Shrink the bundle** *(size)* — `readelf -d` analysis shows that the
+  extension .so only needs 6 Julia libs via DT_NEEDED (`libjulia-internal`, `libstdc++`,
+  `libgcc_s`, `libunwind`, `libatomic`, `libz` ≈ 38 MB) — the other ~70 MB
+  (OpenBLAS/SuiteSparse/GMP/curl/ssl/etc.) is over-vendored. `libjulia-internal`
+  does NOT DT_NEED OpenBLAS; those libs would only be needed if the user's Julia code
+  does `using LinearAlgebra`. Implement `build_wheel(...; slim=true)` that uses
+  `readelf -d` BFS to compute the transitive DT_NEEDED closure of the extension .so,
+  then only vendors libs in that closure (`_transitive_needed` + `_vendor_libs_smart`).
+  Also add `bundle_size_report(whl_path)` utility.
+  - Files: `wheel.jl` (`_readelf_needed`, `_transitive_needed`, `_resolve_soname`,
+    `_vendor_libs_smart`, `bundle_size_report`; modify `build_wheel` to accept
+    `slim=false`), `ParselTongue.jl` (export `bundle_size_report`).
+  - Warning: slim mode is unsafe if Julia code loads `LinearAlgebra`/`SuiteSparse`
+    (those JLL `__init__`s dlopen their libs at startup — not in DT_NEEDED chain but
+    loaded at runtime). Add a docstring warning.
+  - Tests: unit test `_readelf_needed(libjulia-internal.so)` does not contain
+    "openblas" or "cholmod"; integration test `build_wheel(...; slim=true)` produces
+    a smaller wheel that still imports.
+  - Effort M · Risk M (safe for numeric/string-only code; breaks for LinearAlgebra users).
 - [ ] **10. CI + distribution polish** — GitHub Actions wheel matrix (Python × plat),
   doctest the docs examples, prep for Julia General registry. Effort M.
 - [ ] **11. Startup latency** — measure/trim first-call runtime init. Effort S.
@@ -125,6 +147,24 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   destructor. GC-root complexity avoided by restricting to isbitstype. `build.jl` uses
   `Base.invokelatest` so `c_abi_type` dispatch sees `@pyhandle`-registered methods.
   `_type_src` strips sandbox module qualifiers for user-defined types. Effort L · Risk M.
+
+## Known correctness issues (audit findings — fix opportunistically)
+
+- **`_link_extension` redundant Python query** (`build.jl:170`): calls
+  `_py_include_flags(t.python)` again even though `t.py_includes` already has the
+  result. Replace with `t.py_includes` directly.
+- **`assert_boundary` stale error message** (`boundary.jl:330`): says "Supported in
+  v1: scalars, (later) String / numeric arrays" — all those types ship now. Update.
+- **`_wheel_meta` hardcodes version** (`wheel.jl`): "Generator: ParselTongue (0.1.0)"
+  should reflect actual package version. Read `pkgversion(@__MODULE__)` or Project.toml.
+- **`PyDict_SetItemString` return unchecked** (`cshim.jl:_ret_plan`): for NamedTuple
+  returns, `PyDict_SetItemString` can return -1 on OOM. Should check and propagate.
+- **Multiple array args: buffer leak on late arg failure** (`cshim.jl:_wrapper_fn`):
+  if arg 2's `PyObject_GetBuffer` fails after arg 1's succeeded, arg 1's
+  `PyBuffer_Release` is in `cleanup` which never runs. Low severity (Python GC
+  eventually handles it) but incorrect. Fix: add cleanup to setup's early-return paths.
+- **`build_wheel` double-includes user file**: once for mod name, once in
+  `build_extension`. Refactor to accept an already-resolved mod name.
 
 ## Cross-cutting conventions
 
