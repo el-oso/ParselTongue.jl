@@ -94,6 +94,14 @@ end
         d = feature.describe(_array.array("d", [1.0, 3.0, 2.0]))
         assert isinstance(d, dict), f"describe() must return dict, got {type(d)}"
         assert d["min"] == 1.0 and d["max"] == 3.0 and d["n"] == 3, f"wrong describe: {d}"
+        # Opaque handle types (item 12): PyCapsule lifecycle
+        p = feature.make_point(3.0, 4.0)
+        assert feature.point_x(p) == 3.0, "point_x"
+        assert feature.point_y(p) == 4.0, "point_y"
+        assert feature.point_norm(p) == 5.0, "point_norm 3-4-5"
+        p2 = feature.point_scale(p, 2.0)
+        assert feature.point_x(p2) == 6.0 and feature.point_y(p2) == 8.0, "point_scale"
+        del p, p2   # capsule destructors call free()
         print("FEATURE_OK")
         """
         out = read(`$(Sys.which("python3")) -c $script`, String)

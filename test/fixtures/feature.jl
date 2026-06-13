@@ -1,7 +1,17 @@
 using ParselTongue
 
+# Opaque-handle type (item 12): immutable isbits struct on C heap.
+# Constructor @pyfunc returns a PyCapsule; method @pyfuncs receive/return handles.
+# Mutation is functional — each "update" returns a new handle.
+struct Pt2D
+    x::Float64
+    y::Float64
+end
+@pyhandle Pt2D
+
 # Exercises every v1.x boundary kind in one extension: scalars, strings, complex,
-# 1-D and N-D arrays (both policies), in-place mutation + void, and tuple returns.
+# 1-D and N-D arrays (both policies), in-place mutation + void, tuple returns,
+# and opaque handles.
 @pymodule feature begin
     @pyfunc add(a::Int64, b::Int64)::Int64 = a + b
     @pyfunc is_even(n::Int64)::Bool = iseven(n)
@@ -30,4 +40,11 @@ using ParselTongue
     # NamedTuple <-> dict return (item 8).
     @pyfunc describe(v::Vector{Float64})::NamedTuple{(:min, :max, :n), Tuple{Float64, Float64, Int64}} =
         (min=minimum(v), max=maximum(v), n=Int64(length(v)))
+
+    # Opaque handle types (item 12): Pt2D is an isbitstype struct on the C heap.
+    @pyfunc make_point(x::Float64, y::Float64)::Pt2D = Pt2D(x, y)
+    @pyfunc point_x(p::Pt2D)::Float64 = p.x
+    @pyfunc point_y(p::Pt2D)::Float64 = p.y
+    @pyfunc point_norm(p::Pt2D)::Float64 = sqrt(p.x^2 + p.y^2)
+    @pyfunc point_scale(p::Pt2D, k::Float64)::Pt2D = Pt2D(p.x * k, p.y * k)
 end

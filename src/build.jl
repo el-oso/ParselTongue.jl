@@ -105,8 +105,10 @@ function build_extension(user_path::AbstractString;
     tools = _build_tools(; python)
 
     # 2. Generate the juliac entry file (loads user code + @ccallable wrappers).
+    # Use invokelatest: @pyhandle definitions in the sandbox bump the world counter,
+    # so c_abi_type dispatch inside the codegen must use the current latest world.
     entry_path = joinpath(builddir, "_pt_entry.jl")
-    write(entry_path, emit_entry(exports, user_path))
+    write(entry_path, Base.invokelatest(emit_entry, exports, user_path))
 
     # 3. Run juliac --trim to produce the trimmed object archive.
     img = joinpath(builddir, "img.a")
@@ -114,7 +116,7 @@ function build_extension(user_path::AbstractString;
 
     # 4. Generate the C PyInit shim.
     cpath = joinpath(builddir, string("_", mod, "module.c"))
-    write(cpath, emit_cshim(mod, exports))
+    write(cpath, Base.invokelatest(emit_cshim, mod, exports))
 
     # 5. Link the shim + archive into the extension module.
     so_path = joinpath(outdir, string(mod, tools.ext_suffix))

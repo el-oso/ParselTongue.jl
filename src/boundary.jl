@@ -118,6 +118,54 @@ function to_c(s::String)::Cstring
     return Cstring(p)
 end
 
+# ── Opaque handle types (@pyhandle) ───────────────────────────────────
+# A handle is a Julia `struct` (immutable, isbitstype) stored on the C heap.
+# The carrier `PtHandle` wraps a `void *` (the malloc'd pointer). On the Python
+# side the wrapper is a `PyCapsule` whose destructor calls `free`.
+#
+# Lifecycle:
+#   constructor @pyfunc → `to_c` mallocs + copies → C shim wraps in PyCapsule
+#   method @pyfunc (arg) → C shim extracts pointer → `from_c` loads a copy
+#   Python GC → PyCapsule destructor → `free`
+#
+# Mutation: handles are value types on the C heap, so "mutation" is functional —
+# the method returns a new handle carrying the updated state.
+#
+# Restriction: `T` must satisfy `isbitstype(T)` (immutable struct, all-isbits
+# fields). This guarantees safe `unsafe_store!`/`unsafe_load` on C-heap memory.
+
+struct PtHandle
+    ptr::Ptr{Cvoid}
+end
+
+"""
+    @pyhandle T
+
+Mark the immutable, isbits struct `T` as an opaque-handle boundary type.
+After this annotation, `T` can be used as a `@pyfunc` argument or return type.
+The Python side sees a `PyCapsule`; `free` is called automatically when the
+capsule is garbage-collected.
+
+`T` must satisfy `isbitstype(T)`.
+"""
+macro pyhandle(T_expr)
+    T = Core.eval(__module__, T_expr)
+    isbitstype(T) || error(
+        "@pyhandle: `$T` must be an isbitstype (immutable struct with all-isbits fields).")
+    quote
+        ParselTongue.c_abi_type(::Type{$T}) = ParselTongue.PtHandle
+        function ParselTongue.to_c(obj::$T)::ParselTongue.PtHandle
+            p = Ptr{$T}(Libc.malloc(sizeof($T)))
+            unsafe_store!(p, obj)
+            ParselTongue.PtHandle(Ptr{Cvoid}(p))
+        end
+        function ParselTongue.from_c(::Type{$T}, h::ParselTongue.PtHandle)::$T
+            unsafe_load(Ptr{$T}(h.ptr))
+        end
+        nothing
+    end
+end
+
 # ── String-array boundary type ────────────────────────────────────────
 # Carrier: `PtStrArray` (`{char **data; int64_t len;}`).
 #   arg:  Python list[str] → C shim strdup's each item into `data`. Julia builds a

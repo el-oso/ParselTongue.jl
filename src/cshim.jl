@@ -108,6 +108,7 @@ const _ELTINFO = Dict{Type,EltInfo}(
 
 isarray(@nospecialize(C::Type)) = C isa DataType && C.name === PtArray.body.body.name
 isstrarr(@nospecialize(C::Type)) = C === PtStrArray
+ishandle(@nospecialize(C::Type)) = C === PtHandle
 _elt(@nospecialize(C::Type)) = _ELTINFO[C.parameters[1]]      # T from PtArray{T,N}
 _ndims(@nospecialize(C::Type)) = C.parameters[2]::Int         # N from PtArray{T,N}
 _structname(@nospecialize(C::Type)) = string("PtArray_", _elt(C).tag, "_", _ndims(C))
@@ -122,6 +123,7 @@ function _carrier_tag(@nospecialize(C::Type))
     C === Cstring && return "str"
     isarray(C) && return _structname(C)
     isstrarr(C) && return "stra"
+    ishandle(C) && return "handle"
     istuple(C) && return string("T", join((_carrier_tag(S) for S in fieldtypes(C)), ""))
     return "x"
 end
@@ -154,6 +156,7 @@ function _c_ctype(@nospecialize(C::Type))
     C === Cstring && return "char *"
     isarray(C) && return _structname(C)
     isstrarr(C) && return "PtStrArray"
+    ishandle(C) && return "PtHandle"
     istuple(C) && return _tuple_structname(C)
     error("ParselTongue: no C type for carrier `$C`.")
 end
@@ -271,6 +274,20 @@ function _arg_plan(@nospecialize(C::Type), i::Int; logical::Bool=false, mutable:
         end
         return ArgPlan(decls, "O", [string("&", obj)], setup, tmp,
                        [string("PyBuffer_Release(&", buf, ");")])
+    elseif ishandle(C)
+        obj = string(tmp, "_obj"); ptr = string(tmp, "_ptr")
+        decls = [
+            string("PyObject *", obj, " = NULL;"),
+            string("void *", ptr, ";"),
+            string("PtHandle ", tmp, ";"),
+        ]
+        setup = [
+            string("if (!PyCapsule_CheckExact(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"expected a PtHandle capsule\"); return NULL; }"),
+            string(ptr, " = PyCapsule_GetPointer(", obj, ", NULL);"),
+            string("if (!", ptr, ") return NULL;"),
+            string(tmp, ".ptr = ", ptr, ";"),
+        ]
+        return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
     end
     error("ParselTongue: no argument marshalling for carrier `$C`.")
 end
@@ -289,6 +306,8 @@ function _build_pyobject(@nospecialize(C::Type), val::AbstractString, out::Abstr
                 string("free((void *)", val, ");")]
     elseif isstrarr(C)
         return [string("PyObject *", out, " = _pt_strarray_to_list(", val, ".data, ", val, ".len);")]
+    elseif ishandle(C)
+        return [string("PyObject *", out, " = PyCapsule_New(", val, ".ptr, NULL, _pt_capsule_free);")]
     elseif isarray(C)
         e = _elt(C); n = _ndims(C)
         ne = string("nelem_", out); shp = string("shp_", out); nb = string("nbytes_", out)
@@ -455,6 +474,10 @@ _uses_strarr(exports) = any(e -> any(a -> isstrarr(c_abi_type(a.jl_type)), e.arg
                                   isstrarr(c_abi_type(e.ret)) ||
                                   (istuple(c_abi_type(e.ret)) && any(isstrarr, fieldtypes(c_abi_type(e.ret)))),
                             exports)
+_uses_handles(exports) = any(e -> ishandle(c_abi_type(e.ret)) ||
+                                   any(a -> ishandle(c_abi_type(a.jl_type)), e.args) ||
+                                   (istuple(c_abi_type(e.ret)) && any(ishandle, fieldtypes(c_abi_type(e.ret)))),
+                             exports)
 
 const _WRAP_STRARR_HELPER = """
 /* PtStrArray: carrier for Vector{String} <-> list[str]. */
@@ -482,6 +505,17 @@ static PyObject *_pt_strarray_to_list(char **data, int64_t len) {
     }
     free(data);
     return lst;
+}
+"""
+
+const _WRAP_HANDLE_HELPER = """
+/* PtHandle: carrier for opaque-handle types (@pyhandle).  The handle is a
+   malloc'd copy of an isbitstype Julia struct on the C heap.  Python sees a
+   PyCapsule whose destructor calls free() when Python GC collects it.
+   Constructor @pyfuncs return PtHandle; method @pyfuncs receive it as arg. */
+typedef struct { void *ptr; } PtHandle;
+static void _pt_capsule_free(PyObject *cap) {
+    free(PyCapsule_GetPointer(cap, NULL));
 }
 """
 
@@ -571,6 +605,9 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport};
     end
     if _uses_strarr(exports)
         print(io, _WRAP_STRARR_HELPER)
+    end
+    if _uses_handles(exports)
+        print(io, _WRAP_HANDLE_HELPER)
     end
     structs = _array_structs(exports)
     if !isempty(structs)

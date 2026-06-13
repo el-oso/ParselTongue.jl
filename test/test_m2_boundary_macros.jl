@@ -1,9 +1,16 @@
 using Test
 using ParselTongue
 using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
-                    c_abi_type, from_c, to_c, Mut,
+                    c_abi_type, from_c, to_c, Mut, PtHandle,
                     PtExport, PtArray, emit_ccallable, emit_entry, emit_cshim,
                     _EXPORTS, clear_exports!, _default_py_name, submodule_names
+
+# Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
+struct _TestHandle
+    x::Float64
+    n::Int64
+end
+@pyhandle _TestHandle
 
 @testset "boundary scalar impls" begin
     @test c_abi_type(Int64) === Int64
@@ -257,6 +264,51 @@ end
     @test occursin("_pt_free_str_array", c)
     @test occursin("PyList_Check", c)     # arg validation
     @test occursin("PyUnicode_AsUTF8AndSize", c)
+end
+
+@testset "opaque handle types (@pyhandle, item 12)" begin
+    # @pyhandle rejects non-isbits types (Int is a primitive, not isbitstype-wrappable).
+    err = try; @eval @pyhandle String; catch e; e; end
+    @test (err isa LoadError ? err.error : err) isa ErrorException
+
+    # Boundary protocol is now complete (registered at file scope above).
+    @test is_boundary_type(_TestHandle)
+    @test c_abi_type(_TestHandle) === ParselTongue.PtHandle
+    @test assert_ret_boundary(_TestHandle) === ParselTongue.PtHandle
+
+    # Round-trip: to_c mallocs a copy; from_c loads it back.
+    orig = _TestHandle(3.14, 42)
+    h = to_c(orig)
+    @test h isa PtHandle
+    @test h.ptr != Ptr{Cvoid}(0)
+    recovered = from_c(_TestHandle, h)
+    @test recovered === orig
+    Libc.free(h.ptr)   # to_c malloc's; free manually in the test
+
+    # @pyfunc records correct carrier type for handle args/returns.
+    clear_exports!()
+    @pyfunc make_th(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
+    @pyfunc get_x(h::_TestHandle)::Float64 = h.x
+    @pyfunc update_n(h::_TestHandle, n::Int64)::_TestHandle = _TestHandle(h.x, n)
+
+    @test length(_EXPORTS) == 3
+    e_make = _EXPORTS[findfirst(e -> e.export_name == "make_th", _EXPORTS)]
+    @test c_abi_type(e_make.ret) === ParselTongue.PtHandle
+    e_get  = _EXPORTS[findfirst(e -> e.export_name == "get_x",  _EXPORTS)]
+    @test c_abi_type(e_get.args[1].jl_type) === ParselTongue.PtHandle
+
+    # emit_ccallable: return type and param type are ParselTongue.PtHandle.
+    src = emit_ccallable(e_make)
+    @test occursin("ParselTongue.PtHandle", src)
+    @test Meta.parse(src) isa Expr
+
+    # C shim emits capsule helpers and PtHandle typedef.
+    c = emit_cshim("demo", _EXPORTS)
+    @test occursin("typedef struct { void *ptr; } PtHandle;", c)
+    @test occursin("_pt_capsule_free", c)
+    @test occursin("PyCapsule_New", c)        # constructor return
+    @test occursin("PyCapsule_CheckExact", c) # method arg validation
+    @test occursin("PyCapsule_GetPointer", c) # handle extraction
 end
 
 @testset "NamedTuple return (item 8)" begin

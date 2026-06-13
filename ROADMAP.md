@@ -114,11 +114,13 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
 
 ## Phase 4 — optional capability track (stateful objects)
 
-- [ ] **12. Opaque-handle types (~scoped `#[pyclass]`)** — a Julia mutable struct kept
-  alive behind an opaque pointer/`PyCapsule`; a constructor `@pyfunc` returns a handle,
-  methods are `@pyfunc`s taking the handle, with explicit `free`/capsule destructor and
-  a GC root registry so Julia doesn't collect it early. Closes the biggest capability
-  gap but is a large, higher-risk design. Effort L+ · Risk H · **clearly optional.**
+- [x] **12. Opaque-handle types (~scoped `#[pyclass]`)** — `@pyhandle T` for isbitstype
+  (immutable, all-isbits fields) structs stored on the C heap. A constructor `@pyfunc`
+  returns a `PyCapsule`; method `@pyfunc`s receive/return handles. Mutation is
+  functional (return new handles). `free` is called automatically by the capsule
+  destructor. GC-root complexity avoided by restricting to isbitstype. `build.jl` uses
+  `Base.invokelatest` so `c_abi_type` dispatch sees `@pyhandle`-registered methods.
+  `_type_src` strips sandbox module qualifiers for user-defined types. Effort L · Risk M.
 
 ## Cross-cutting conventions
 

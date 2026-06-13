@@ -21,6 +21,7 @@ function _zero_cval(@nospecialize(C::Type))
     iscomplex(C)  && return string("zero(", _type_src(C), ")")
     C === Cstring && return "Cstring(Ptr{UInt8}(0))"
     C === ParselTongue.PtStrArray && return "ParselTongue.PtStrArray(Ptr{Ptr{UInt8}}(0), Int64(0))"
+    C === ParselTongue.PtHandle && return "ParselTongue.PtHandle(Ptr{Cvoid}(0))"
     if isarray(C)
         T = _type_src(C.parameters[1])
         N = C.parameters[2]::Int
@@ -42,8 +43,18 @@ function _type_src(@nospecialize(T::Type))
         # caller has `using ParselTongue: PtStrArray` in scope (which causes
         # string(PtStrArray) to drop the module prefix in the current session).
         return "ParselTongue.PtStrArray"
+    elseif T === PtHandle
+        return "ParselTongue.PtHandle"
     elseif T isa DataType && T <: Tuple
         return string("Tuple{", join((_type_src(S) for S in fieldtypes(T)), ", "), "}")
+    end
+    # For user-defined types (not from Base, Core, or ParselTongue) return only
+    # the bare type name. The juliac entry file include's the user source into
+    # Main, so user types (including @pyhandle structs) are reachable by bare name.
+    # Fully-qualified sandbox-module paths (e.g. Main.ParselTongueUserSandbox.Pt2D)
+    # do not exist in the juliac subprocess and cause unresolved-call verifier errors.
+    if T isa DataType && T.name.module ∉ (Base, Core, @__MODULE__)
+        return String(T.name.name)
     end
     return string(T)
 end
