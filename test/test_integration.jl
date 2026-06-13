@@ -55,6 +55,28 @@ end
         except RuntimeError as exc:
             assert "division by zero" in str(exc), f"wrong message: {exc}"
         assert feature.safe_div(10.0, 2.0) == 5.0  # success path still works
+        # GIL is released during Julia compute: two threads should overlap
+        import threading, time
+        t0 = time.time()
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(feature.sleep_ms(100))) for _ in range(2)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        elapsed = time.time() - t0
+        assert elapsed < 0.15, f"GIL not released: elapsed {elapsed:.2f}s (expected < 0.15s)"
+        assert results.count(100) == 2
+        # Zero-copy array returns: base chain must not go through a bytearray
+        try:
+            import numpy as np
+            A = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+            out = feature.rowsums(A)
+            bases = []
+            b = out
+            while hasattr(b, "base") and b.base is not None:
+                b = b.base; bases.append(b)
+            assert not any(isinstance(x, bytearray) for x in bases), "array return went through bytearray (not zero-copy)"
+        except ImportError:
+            pass
         print("FEATURE_OK")
         """
         out = read(`$(Sys.which("python3")) -c $script`, String)

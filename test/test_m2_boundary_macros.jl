@@ -119,7 +119,9 @@ end
     @test occursin("PyArg_ParseTuple", c)
     @test occursin("PyObject_GetBuffer", c)          # array arg
     @test occursin("typedef struct {", c)            # PtArray carrier struct
-    @test occursin("frombuffer", c)                  # numpy-at-runtime return
+    @test occursin("frombuffer", c)                  # numpy-at-runtime return (zero-copy)
+    @test occursin("_PtBuf", c)                      # zero-copy buffer owner type
+    @test occursin("Py_BEGIN_ALLOW_THREADS", c)      # GIL released during Julia call
     @test occursin("PyUnicode_FromString", c)        # string return
 end
 

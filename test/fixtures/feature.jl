@@ -17,4 +17,5 @@ using ParselTongue
 
     @pyfunc boom()::Int64 = error("boom!")
     @pyfunc safe_div(a::Float64, b::Float64)::Float64 = b == 0.0 ? error("division by zero") : a / b
+    @pyfunc sleep_ms(ms::Int64)::Int64 = (Libc.systemsleep(ms / 1000.0); ms)
 end

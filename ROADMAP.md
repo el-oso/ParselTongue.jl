@@ -69,7 +69,7 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   - Effort M · Risk L–M · Done-when: one wheel imports under two different CPython
     3.x minors.
 
-- [ ] **3. Release the GIL during compute + zero-copy array returns** *(performance)*
+- [x] **3. Release the GIL during compute + zero-copy array returns** *(performance)*
   - Gap: the shim holds the GIL for the whole call (blocks other Python threads),
     and array **returns** do one extra copy (malloc → `bytearray` → `frombuffer`).
   - GIL: wrap only the `pt_<fn>(...)` call in `Py_BEGIN_ALLOW_THREADS` /

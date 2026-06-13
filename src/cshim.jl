@@ -230,22 +230,17 @@ function _build_pyobject(@nospecialize(C::Type), val::AbstractString, out::Abstr
                 string("free((void *)", val, ");")]
     elseif isarray(C)
         e = _elt(C); n = _ndims(C)
-        ne = string("nelem_", out); shp = string("shp_", out); ba = string("ba_", out)
+        ne = string("nelem_", out); shp = string("shp_", out); nb = string("nbytes_", out)
         stmts = [string("Py_ssize_t ", ne, " = 1;")]
         for k in 0:n-1
             push!(stmts, string(ne, " *= (Py_ssize_t)", val, ".shape[", k, "];"))
         end
         push!(stmts, string("Py_ssize_t ", shp, "[", n, "] = {",
                             join(("(Py_ssize_t)$val.shape[$k]" for k in 0:n-1), ", "), "};"))
-        append!(stmts, [
-            string("PyObject *", ba, " = PyByteArray_FromStringAndSize((const char *)", val,
-                   ".data, ", ne, " * (Py_ssize_t)sizeof(", e.ctype, "));"),
-            string("free(", val, ".data);"),
-            # returns are always column-major (to_c tags order=1) -> reshape order 'F'
-            string("PyObject *", out, " = ", ba, " ? _pt_wrap_ndarray(", ba, ", \"", e.np,
-                   "\", ", shp, ", ", n, ", ", val, ".order) : NULL;"),
-            string("Py_XDECREF(", ba, ");"),
-        ])
+        push!(stmts, string("Py_ssize_t ", nb, " = ", ne, " * (Py_ssize_t)sizeof(", e.ctype, ");"))
+        # _pt_wrap_ndarray takes ownership of val.data (frees it on error or via _PtBuf).
+        push!(stmts, string("PyObject *", out, " = _pt_wrap_ndarray(", val, ".data, ", nb,
+                            ", \"", e.np, "\", ", shp, ", ", n, ", ", val, ".order);"))
         return stmts
     end
     error("ParselTongue: no return marshalling for carrier `$C`.")
@@ -313,10 +308,16 @@ function _wrapper_fn(e::PtExport)
     println(io, "    char *_pt_errmsg = NULL;")
     retc = c_abi_type(e.ret)
     err_suffix = isempty(callargs) ? "&_pt_err, &_pt_errmsg" : ", &_pt_err, &_pt_errmsg"
+    call_expr = string(cabi_symbol(e), "(", join(callargs, ", "), err_suffix, ")")
     if retc === Cvoid
-        println(io, "    ", cabi_symbol(e), "(", join(callargs, ", "), err_suffix, ");")
+        println(io, "    Py_BEGIN_ALLOW_THREADS")
+        println(io, "    ", call_expr, ";")
+        println(io, "    Py_END_ALLOW_THREADS")
     else
-        println(io, "    ", _c_ctype(retc), " r = ", cabi_symbol(e), "(", join(callargs, ", "), err_suffix, ");")
+        println(io, "    ", _c_ctype(retc), " r;")
+        println(io, "    Py_BEGIN_ALLOW_THREADS")
+        println(io, "    r = ", call_expr, ";")
+        println(io, "    Py_END_ALLOW_THREADS")
     end
     for s in cleanups; println(io, "    ", s); end
     println(io, "    if (_pt_err) {")
@@ -361,15 +362,52 @@ end
 _uses_arrays(exports) = !isempty(_array_structs(exports))
 
 const _WRAP_ARRAY_HELPER = """
-/* Turn a bytearray of raw elements into an N-D numpy array (reshaped in the given
-   order: 0='C', 1='F') if numpy is importable, else a flat memoryview. The result
-   keeps a reference to `ba`, so the caller may DECREF it afterwards. numpy is
-   resolved at runtime — never a build dependency. */
-static PyObject *_pt_wrap_ndarray(PyObject *ba, const char *dtype,
+/* _PtBuf: a minimal Python object that owns a malloc'd byte buffer and exposes it
+   via the buffer protocol.  numpy.frombuffer() accepts any buffer-protocol object,
+   so Julia's result buffer can be handed straight to NumPy without an intermediate
+   copy.  When the NumPy array (and therefore this object) is GC'd, the destructor
+   calls free().  Initialised by PyInit_<mod> via PyType_Ready. */
+typedef struct { PyObject_HEAD void *data; Py_ssize_t len; } _PtBuf;
+static void _ptbuf_dealloc(_PtBuf *self) {
+    free(self->data);
+    Py_TYPE(self)->tp_free((PyObject *)self);
+}
+static int _ptbuf_getbuf(PyObject *self_, Py_buffer *v, int flags) {
+    _PtBuf *self = (_PtBuf *)self_;
+    return PyBuffer_FillInfo(v, self_, self->data, self->len, 0, flags);
+}
+static PyBufferProcs _ptbuf_bufs = { _ptbuf_getbuf, NULL };
+static PyTypeObject _PtBufType = {
+    PyVarObject_HEAD_INIT(NULL, 0)
+    .tp_name      = "parseltongue._PtBuf",
+    .tp_basicsize = sizeof(_PtBuf),
+    .tp_dealloc   = (destructor)_ptbuf_dealloc,
+    .tp_as_buffer = &_ptbuf_bufs,
+    .tp_flags     = Py_TPFLAGS_DEFAULT,
+    .tp_doc       = "ParselTongue internal: owns a malloc\\'d byte buffer.",
+};
+/* Create a _PtBuf that takes ownership of `data` (frees it on alloc failure). */
+static PyObject *_pt_make_buf(void *data, Py_ssize_t nbytes) {
+    _PtBuf *o = PyObject_New(_PtBuf, &_PtBufType);
+    if (!o) { free(data); return NULL; }
+    o->data = data; o->len = nbytes;
+    return (PyObject *)o;
+}
+/* Wrap a Julia-malloc'd buffer into an N-D NumPy array (zero-copy via _PtBuf),
+   or a flat memoryview if NumPy is unavailable.  Takes ownership of `data`. */
+static PyObject *_pt_wrap_ndarray(void *data, Py_ssize_t nbytes, const char *dtype,
                                   const Py_ssize_t *shape, int ndim, int order) {
+    PyObject *buf = _pt_make_buf(data, nbytes);
+    if (!buf) return NULL;
     PyObject *np = PyImport_ImportModule("numpy");
-    if (!np) { PyErr_Clear(); return PyMemoryView_FromObject(ba); }
-    PyObject *flat = PyObject_CallMethod(np, "frombuffer", "Os", ba, dtype);
+    if (!np) {
+        PyErr_Clear();
+        PyObject *mv = PyMemoryView_FromObject(buf);
+        Py_DECREF(buf);
+        return mv;
+    }
+    PyObject *flat = PyObject_CallMethod(np, "frombuffer", "Os", buf, dtype);
+    Py_DECREF(buf);   /* numpy holds ref to buf via flat.base */
     Py_DECREF(np);
     if (!flat) return NULL;
     PyObject *sh = PyTuple_New(ndim);
@@ -444,6 +482,9 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport};
     println(io, "};")
     println(io)
     println(io, "PyMODINIT_FUNC PyInit_", mod_name, "(void) {")
+    if _uses_arrays(exports)
+        println(io, "    if (PyType_Ready(&_PtBufType) < 0) return NULL;")
+    end
     println(io, "    /* trimmed Julia lib self-initializes on first @ccallable call */")
     println(io, "    return PyModule_Create(&", mod_name, "_module);")
     println(io, "}")
