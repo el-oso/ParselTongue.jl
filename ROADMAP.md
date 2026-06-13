@@ -115,25 +115,17 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
 
 ## Phase 3 — performance & polish
 
-- [ ] **9. Shrink the bundle** *(size)* — `readelf -d` analysis shows that the
+- [x] **9. Shrink the bundle** *(size)* — `readelf -d` analysis shows that the
   extension .so only needs 6 Julia libs via DT_NEEDED (`libjulia-internal`, `libstdc++`,
   `libgcc_s`, `libunwind`, `libatomic`, `libz` ≈ 38 MB) — the other ~70 MB
-  (OpenBLAS/SuiteSparse/GMP/curl/ssl/etc.) is over-vendored. `libjulia-internal`
-  does NOT DT_NEED OpenBLAS; those libs would only be needed if the user's Julia code
-  does `using LinearAlgebra`. Implement `build_wheel(...; slim=true)` that uses
-  `readelf -d` BFS to compute the transitive DT_NEEDED closure of the extension .so,
-  then only vendors libs in that closure (`_transitive_needed` + `_vendor_libs_smart`).
-  Also add `bundle_size_report(whl_path)` utility.
-  - Files: `wheel.jl` (`_readelf_needed`, `_transitive_needed`, `_resolve_soname`,
-    `_vendor_libs_smart`, `bundle_size_report`; modify `build_wheel` to accept
-    `slim=false`), `ParselTongue.jl` (export `bundle_size_report`).
-  - Warning: slim mode is unsafe if Julia code loads `LinearAlgebra`/`SuiteSparse`
-    (those JLL `__init__`s dlopen their libs at startup — not in DT_NEEDED chain but
-    loaded at runtime). Add a docstring warning.
-  - Tests: unit test `_readelf_needed(libjulia-internal.so)` does not contain
-    "openblas" or "cholmod"; integration test `build_wheel(...; slim=true)` produces
-    a smaller wheel that still imports.
-  - Effort M · Risk M (safe for numeric/string-only code; breaks for LinearAlgebra users).
+  (OpenBLAS/SuiteSparse/GMP/curl/ssl/etc.) is over-vendored. Shipped in v0.9.0.
+  `build_wheel(...; slim=true)` uses `readelf -d` BFS (`_transitive_needed` +
+  `_vendor_libs_smart`) to compute the transitive DT_NEEDED closure of the extension
+  .so and only vendors libs in that closure. `bundle_size_report(whl_path)` is a
+  utility for auditing wheel contents.
+  **Warning**: `slim=true` breaks extensions that `using LinearAlgebra`/`SuiteSparse`
+  — those JLL `__init__`s dlopen their libs at startup via `dlopen` (not DT_NEEDED),
+  so those libs are absent from the transitive closure and will cause `ImportError`.
 - [ ] **10. CI + distribution polish** — GitHub Actions wheel matrix (Python × plat),
   doctest the docs examples, prep for Julia General registry. Effort M.
 - [ ] **11. Startup latency** — measure/trim first-call runtime init. Effort S.

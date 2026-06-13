@@ -5,7 +5,9 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     PtExport, PtArray, emit_ccallable, emit_entry, emit_cshim,
                     _EXPORTS, clear_exports!, _default_py_name, submodule_names,
                     _julia_version_str, _runtime_wheel_tag, _runtime_metadata,
-                    _RUNTIME_INIT_PY, _write_shared_pkg_pyfiles
+                    _RUNTIME_INIT_PY, _write_shared_pkg_pyfiles,
+                    _readelf_needed, _transitive_needed, _resolve_soname,
+                    _vendor_libs_smart
 
 # Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
 struct _TestHandle
@@ -355,6 +357,46 @@ end
     # Function-form equivalents ARE present (used for list/tuple operations).
     @test occursin("PyList_SetItem",  c_abi3)
     @test occursin("PyTuple_SetItem", c_abi3)
+end
+
+@testset "slim vendoring helpers (item 9)" begin
+    # _readelf_needed on a real Julia lib should return a non-empty soname list.
+    julia_lib = abspath(joinpath(Sys.BINDIR, "..", "lib", "julia"))
+    libjulia_int = filter(n -> startswith(n, "libjulia-internal") && !occursin(".a", n) &&
+                                isfile(joinpath(julia_lib, n)) && !islink(joinpath(julia_lib, n)),
+                          readdir(julia_lib))
+    if !isempty(libjulia_int)
+        needs = _readelf_needed(joinpath(julia_lib, first(libjulia_int)))
+        @test !isempty(needs)
+        # libjulia-internal must not DT_NEED OpenBLAS or SuiteSparse/cholmod (item 9 claim).
+        @test !any(n -> occursin("openblas", lowercase(n)), needs)
+        @test !any(n -> occursin("cholmod",  lowercase(n)), needs)
+    end
+
+    # _resolve_soname: should find libjulia in the Julia lib dirs.
+    lib_dirs = [abspath(joinpath(Sys.BINDIR, "..", "lib")),
+                abspath(joinpath(Sys.BINDIR, "..", "lib", "julia"))]
+    libjulia_sonames = filter(n -> startswith(n, "libjulia.so"),
+                              readdir(first(lib_dirs)))
+    if !isempty(libjulia_sonames)
+        resolved = _resolve_soname(first(libjulia_sonames), lib_dirs)
+        @test resolved !== nothing
+        @test isfile(resolved)
+    end
+
+    # _vendor_libs_smart: only copies files whose soname is in `needed`.
+    src = mktempdir(); dst = mktempdir()
+    try
+        # Create two fake .so files; only one is in needed.
+        write(joinpath(src, "libfoo.so.1"), "foo")
+        write(joinpath(src, "libbar.so.1"), "bar")
+        needed = Set(["libfoo.so.1"])
+        _vendor_libs_smart(src, dst, needed)
+        @test  isfile(joinpath(dst, "libfoo.so.1"))
+        @test !isfile(joinpath(dst, "libbar.so.1"))
+    finally
+        rm(src; recursive=true); rm(dst; recursive=true)
+    end
 end
 
 @testset "shared-runtime wheel helpers (item 4)" begin

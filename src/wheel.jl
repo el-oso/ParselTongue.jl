@@ -41,7 +41,8 @@ end
 """
     build_wheel(user_path; version="0.1.0", mod_name=nothing,
                 outdir=dirname(user_path), python="python3", trim=:safe,
-                abi3=false, runtime=:bundled, keep_build=false, verbose=false) -> String
+                abi3=false, runtime=:bundled, slim=false,
+                keep_build=false, verbose=false) -> String
 
 Build a pip-installable wheel from the `@pyfunc`-annotated functions in `user_path`.
 Returns the path to the `.whl`.
@@ -55,6 +56,14 @@ Returns the path to the `.whl`.
   the runtime package's `julia/lib` dirs before importing the extension `.so`.
   Build the runtime wheel with [`build_runtime_wheel`](@ref).
 
+When `slim=true` the bundled Julia runtime is trimmed to only the libraries that the
+extension `.so` actually needs (via `readelf -d` BFS), reducing wheel size from ~100 MB
+to ~38 MB for typical numeric/string extensions. **Warning**: `slim=true` breaks
+extensions that `using LinearAlgebra`, `using SuiteSparse`, etc. — those JLL
+`__init__`s dlopen their libraries at startup via `dlopen` calls (not DT_NEEDED entries),
+so they are absent from the transitive closure and will cause an `ImportError` at
+runtime. Only use `slim=true` if you are sure your code does not load stdlib JLLs.
+
 When `abi3=true` the extension is compiled against the stable ABI
 (`Py_LIMITED_API=0x030B0000`) and the wheel tag is `cp311-abi3-<plat>`,
 making it installable on any CPython ≥ 3.11 without recompilation.
@@ -67,10 +76,13 @@ function build_wheel(user_path::AbstractString;
                      trim::Symbol=:safe,
                      abi3::Bool=false,
                      runtime::Symbol=:bundled,
+                     slim::Bool=false,
                      keep_build::Bool=false,
                      verbose::Bool=false)
     runtime in (:bundled, :shared) ||
         error("ParselTongue: runtime must be :bundled or :shared, got :$runtime")
+    slim && runtime === :shared &&
+        error("ParselTongue: slim=true is not meaningful with runtime=:shared (no libs are vendored)")
 
     user_path = abspath(user_path)
     # Resolve the user-facing module name the same way build_extension does.
@@ -93,17 +105,29 @@ function build_wheel(user_path::AbstractString;
     ext_name = string("_", mod)
     rpaths = runtime === :bundled ?
         ["\$ORIGIN/julia/lib", "\$ORIGIN/julia/lib/julia"] : String[]
-    build_extension(user_path;
-                    mod_name=ext_name, outdir=pkgdir, trim, python, abi3,
-                    runtime_rpaths=rpaths,
-                    strip_abs_rpath=true, keep_build, verbose)
+    so = build_extension(user_path;
+                         mod_name=ext_name, outdir=pkgdir, trim, python, abi3,
+                         runtime_rpaths=rpaths,
+                         strip_abs_rpath=true, keep_build, verbose)
     exports = copy(_EXPORTS)   # build_extension repopulated the registry
 
     # 2. Vendor the Julia runtime (bundled only).
     if runtime === :bundled
         libsrc = abspath(joinpath(Sys.BINDIR, "..", "lib"))
-        _vendor_libs(libsrc, joinpath(pkgdir, "julia", "lib"))
-        _vendor_libs(joinpath(libsrc, "julia"), joinpath(pkgdir, "julia", "lib", "julia"))
+        libsrc_julia = joinpath(libsrc, "julia")
+        dst_lib      = joinpath(pkgdir, "julia", "lib")
+        dst_lib_j    = joinpath(pkgdir, "julia", "lib", "julia")
+        if slim
+            # BFS over DT_NEEDED from the compiled .so; only vendor what's reachable.
+            lib_dirs = [libsrc, libsrc_julia]
+            needed   = _transitive_needed(so, lib_dirs)
+            verbose && @info "ParselTongue: slim=true — vendoring $(length(needed)) libs (of $(length(readdir(libsrc_julia))) total)"
+            _vendor_libs_smart(libsrc,       dst_lib,   needed)
+            _vendor_libs_smart(libsrc_julia, dst_lib_j, needed)
+        else
+            _vendor_libs(libsrc,       dst_lib)
+            _vendor_libs(libsrc_julia, dst_lib_j)
+        end
     end
 
     # 3. __init__.py + per-submodule re-export files.
@@ -356,4 +380,102 @@ $(imports_str)$(submod_str)$(all_str)"""
                      "__all__ = [", join(("\"$n\"" for n in names), ", "), "]\n"))
     end
     return nothing
+end
+
+# ── Slim vendoring (item 9) ────────────────────────────────────────────
+
+# Return the DT_NEEDED sonames listed in `so_path` (requires `readelf` on PATH).
+function _readelf_needed(so_path::AbstractString)
+    needed = String[]
+    for line in eachline(ignorestatus(`readelf -d $so_path`))
+        m = match(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", line)
+        m !== nothing && push!(needed, m.captures[1])
+    end
+    return needed
+end
+
+# Resolve a soname to an on-disk path by searching `lib_dirs` in order.
+# Returns `nothing` if not found in any of the search dirs.
+function _resolve_soname(soname::AbstractString, lib_dirs::AbstractVector{<:AbstractString})
+    for dir in lib_dirs
+        for name in readdir(dir)
+            if name == soname
+                full = joinpath(dir, name)
+                isfile(full) && return full
+            end
+        end
+    end
+    return nothing
+end
+
+# BFS over DT_NEEDED entries starting from `so_path`; returns the set of sonames
+# (basenames) of every transitively needed library found in `lib_dirs`.
+function _transitive_needed(so_path::AbstractString,
+                            lib_dirs::AbstractVector{<:AbstractString})
+    visited  = Set{String}()  # sonames already enqueued
+    needed   = Set{String}()  # sonames resolved to a local file
+    queue    = String[so_path]
+
+    while !isempty(queue)
+        path = popfirst!(queue)
+        for soname in _readelf_needed(path)
+            soname in visited && continue
+            push!(visited, soname)
+            resolved = _resolve_soname(soname, lib_dirs)
+            resolved === nothing && continue   # system lib — not vendored
+            push!(needed, soname)
+            push!(queue, resolved)
+        end
+    end
+    return needed
+end
+
+# Like _vendor_libs but only copies libs whose soname (or the soname of their
+# symlink target) appears in `needed`.
+function _vendor_libs_smart(srcdir::AbstractString, dstdir::AbstractString,
+                            needed::Set{String})
+    mkpath(dstdir)
+    n = 0
+    for name in readdir(srcdir)
+        occursin(".so", name) || continue
+        occursin(_SKIP_LIB, name) && continue
+        path = joinpath(srcdir, name)
+        real_name = islink(path) ? basename(realpath(path)) : name
+        (name in needed || real_name in needed) || continue
+        cp(path, joinpath(dstdir, name); follow_symlinks=false, force=true)
+        n += 1
+    end
+    n
+end
+
+"""
+    bundle_size_report(whl_path; python="python3") -> Vector{NamedTuple}
+
+Return a list of `(; name, bytes, compressed_bytes)` NamedTuples for every file
+in `whl_path`, sorted largest uncompressed first. Useful for auditing wheel size.
+
+```julia-repl
+julia> rpt = bundle_size_report("dist/mathx-0.1.0-cp314-cp314-linux_x86_64.whl")
+julia> foreach(r -> println(lpad(r.bytes ÷ 1024, 8), " KB  ", r.name), rpt[1:10])
+```
+"""
+function bundle_size_report(whl_path::AbstractString;
+                            python::AbstractString=get(ENV, "PYTHON3", "python3"))
+    script = raw"""
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    for i in sorted(z.infolist(), key=lambda x: -x.file_size):
+        print(f"{i.file_size}\t{i.compress_size}\t{i.filename}")
+"""
+    lines = readlines(`$python -c $script $whl_path`)
+    T = @NamedTuple{name::String, bytes::Int, compressed_bytes::Int}
+    result = T[]
+    for line in lines
+        parts = split(line, '\t'; limit=3)
+        length(parts) == 3 || continue
+        push!(result, (name=String(parts[3]),
+                       bytes=parse(Int, parts[1]),
+                       compressed_bytes=parse(Int, parts[2])))
+    end
+    return result
 end
