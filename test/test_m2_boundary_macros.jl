@@ -61,9 +61,14 @@ end
     clear_exports!()
     @pyfunc add(a::Int, b::Int)::Int = a + b
     src = emit_ccallable(_EXPORTS[1])
-    @test occursin("Base.@ccallable function pt_add(a::Int64, b::Int64)::Int64", src)
+    # Error out-params are appended to the signature.
+    @test occursin("pt_add(a::Int64, b::Int64, _pt_err::Ptr{Int32}, _pt_errmsg::Ptr{Ptr{UInt8}})::Int64", src)
     @test occursin("ParselTongue.from_c(Int64, a)", src)
     @test occursin("ParselTongue.to_c(add(", src)
+    # try/catch error propagation is present.
+    @test occursin("try", src)
+    @test occursin("catch _e", src)
+    @test occursin("unsafe_store!(_pt_err", src)
     # The emitted wrapper parses as valid Julia.
     @test Meta.parse(src) isa Expr
 end

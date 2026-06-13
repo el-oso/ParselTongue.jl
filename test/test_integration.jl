@@ -43,6 +43,18 @@ end
             assert list(feature.dims(A)) == [3, 2]                # dense: transposed for C-order
         except ImportError:
             pass
+        # Julia errors must surface as Python RuntimeError (not crashes)
+        try:
+            feature.boom()
+            assert False, "expected RuntimeError from boom()"
+        except RuntimeError as exc:
+            assert "boom!" in str(exc), f"wrong message: {exc}"
+        try:
+            feature.safe_div(1.0, 0.0)
+            assert False, "expected RuntimeError from safe_div"
+        except RuntimeError as exc:
+            assert "division by zero" in str(exc), f"wrong message: {exc}"
+        assert feature.safe_div(10.0, 2.0) == 5.0  # success path still works
         print("FEATURE_OK")
         """
         out = read(`$(Sys.which("python3")) -c $script`, String)

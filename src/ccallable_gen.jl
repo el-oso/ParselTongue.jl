@@ -12,6 +12,27 @@
 # A type rendered as parseable Julia source valid inside the generated entry
 # (which only does `using ParselTongue`). Scalars/String/Cstring print back
 # directly; the ParselTongue-owned carrier `PtArray{T,N}` is module-qualified.
+# Returns Julia source text for a zero-valued instance of carrier C, used to
+# initialize the result variable before the try block (the C shim discards this
+# value when an error is signalled, but Julia's type system needs a valid return).
+function _zero_cval(@nospecialize(C::Type))
+    C === Cvoid   && return ""
+    isscalar(C)   && return string("zero(", _type_src(C), ")")
+    iscomplex(C)  && return string("zero(", _type_src(C), ")")
+    C === Cstring && return "Cstring(Ptr{UInt8}(0))"
+    if isarray(C)
+        T = _type_src(C.parameters[1])
+        N = C.parameters[2]::Int
+        shape = string("(", join(fill("Int64(0)", N), ", "), N == 1 ? "," : "", ")")
+        return string(_type_src(C), "(Ptr{", T, "}(0), ", shape, ", Int32(0))")
+    end
+    if istuple(C)
+        parts = [_zero_cval(S) for S in fieldtypes(C)]
+        return string("(", join(parts, ", "), length(parts) == 1 ? "," : "", ")")
+    end
+    error("ParselTongue: _zero_cval: unhandled carrier $C")
+end
+
 function _type_src(@nospecialize(T::Type))
     if T isa DataType && T.name === PtArray.body.body.name
         return string("ParselTongue.PtArray{", _type_src(T.parameters[1]), ", ", T.parameters[2], "}")
@@ -29,32 +50,75 @@ wrapper references the user function by its bare name, so it must be emitted int
 the same scope into which the user code was `include`d.
 """
 function emit_ccallable(e::PtExport)
-    sym       = cabi_symbol(e)                       # e.g. "pt_add"
-    ret_c     = c_abi_type(e.ret)
-    # Parameter list with carrier types: `a::Int64, b::Int64`
+    sym   = cabi_symbol(e)
+    ret_c = c_abi_type(e.ret)
+
     params = String[]
     conv   = String[]
     for a in e.args
         ci = c_abi_type(a.jl_type)
         push!(params, string(a.name, "::", _type_src(ci)))
-        # from_c(<NativeType>, <param>)
         push!(conv, string("ParselTongue.from_c(", _type_src(a.jl_type), ", ", a.name, ")"))
     end
+    # Trailing error out-parameters: signal exceptions to the C shim.
+    push!(params, "_pt_err::Ptr{Int32}")
+    push!(params, "_pt_errmsg::Ptr{Ptr{UInt8}}")
+
     call = string(e.jl_func, "(", join(conv, ", "), ")")
-    # `::Nothing` returns lower to a void wrapper that calls the function and returns
-    # nothing (no `to_c`); everything else wraps the result through `to_c`.
-    if e.ret === Nothing
+
+    # Catch block: signal the error and copy the message into a malloc'd C buffer.
+    # The C shim checks _pt_err, builds the Python exception, and frees the buffer.
+    #
+    # Nested isa checks are required for --trim=safe:
+    #   _e::Any  (general catch; user function may throw any exception type)
+    #   → isa ErrorException narrows _e to ErrorException
+    #   → _e.msg::AbstractString (field is declared AbstractString in Julia base)
+    #   → isa String narrows _m to String, making pointer/_n concrete
+    # Without the inner `isa String`, assigning to ::String triggers
+    # convert(String, ::AbstractString) which is dynamic dispatch.
+    catch_stmts = string(
+        "        unsafe_store!(_pt_err, Int32(1))\n",
+        "        local _buf::Ptr{UInt8} = Ptr{UInt8}(0)\n",
+        "        if _e isa ErrorException\n",
+        "            local _m = _e.msg\n",
+        "            if _m isa String\n",
+        "                local _n::Int = sizeof(_m)\n",
+        "                _buf = Ptr{UInt8}(Libc.malloc(_n + 1))\n",
+        "                if _buf != C_NULL\n",
+        "                    unsafe_copyto!(_buf, pointer(_m), _n)\n",
+        "                    unsafe_store!(_buf, UInt8(0), _n + 1)\n",
+        "                end\n",
+        "            end\n",
+        "        end\n",
+        "        unsafe_store!(_pt_errmsg, _buf)\n",
+    )
+
+    sig = string("Base.@ccallable function ", sym, "(", join(params, ", "), ")")
+    if ret_c === Cvoid
         return string(
-            "Base.@ccallable function ", sym, "(", join(params, ", "), ")::Cvoid\n",
-            "    ", call, "\n",
+            sig, "::Cvoid\n",
+            "    try\n",
+            "        ", call, "\n",
+            "        unsafe_store!(_pt_err, Int32(0))\n",
+            "    catch _e\n",
+            catch_stmts,
+            "    end\n",
             "    return\n",
             "end\n",
         )
     end
-    body = string("ParselTongue.to_c(", call, ")")
+    ret_src  = _type_src(ret_c)
+    zero_src = _zero_cval(ret_c)
     return string(
-        "Base.@ccallable function ", sym, "(", join(params, ", "), ")::", _type_src(ret_c), "\n",
-        "    return ", body, "\n",
+        sig, "::", ret_src, "\n",
+        "    local _result::", ret_src, " = ", zero_src, "\n",
+        "    try\n",
+        "        _result = ParselTongue.to_c(", call, ")\n",
+        "        unsafe_store!(_pt_err, Int32(0))\n",
+        "    catch _e\n",
+        catch_stmts,
+        "    end\n",
+        "    return _result\n",
         "end\n",
     )
 end

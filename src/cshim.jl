@@ -279,8 +279,8 @@ end
 
 function _extern_decl(e::PtExport)
     ret = _c_ctype(c_abi_type(e.ret))
-    args = isempty(e.args) ? "void" :
-           join((_c_ctype(c_abi_type(a.jl_type)) for a in e.args), ", ")
+    user = [_c_ctype(c_abi_type(a.jl_type)) for a in e.args]
+    args = join([user..., "int32_t *", "char **"], ", ")
     string("extern ", ret, " ", cabi_symbol(e), "(", args, ");")
 end
 
@@ -309,13 +309,21 @@ function _wrapper_fn(e::PtExport)
     end
     for s in setups; println(io, "    ", s); end
 
+    println(io, "    int32_t _pt_err = 0;")
+    println(io, "    char *_pt_errmsg = NULL;")
     retc = c_abi_type(e.ret)
+    err_suffix = isempty(callargs) ? "&_pt_err, &_pt_errmsg" : ", &_pt_err, &_pt_errmsg"
     if retc === Cvoid
-        println(io, "    ", cabi_symbol(e), "(", join(callargs, ", "), ");")
+        println(io, "    ", cabi_symbol(e), "(", join(callargs, ", "), err_suffix, ");")
     else
-        println(io, "    ", _c_ctype(retc), " r = ", cabi_symbol(e), "(", join(callargs, ", "), ");")
+        println(io, "    ", _c_ctype(retc), " r = ", cabi_symbol(e), "(", join(callargs, ", "), err_suffix, ");")
     end
     for s in cleanups; println(io, "    ", s); end
+    println(io, "    if (_pt_err) {")
+    println(io, "        PyErr_SetString(PyExc_RuntimeError, _pt_errmsg ? _pt_errmsg : \"Julia exception\");")
+    println(io, "        free(_pt_errmsg);")
+    println(io, "        return NULL;")
+    println(io, "    }")
     for s in _ret_plan(retc).stmts; println(io, "    ", s); end
     println(io, "}")
     return String(take!(io)), wname
