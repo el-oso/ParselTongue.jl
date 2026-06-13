@@ -56,16 +56,20 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   - Effort M · Risk M (trim try/catch support unknown) · Done-when: a `@pyfunc` that
     `error("boom")` raises a Python `RuntimeError` instead of crashing.
 
-- [ ] **2. abi3 (stable-ABI) shim — one wheel across CPython versions** *(distribution)*
+- [x] **2. abi3 (stable-ABI) shim — one wheel across CPython versions** *(distribution)*
   - Gap: each extension wheel is Python-version-specific; PyO3 ships one abi3 wheel
     for many. The shim's C-API surface is **almost entirely in the limited API**;
     the only floor-setter is the buffer protocol (`PyObject_GetBuffer` etc.), which
     entered the limited API in **Python 3.11** → abi3 floor 3.11 (fine today).
   - Approach: emit `#define Py_LIMITED_API 0x030B0000` in the shim, use the abi3
     extension suffix (`.abi3.so`) and wheel tag (`cp311-abi3-<plat>`). Gate behind
-    `build_wheel(...; abi3=true)`; default could flip later.
-  - Files: `cshim.jl` (define + verify every emitted call is limited-API),
-    `build.jl` (ext suffix), `wheel.jl` (`_wheel_tag` → abi3 form).
+    `build_extension(...; abi3=true)` / `build_wheel(...; abi3=true)`.
+  - `_PtBuf` type registration refactored to `PyType_Spec`/`PyType_Slot`/`PyType_FromSpec`
+    (works in both full and limited API). Macro-only C API (`PyList_GET_SIZE`, etc.)
+    replaced with function equivalents everywhere. Complex inputs use
+    `PyComplex_RealAsDouble`/`ImagAsDouble` under abi3 (`Py_complex` not in 3.11 stable ABI).
+  - Files: `cshim.jl`, `build.jl` (abi3 ext suffix via `importlib`), `wheel.jl`
+    (`_wheel_tag_abi3` → `cp311-abi3-<plat>`).
   - Effort M · Risk L–M · Done-when: one wheel imports under two different CPython
     3.x minors.
 

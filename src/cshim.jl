@@ -181,7 +181,7 @@ function _c_scalar_lit(@nospecialize(C::Type), val)
 end
 
 function _arg_plan(@nospecialize(C::Type), i::Int; logical::Bool=false, mutable::Bool=false,
-                   default::Union{Nothing,Any}=nothing)
+                   default::Union{Nothing,Any}=nothing, abi3::Bool=false)
     tmp = string("a", i)
     if isscalar(C)
         cs = _CSCALARS[C]
@@ -192,20 +192,42 @@ function _arg_plan(@nospecialize(C::Type), i::Int; logical::Bool=false, mutable:
         end
         return ArgPlan([decl], cs.fmt, [string("&", tmp)], string("(", cs.ctype, ")", tmp))
     elseif iscomplex(C)
-        cc = _CCOMPLEX[C]; pc = string(tmp, "_pc")
-        if default === nothing
-            decls = [string("Py_complex ", pc, ";"), string(cc.cname, " ", tmp, ";")]
-        else
-            v = convert(ComplexF64, default)
-            decls = [
-                string("Py_complex ", pc, " = {(double)", _c_float_lit(real(v)),
-                       ", (double)", _c_float_lit(imag(v)), "};"),
-                string(cc.cname, " ", tmp, ";"),
+        cc = _CCOMPLEX[C]
+        if abi3
+            # Py_complex is not in the Python 3.11 stable ABI; use PyComplex_*AsDouble instead.
+            obj = string(tmp, "_obj")
+            decls = if default === nothing
+                [string("PyObject *", obj, " = NULL;"), string(cc.cname, " ", tmp, ";")]
+            else
+                v = convert(ComplexF64, default)
+                [string("PyObject *", obj, " = NULL;"),
+                 string(cc.cname, " ", tmp, " = {(", cc.celt, ")", _c_float_lit(real(v)),
+                        ", (", cc.celt, ")", _c_float_lit(imag(v)), "};")]
+            end
+            setup = [
+                string("if (", obj, " != NULL) {"),
+                string("    ", tmp, ".re = (", cc.celt, ")PyComplex_RealAsDouble(", obj, ");"),
+                string("    ", tmp, ".im = (", cc.celt, ")PyComplex_ImagAsDouble(", obj, ");"),
+                string("    if (PyErr_Occurred()) return NULL;"),
+                string("}"),
             ]
+            return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
+        else
+            pc = string(tmp, "_pc")
+            if default === nothing
+                decls = [string("Py_complex ", pc, ";"), string(cc.cname, " ", tmp, ";")]
+            else
+                v = convert(ComplexF64, default)
+                decls = [
+                    string("Py_complex ", pc, " = {(double)", _c_float_lit(real(v)),
+                           ", (double)", _c_float_lit(imag(v)), "};"),
+                    string(cc.cname, " ", tmp, ";"),
+                ]
+            end
+            setup = [string(tmp, ".re = (", cc.celt, ")", pc, ".real;"),
+                     string(tmp, ".im = (", cc.celt, ")", pc, ".imag;")]
+            return ArgPlan(decls, "D", [string("&", pc)], setup, tmp, String[])
         end
-        setup = [string(tmp, ".re = (", cc.celt, ")", pc, ".real;"),
-                 string(tmp, ".im = (", cc.celt, ")", pc, ".imag;")]
-        return ArgPlan(decls, "D", [string("&", pc)], setup, tmp, String[])
     elseif C === Cstring
         return ArgPlan([string("const char *", tmp, ";")], "s", [string("&", tmp)],
                        string("(char *)", tmp))
@@ -216,13 +238,13 @@ function _arg_plan(@nospecialize(C::Type), i::Int; logical::Bool=false, mutable:
                  string("PtStrArray ", tmp, " = {NULL, 0};")]
         setup = String[
             string("if (!PyList_Check(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"expected a list of str\"); return NULL; }"),
-            string("{ Py_ssize_t ", ni, " = PyList_GET_SIZE(", obj, ");"),
+            string("{ Py_ssize_t ", ni, " = PyList_Size(", obj, ");"),
             string(tmp, ".data = (char **)malloc(", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
             string("if (!", tmp, ".data) { PyErr_NoMemory(); return NULL; }"),
             string(tmp, ".len = (int64_t)", ni, ";"),
             string("memset(", tmp, ".data, 0, (size_t)", ni, " * sizeof(char *));"),
             string("Py_ssize_t ", ii, "; for (", ii, " = 0; ", ii, " < ", ni, "; ", ii, "++) {"),
-            string("    PyObject *", itm, " = PyList_GET_ITEM(", obj, ", ", ii, ");"),
+            string("    PyObject *", itm, " = PyList_GetItem(", obj, ", ", ii, ");"),
             string("    Py_ssize_t ", szv, ";"),
             string("    const char *", sv, " = PyUnicode_AsUTF8AndSize(", itm, ", &", szv, ");"),
             string("    if (!", sv, ") { _pt_free_str_array(", tmp, ".data, ", ii, "); return NULL; }"),
@@ -369,7 +391,7 @@ function _extern_decl(e::PtExport)
     string("extern ", ret, " ", cabi_symbol(e), "(", args, ");")
 end
 
-function _wrapper_fn(e::PtExport)
+function _wrapper_fn(e::PtExport; abi3::Bool=false)
     wname = string("pyw_", e.export_name)
     io = IOBuffer()
     has_defaults = any(a -> a.default !== nothing, e.args)
@@ -386,7 +408,7 @@ function _wrapper_fn(e::PtExport)
     for (i, a) in enumerate(e.args)
         logical = a.jl_type <: AbstractArray && !(a.jl_type <: Array)
         plan = _arg_plan(c_abi_type(a.jl_type), i; logical, mutable=a.mutable,
-                         default=a.default)
+                         default=a.default, abi3)
         for d in plan.decls; println(io, "    ", d); end
         if a.default === nothing
             print(fmt_req, plan.fmt)
@@ -501,7 +523,7 @@ static PyObject *_pt_strarray_to_list(char **data, int64_t len) {
             Py_DECREF(lst);
             return NULL;
         }
-        PyList_SET_ITEM(lst, (Py_ssize_t)i, s);
+        PyList_SetItem(lst, (Py_ssize_t)i, s);
     }
     free(data);
     return lst;
@@ -524,29 +546,30 @@ const _WRAP_ARRAY_HELPER = """
    via the buffer protocol.  numpy.frombuffer() accepts any buffer-protocol object,
    so Julia's result buffer can be handed straight to NumPy without an intermediate
    copy.  When the NumPy array (and therefore this object) is GC'd, the destructor
-   calls free().  Initialised by PyInit_<mod> via PyType_Ready. */
+   calls free().  Type is heap-allocated via PyType_FromSpec so it works in both
+   the full CPython API and the stable ABI (Py_LIMITED_API).  Initialised by
+   PyInit_<mod> via PyType_FromSpec. */
 typedef struct { PyObject_HEAD void *data; Py_ssize_t len; } _PtBuf;
-static void _ptbuf_dealloc(_PtBuf *self) {
-    free(self->data);
-    Py_TYPE(self)->tp_free((PyObject *)self);
+static void _ptbuf_dealloc(PyObject *self) {
+    free(((_PtBuf *)self)->data);
+    PyObject_Free(self);
 }
 static int _ptbuf_getbuf(PyObject *self_, Py_buffer *v, int flags) {
     _PtBuf *self = (_PtBuf *)self_;
     return PyBuffer_FillInfo(v, self_, self->data, self->len, 0, flags);
 }
-static PyBufferProcs _ptbuf_bufs = { _ptbuf_getbuf, NULL };
-static PyTypeObject _PtBufType = {
-    PyVarObject_HEAD_INIT(NULL, 0)
-    .tp_name      = "parseltongue._PtBuf",
-    .tp_basicsize = sizeof(_PtBuf),
-    .tp_dealloc   = (destructor)_ptbuf_dealloc,
-    .tp_as_buffer = &_ptbuf_bufs,
-    .tp_flags     = Py_TPFLAGS_DEFAULT,
-    .tp_doc       = "ParselTongue internal: owns a malloc\\'d byte buffer.",
+static PyType_Slot _ptbuf_slots[] = {
+    {Py_tp_dealloc, (void *)_ptbuf_dealloc},
+    {Py_bf_getbuffer, (void *)_ptbuf_getbuf},
+    {0, NULL}
 };
+static PyType_Spec _ptbuf_spec = {
+    "parseltongue._PtBuf", sizeof(_PtBuf), 0, Py_TPFLAGS_DEFAULT, _ptbuf_slots
+};
+static PyObject *_PtBufType = NULL;
 /* Create a _PtBuf that takes ownership of `data` (frees it on alloc failure). */
 static PyObject *_pt_make_buf(void *data, Py_ssize_t nbytes) {
-    _PtBuf *o = PyObject_New(_PtBuf, &_PtBufType);
+    _PtBuf *o = (_PtBuf *)PyType_GenericAlloc((PyTypeObject *)_PtBufType, 0);
     if (!o) { free(data); return NULL; }
     o->data = data; o->len = nbytes;
     return (PyObject *)o;
@@ -571,7 +594,7 @@ static PyObject *_pt_wrap_ndarray(void *data, Py_ssize_t nbytes, const char *dty
     PyObject *sh = PyTuple_New(ndim);
     if (!sh) { Py_DECREF(flat); return NULL; }
     for (int i = 0; i < ndim; i++)
-        PyTuple_SET_ITEM(sh, i, PyLong_FromSsize_t(shape[i]));
+        PyTuple_SetItem(sh, i, PyLong_FromSsize_t(shape[i]));
     PyObject *kw = Py_BuildValue("{s:s}", "order", order == 1 ? "F" : "C");
     PyObject *args = PyTuple_Pack(1, sh);
     PyObject *reshape = PyObject_GetAttrString(flat, "reshape");
@@ -582,20 +605,30 @@ static PyObject *_pt_wrap_ndarray(void *data, Py_ssize_t nbytes, const char *dty
 """
 
 """
-    emit_cshim(mod_name, exports; doc="") -> String
+    emit_cshim(mod_name, exports; doc="", abi3=false) -> String
 
 Return the full C source of the CPython extension module `mod_name` exporting
 `exports`. Compile + link with the trimmed `img.a` to get an importable extension.
+
+When `abi3=true` the shim defines `Py_LIMITED_API 0x030B0000` (Python 3.11 floor —
+the version that added `PyObject_GetBuffer` to the stable ABI) and emits only
+stable-ABI calls. The resulting `.abi3.so` is compatible with any CPython ≥ 3.11.
 """
-function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport}; doc::AbstractString="")
+function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport};
+                    doc::AbstractString="", abi3::Bool=false)
     isempty(doc) && (doc = "ParselTongue extension (Julia via juliac --trim)")
     io = IOBuffer()
     println(io, "/* Generated by ParselTongue — do not edit. */")
     println(io, "#define PY_SSIZE_T_CLEAN")
+    # Py_LIMITED_API must be defined before Python.h to restrict to the stable ABI.
+    # Floor 0x030B0000 = Python 3.11, the version that added PyObject_GetBuffer to
+    # the stable ABI (needed for zero-copy numeric array returns).
+    abi3 && println(io, "#define Py_LIMITED_API 0x030B0000")
     println(io, "#include <Python.h>")
     println(io, "#include <stdint.h>")
     println(io, "#include <stdbool.h>")
     println(io, "#include <stdlib.h>")
+    println(io, "#include <string.h>")
     println(io)
     cstructs = _complex_structs(exports)
     if !isempty(cstructs)
@@ -629,7 +662,7 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport};
     println(io)
     wnames = String[]
     for e in exports
-        fn, wname = _wrapper_fn(e)
+        fn, wname = _wrapper_fn(e; abi3)
         println(io, fn); println(io)
         push!(wnames, wname)
     end
@@ -653,7 +686,9 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport};
     println(io)
     println(io, "PyMODINIT_FUNC PyInit_", mod_name, "(void) {")
     if _uses_arrays(exports)
-        println(io, "    if (PyType_Ready(&_PtBufType) < 0) return NULL;")
+        # PyType_FromSpec heap-allocates the type; works in both full and stable ABI.
+        println(io, "    _PtBufType = PyType_FromSpec(&_ptbuf_spec);")
+        println(io, "    if (!_PtBufType) return NULL;")
     end
     println(io, "    /* trimmed Julia lib self-initializes on first @ccallable call */")
     println(io, "    return PyModule_Create(&", mod_name, "_module);")

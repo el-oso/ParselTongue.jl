@@ -321,3 +321,36 @@ end
     @test occursin("PyDict_SetItemString", c)
     @test occursin("\"min\"", c) && occursin("\"max\"", c) && occursin("\"n\"", c)
 end
+
+@testset "abi3 stable-ABI shim (item 2)" begin
+    clear_exports!()
+    @pyfunc add(a::Int64, b::Int64)::Int64 = a + b
+    @pyfunc greet(s::String)::String = string("hello ", s)
+    @pyfunc scale(v::Vector{Float64}, k::Float64)::Vector{Float64} = v .* k
+    @pyfunc words(s::String)::Vector{String} = split(s)
+
+    c_default = emit_cshim("demo", _EXPORTS)
+    c_abi3    = emit_cshim("demo", _EXPORTS; abi3=true)
+
+    # abi3 shim defines the limited-API guard; default does not.
+    @test  occursin("#define Py_LIMITED_API 0x030B0000", c_abi3)
+    @test !occursin("#define Py_LIMITED_API",            c_default)
+
+    # Both use PyType_Spec / PyType_FromSpec (the unified approach).
+    @test occursin("PyType_Spec",     c_abi3)
+    @test occursin("PyType_FromSpec", c_abi3)
+    @test occursin("PyType_Spec",     c_default)
+    @test occursin("PyType_FromSpec", c_default)
+
+    # Neither uses macros that are absent under Py_LIMITED_API.
+    for macro_name in ("PyObject_New", "PyVarObject_HEAD_INIT",
+                       "PyList_GET_SIZE", "PyList_GET_ITEM",
+                       "PyList_SET_ITEM", "PyTuple_SET_ITEM")
+        @test !occursin(macro_name, c_abi3)
+        @test !occursin(macro_name, c_default)
+    end
+
+    # Function-form equivalents ARE present (used for list/tuple operations).
+    @test occursin("PyList_SetItem",  c_abi3)
+    @test occursin("PyTuple_SetItem", c_abi3)
+end

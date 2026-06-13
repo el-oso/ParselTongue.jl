@@ -62,19 +62,24 @@ end
 
 """
     build_extension(user_path; mod_name=nothing, outdir=dirname(user_path),
-                    trim=:safe, python="python3", verbose=false) -> String
+                    trim=:safe, python="python3", abi3=false, verbose=false) -> String
 
 Compile the `@pyfunc`-annotated functions in `user_path` into an importable
 CPython extension module and return the path to the produced `.so`.
 
 `mod_name` defaults to the `@pymodule` name (if any) or the source file's base
 name. `trim` is `:safe` (default), `:unsafe`, or `:unsafe_warn`.
+
+When `abi3=true` the C shim is compiled against the stable ABI
+(`Py_LIMITED_API=0x030B0000`, Python ≥ 3.11 floor) and the output uses the
+`.abi3.so` extension suffix, so the resulting module loads on any CPython ≥ 3.11.
 """
 function build_extension(user_path::AbstractString;
                          mod_name::Union{Nothing,AbstractString}=nothing,
                          outdir::AbstractString=dirname(abspath(user_path)),
                          trim::Symbol=:safe,
                          python::AbstractString="python3",
+                         abi3::Bool=false,
                          runtime_rpaths::Vector{String}=String[],
                          strip_abs_rpath::Bool=false,
                          keep_build::Bool=false,
@@ -103,6 +108,8 @@ function build_extension(user_path::AbstractString;
     mkpath(outdir)
     builddir = mktempdir(; prefix="parseltongue_", cleanup=!keep_build)
     tools = _build_tools(; python)
+    # abi3 uses a version-neutral suffix; non-abi3 uses Python's EXT_SUFFIX.
+    ext_suffix = abi3 ? _abi3_ext_suffix(tools.python) : tools.ext_suffix
 
     # 2. Generate the juliac entry file (loads user code + @ccallable wrappers).
     # Use invokelatest: @pyhandle definitions in the sandbox bump the world counter,
@@ -116,10 +123,10 @@ function build_extension(user_path::AbstractString;
 
     # 4. Generate the C PyInit shim.
     cpath = joinpath(builddir, string("_", mod, "module.c"))
-    write(cpath, Base.invokelatest(emit_cshim, mod, exports))
+    write(cpath, Base.invokelatest(emit_cshim, mod, exports; abi3))
 
     # 5. Link the shim + archive into the extension module.
-    so_path = joinpath(outdir, string(mod, tools.ext_suffix))
+    so_path = joinpath(outdir, string(mod, ext_suffix))
     _link_extension(tools, cpath, img, so_path, runtime_rpaths, strip_abs_rpath, verbose)
 
     verbose && @info "ParselTongue: built $so_path ($(length(exports)) function(s))"
@@ -128,6 +135,13 @@ end
 
 _default_mod_name(p) = first(split(basename(p), '.'))
 _is_valid_modname(s) = occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", s)
+
+# Query Python's importlib for the abi3 extension suffix (`.abi3.so` on Linux/macOS).
+# Falls back to `.abi3.so` if the interpreter reports none (e.g. on Windows, TBD).
+function _abi3_ext_suffix(python::AbstractString)
+    script = "import importlib.machinery as m; s=next((x for x in m.EXTENSION_SUFFIXES if 'abi3' in x),None); print(s or '.abi3.so')"
+    return readchomp(`$python -c $script`)
+end
 
 function _run_juliac(t::BuildTools, entry::AbstractString, img::AbstractString,
                      trim::Symbol, verbose::Bool)

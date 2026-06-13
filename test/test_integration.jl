@@ -115,3 +115,28 @@ end
     write(badmod, "x = 1\n")                                          # no @pyfunc
     @test_throws ErrorException build_extension(badmod)
 end
+
+@testset "integration: abi3 stable-ABI shim (item 2)" begin
+    if !_have_tools()
+        @info "skipping abi3 integration test (need python3, a C compiler, and juliac)"
+        @test_skip true
+    else
+        fixture = joinpath(@__DIR__, "fixtures", "feature.jl")
+        outdir = mktempdir()
+        so = build_extension(fixture; outdir=outdir, abi3=true)
+        @test isfile(so)
+        # The produced file must carry the abi3 suffix, not the cpython-specific one.
+        @test occursin("abi3", basename(so))
+
+        script = """
+        import sys
+        sys.path.insert(0, $(repr(outdir)))
+        import feature
+        assert feature.add(40, 2) == 42,         "add"
+        assert feature.greet("World") == "Hello, World!", "greet"
+        print("ABI3_OK")
+        """
+        out = read(`$(Sys.which("python3")) -c $script`, String)
+        @test occursin("ABI3_OK", out)
+    end
+end

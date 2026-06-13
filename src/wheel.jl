@@ -41,11 +41,15 @@ end
 """
     build_wheel(user_path; version="0.1.0", mod_name=nothing,
                 outdir=dirname(user_path), python="python3", trim=:safe,
-                keep_build=false, verbose=false) -> String
+                abi3=false, keep_build=false, verbose=false) -> String
 
 Build a self-contained, pip-installable wheel from the `@pyfunc`-annotated
 functions in `user_path`. Returns the path to the `.whl`. The wheel bundles
 libjulia, so the end user needs no Julia installation.
+
+When `abi3=true` the extension is compiled against the stable ABI
+(`Py_LIMITED_API=0x030B0000`) and the wheel tag is `cp311-abi3-<plat>`,
+making it installable on any CPython ≥ 3.11 without recompilation.
 """
 function build_wheel(user_path::AbstractString;
                      version::AbstractString="0.1.0",
@@ -53,6 +57,7 @@ function build_wheel(user_path::AbstractString;
                      outdir::AbstractString=dirname(abspath(user_path)),
                      python::AbstractString="python3",
                      trim::Symbol=:safe,
+                     abi3::Bool=false,
                      keep_build::Bool=false,
                      verbose::Bool=false)
     user_path = abspath(user_path)
@@ -73,7 +78,7 @@ function build_wheel(user_path::AbstractString;
     # 1. Build the extension as the internal submodule `_<mod>` with relative rpaths.
     ext_name = string("_", mod)
     build_extension(user_path;
-                    mod_name=ext_name, outdir=pkgdir, trim, python,
+                    mod_name=ext_name, outdir=pkgdir, trim, python, abi3,
                     runtime_rpaths=["\$ORIGIN/julia/lib", "\$ORIGIN/julia/lib/julia"],
                     strip_abs_rpath=true, keep_build, verbose)
     exports = copy(_EXPORTS)   # build_extension repopulated the registry
@@ -89,7 +94,7 @@ function build_wheel(user_path::AbstractString;
 
     # 4. dist-info metadata.
     distinfo = joinpath(stage, string(mod, "-", version, ".dist-info")); mkpath(distinfo)
-    tag = _wheel_tag(python)
+    tag = abi3 ? _wheel_tag_abi3(python) : _wheel_tag(python)
     write(joinpath(distinfo, "METADATA"), _metadata(mod, version))
     write(joinpath(distinfo, "WHEEL"), _wheel_meta(tag))
 
@@ -151,6 +156,12 @@ Tag: $tag
 function _wheel_tag(python::AbstractString)
     out = readchomp(`$python -c "import sysconfig,sys;v=sys.version_info;print(f'cp{v.major}{v.minor}-cp{v.major}{v.minor}-'+sysconfig.get_platform().replace('-','_').replace('.','_'))"`)
     return out
+end
+
+# Stable-ABI wheel tag, e.g. "cp311-abi3-linux_x86_64".
+function _wheel_tag_abi3(python::AbstractString)
+    plat = readchomp(`$python -c "import sysconfig; print(sysconfig.get_platform().replace('-','_').replace('.','_'))"`)
+    return "cp311-abi3-$plat"
 end
 
 # Generate + run a Python helper that writes RECORD (with sha256) and zips the
