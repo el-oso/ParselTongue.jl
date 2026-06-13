@@ -20,6 +20,7 @@ function _zero_cval(@nospecialize(C::Type))
     isscalar(C)   && return string("zero(", _type_src(C), ")")
     iscomplex(C)  && return string("zero(", _type_src(C), ")")
     C === Cstring && return "Cstring(Ptr{UInt8}(0))"
+    C === ParselTongue.PtStrArray && return "ParselTongue.PtStrArray(Ptr{Ptr{UInt8}}(0), Int64(0))"
     if isarray(C)
         T = _type_src(C.parameters[1])
         N = C.parameters[2]::Int
@@ -36,6 +37,11 @@ end
 function _type_src(@nospecialize(T::Type))
     if T isa DataType && T.name === PtArray.body.body.name
         return string("ParselTongue.PtArray{", _type_src(T.parameters[1]), ", ", T.parameters[2], "}")
+    elseif T === PtStrArray
+        # Always fully-qualify ParselTongue types to avoid ambiguity when the
+        # caller has `using ParselTongue: PtStrArray` in scope (which causes
+        # string(PtStrArray) to drop the module prefix in the current session).
+        return "ParselTongue.PtStrArray"
     elseif T isa DataType && T <: Tuple
         return string("Tuple{", join((_type_src(S) for S in fieldtypes(T)), ", "), "}")
     end

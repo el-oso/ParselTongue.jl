@@ -100,7 +100,7 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   given a known glibc floor). Effort M · Risk M.
 - [ ] **7. macOS support** — `.dylib`, `@loader_path` rpaths, ext suffix; juliac on
   macOS. `build.jl`/`wheel.jl` platform branches. Effort L.
-- [ ] **8. More boundary types** — `Bool`/`Int` arrays already work; add `Vector{String}`
+- [x] **8. More boundary types** — `Bool`/`Int` arrays already work; add `Vector{String}`
   ↔ list[str], and `NamedTuple` ↔ dict return. `boundary.jl` + `cshim.jl`. Effort M each.
 
 ## Phase 3 — performance & polish

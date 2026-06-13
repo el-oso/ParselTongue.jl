@@ -88,7 +88,7 @@ end
     @test is_boundary_type(Matrix{Float64})            # N-D
     @test is_boundary_type(AbstractMatrix{Float64})    # logical policy
     @test is_boundary_type(Vector{ComplexF64})         # complex elements
-    @test !is_boundary_type(Vector{String})            # non-numeric eltype
+    @test is_boundary_type(Vector{String})             # string arrays now supported (item 8)
     @test c_abi_type(Vector{Float64})  === PtArray{Float64,1}
     @test c_abi_type(Matrix{Float64})  === PtArray{Float64,2}
     @test c_abi_type(AbstractMatrix{Float64}) === PtArray{Float64,2}
@@ -228,4 +228,44 @@ end
     err = try; @eval @pyfunc bad2(a::Int64=1, b::Int64)::Int64 = a + b; nothing
          catch e; e; end
     @test (err isa LoadError ? err.error : err) isa ErrorException
+end
+
+@testset "Vector{String} boundary (item 8)" begin
+    @test is_boundary_type(Vector{String})
+    @test c_abi_type(Vector{String}) === ParselTongue.PtStrArray
+
+    # round-trip
+    v = ["hello", "world", ""]
+    c = to_c(v)
+    @test c isa ParselTongue.PtStrArray
+    @test c.len == 3
+    v2 = from_c(Vector{String}, c)
+    @test v2 == v
+    # to_c mallocs; the C shim frees in practice, but free manually here
+    for i in 1:c.len
+        Libc.free(unsafe_load(c.data, i))
+    end
+    Libc.free(c.data)
+
+    # cshim emits the PtStrArray helper
+    clear_exports!()
+    @pyfunc words(s::String)::Vector{String} = split(s)
+    @pyfunc join_words(ws::Vector{String})::String = join(ws, " ")
+    c = emit_cshim("demo", _EXPORTS)
+    @test occursin("PtStrArray", c)
+    @test occursin("_pt_strarray_to_list", c)
+    @test occursin("_pt_free_str_array", c)
+    @test occursin("PyList_Check", c)     # arg validation
+    @test occursin("PyUnicode_AsUTF8AndSize", c)
+end
+
+@testset "NamedTuple return (item 8)" begin
+    @test assert_ret_boundary(NamedTuple{(:x, :y), Tuple{Float64, Int64}}) isa Type
+    clear_exports!()
+    @pyfunc stats(v::Vector{Float64})::NamedTuple{(:min, :max, :n), Tuple{Float64, Float64, Int64}} =
+        (min=minimum(v), max=maximum(v), n=length(v))
+    c = emit_cshim("demo", _EXPORTS)
+    @test occursin("PyDict_New", c)
+    @test occursin("PyDict_SetItemString", c)
+    @test occursin("\"min\"", c) && occursin("\"max\"", c) && occursin("\"n\"", c)
 end

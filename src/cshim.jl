@@ -107,6 +107,7 @@ const _ELTINFO = Dict{Type,EltInfo}(
 )
 
 isarray(@nospecialize(C::Type)) = C isa DataType && C.name === PtArray.body.body.name
+isstrarr(@nospecialize(C::Type)) = C === PtStrArray
 _elt(@nospecialize(C::Type)) = _ELTINFO[C.parameters[1]]      # T from PtArray{T,N}
 _ndims(@nospecialize(C::Type)) = C.parameters[2]::Int         # N from PtArray{T,N}
 _structname(@nospecialize(C::Type)) = string("PtArray_", _elt(C).tag, "_", _ndims(C))
@@ -120,6 +121,7 @@ function _carrier_tag(@nospecialize(C::Type))
     iscomplex(C) && return _CCOMPLEX[C].cname
     C === Cstring && return "str"
     isarray(C) && return _structname(C)
+    isstrarr(C) && return "stra"
     istuple(C) && return string("T", join((_carrier_tag(S) for S in fieldtypes(C)), ""))
     return "x"
 end
@@ -151,6 +153,7 @@ function _c_ctype(@nospecialize(C::Type))
     iscomplex(C) && return _CCOMPLEX[C].cname
     C === Cstring && return "char *"
     isarray(C) && return _structname(C)
+    isstrarr(C) && return "PtStrArray"
     istuple(C) && return _tuple_structname(C)
     error("ParselTongue: no C type for carrier `$C`.")
 end
@@ -203,6 +206,29 @@ function _arg_plan(@nospecialize(C::Type), i::Int; logical::Bool=false, mutable:
     elseif C === Cstring
         return ArgPlan([string("const char *", tmp, ";")], "s", [string("&", tmp)],
                        string("(char *)", tmp))
+    elseif isstrarr(C)
+        obj = string(tmp, "_obj"); ni = string(tmp, "_n"); ii = string(tmp, "_i")
+        itm = string(tmp, "_itm"); szv = string(tmp, "_sz"); sv = string(tmp, "_sv")
+        decls = [string("PyObject *", obj, ";"),
+                 string("PtStrArray ", tmp, " = {NULL, 0};")]
+        setup = String[
+            string("if (!PyList_Check(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"expected a list of str\"); return NULL; }"),
+            string("{ Py_ssize_t ", ni, " = PyList_GET_SIZE(", obj, ");"),
+            string(tmp, ".data = (char **)malloc(", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
+            string("if (!", tmp, ".data) { PyErr_NoMemory(); return NULL; }"),
+            string(tmp, ".len = (int64_t)", ni, ";"),
+            string("memset(", tmp, ".data, 0, (size_t)", ni, " * sizeof(char *));"),
+            string("Py_ssize_t ", ii, "; for (", ii, " = 0; ", ii, " < ", ni, "; ", ii, "++) {"),
+            string("    PyObject *", itm, " = PyList_GET_ITEM(", obj, ", ", ii, ");"),
+            string("    Py_ssize_t ", szv, ";"),
+            string("    const char *", sv, " = PyUnicode_AsUTF8AndSize(", itm, ", &", szv, ");"),
+            string("    if (!", sv, ") { _pt_free_str_array(", tmp, ".data, ", ii, "); return NULL; }"),
+            string("    ", tmp, ".data[", ii, "] = (char *)malloc((size_t)(", szv, " + 1));"),
+            string("    if (!", tmp, ".data[", ii, "]) { _pt_free_str_array(", tmp, ".data, ", ii, "); return PyErr_NoMemory(); }"),
+            string("    memcpy(", tmp, ".data[", ii, "], ", sv, ", (size_t)(", szv, " + 1)); } }"),
+        ]
+        cleanup = [string("_pt_free_str_array(", tmp, ".data, ", tmp, ".len);")]
+        return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, cleanup)
     elseif isarray(C)
         e = _elt(C); sn = _structname(C); n = _ndims(C)
         obj = string(tmp, "_obj"); buf = string(tmp, "_buf")
@@ -261,6 +287,8 @@ function _build_pyobject(@nospecialize(C::Type), val::AbstractString, out::Abstr
     elseif C === Cstring
         return [string("PyObject *", out, " = PyUnicode_FromString(", val, ");"),
                 string("free((void *)", val, ");")]
+    elseif isstrarr(C)
+        return [string("PyObject *", out, " = _pt_strarray_to_list(", val, ".data, ", val, ".len);")]
     elseif isarray(C)
         e = _elt(C); n = _ndims(C)
         ne = string("nelem_", out); shp = string("shp_", out); nb = string("nbytes_", out)
@@ -279,7 +307,7 @@ function _build_pyobject(@nospecialize(C::Type), val::AbstractString, out::Abstr
     error("ParselTongue: no return marshalling for carrier `$C`.")
 end
 
-function _ret_plan(@nospecialize(C::Type))
+function _ret_plan(@nospecialize(C::Type); @nospecialize(jl_type::Type=Any))
     if C === Cvoid
         return RetPlan(["Py_RETURN_NONE;"])
     elseif istuple(C)
@@ -292,8 +320,18 @@ function _ret_plan(@nospecialize(C::Type))
             push!(stmts, string("if (!", o, ") {", cleanup, " return NULL; }"))
             push!(outs, o)
         end
-        push!(stmts, string("PyObject *rt = PyTuple_Pack(", length(carriers), ", ", join(outs, ", "), ");"))
-        for o in outs; push!(stmts, string("Py_DECREF(", o, ");")); end
+        if jl_type <: NamedTuple
+            # NamedTuple → Python dict{str, Any}
+            names = fieldnames(jl_type)
+            decref_all = join((string(" Py_DECREF(", oi, ");") for oi in outs), "")
+            push!(stmts, string("PyObject *rt = PyDict_New(); if (!rt) {", decref_all, " return NULL; }"))
+            for (nm, o) in zip(names, outs)
+                push!(stmts, string("PyDict_SetItemString(rt, \"", nm, "\", ", o, "); Py_DECREF(", o, ");"))
+            end
+        else
+            push!(stmts, string("PyObject *rt = PyTuple_Pack(", length(carriers), ", ", join(outs, ", "), ");"))
+            for o in outs; push!(stmts, string("Py_DECREF(", o, ");")); end
+        end
         push!(stmts, "return rt;")
         return RetPlan(stmts)
     else
@@ -378,7 +416,7 @@ function _wrapper_fn(e::PtExport)
     println(io, "        free(_pt_errmsg);")
     println(io, "        return NULL;")
     println(io, "    }")
-    for s in _ret_plan(retc).stmts; println(io, "    ", s); end
+    for s in _ret_plan(retc; jl_type=e.ret).stmts; println(io, "    ", s); end
     println(io, "}")
     return String(take!(io)), wname
 end
@@ -413,6 +451,39 @@ function _tuple_structs(exports::AbstractVector{PtExport})
 end
 
 _uses_arrays(exports) = !isempty(_array_structs(exports))
+_uses_strarr(exports) = any(e -> any(a -> isstrarr(c_abi_type(a.jl_type)), e.args) ||
+                                  isstrarr(c_abi_type(e.ret)) ||
+                                  (istuple(c_abi_type(e.ret)) && any(isstrarr, fieldtypes(c_abi_type(e.ret)))),
+                            exports)
+
+const _WRAP_STRARR_HELPER = """
+/* PtStrArray: carrier for Vector{String} <-> list[str]. */
+typedef struct { char **data; int64_t len; } PtStrArray;
+/* Free all strings + the pointer array (null entries skipped). */
+static void _pt_free_str_array(char **data, int64_t len) {
+    for (int64_t i = 0; i < len; i++) if (data[i]) free(data[i]);
+    free(data);
+}
+/* Build a Python list from a Julia-malloc'd string array. Takes ownership
+   of data (frees each element and the array on success and error). */
+static PyObject *_pt_strarray_to_list(char **data, int64_t len) {
+    PyObject *lst = PyList_New((Py_ssize_t)len);
+    if (!lst) { _pt_free_str_array(data, len); return NULL; }
+    for (int64_t i = 0; i < len; i++) {
+        PyObject *s = PyUnicode_FromString(data[i]);
+        free(data[i]);
+        if (!s) {
+            for (int64_t j = i + 1; j < len; j++) free(data[j]);
+            free(data);
+            Py_DECREF(lst);
+            return NULL;
+        }
+        PyList_SET_ITEM(lst, (Py_ssize_t)i, s);
+    }
+    free(data);
+    return lst;
+}
+"""
 
 const _WRAP_ARRAY_HELPER = """
 /* _PtBuf: a minimal Python object that owns a malloc'd byte buffer and exposes it
@@ -497,6 +568,9 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport};
         println(io, "/* C-ABI carriers for complex numbers (match Julia Complex{T}) */")
         for s in cstructs; println(io, s); end
         println(io)
+    end
+    if _uses_strarr(exports)
+        print(io, _WRAP_STRARR_HELPER)
     end
     structs = _array_structs(exports)
     if !isempty(structs)

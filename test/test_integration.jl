@@ -85,6 +85,15 @@ end
         assert feature.clamp_val(-1.0) == 0.0,       "clamp_val below lo"
         assert feature.clamp_val(2.0) == 1.0,        "clamp_val above hi"
         assert feature.clamp_val(0.5, lo=0.3, hi=0.7) == 0.5, "clamp_val custom range"
+        # Vector{String} <-> list[str] (item 8)
+        assert feature.words("hello world") == ["hello", "world"], "words() return"
+        assert feature.join_words(["a", "b", "c"]) == "a b c", "join_words() arg"
+        assert feature.join_words([]) == "", "join_words([]) empty"
+        # NamedTuple <-> dict return (item 8)
+        import array as _array
+        d = feature.describe(_array.array("d", [1.0, 3.0, 2.0]))
+        assert isinstance(d, dict), f"describe() must return dict, got {type(d)}"
+        assert d["min"] == 1.0 and d["max"] == 3.0 and d["n"] == 3, f"wrong describe: {d}"
         print("FEATURE_OK")
         """
         out = read(`$(Sys.which("python3")) -c $script`, String)

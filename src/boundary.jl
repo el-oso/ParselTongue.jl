@@ -118,6 +118,43 @@ function to_c(s::String)::Cstring
     return Cstring(p)
 end
 
+# ── String-array boundary type ────────────────────────────────────────
+# Carrier: `PtStrArray` (`{char **data; int64_t len;}`).
+#   arg:  Python list[str] → C shim strdup's each item into `data`. Julia builds a
+#         `Vector{String}` via `unsafe_string`. C shim frees after the call.
+#   ret:  Julia mallocs each NUL-terminated string into `data`; C shim builds a
+#         Python list and frees all pointers.
+
+struct PtStrArray
+    data::Ptr{Ptr{UInt8}}   # char ** (each NUL-terminated)
+    len::Int64
+end
+
+c_abi_type(::Type{Vector{String}}) = PtStrArray
+
+function from_c(::Type{Vector{String}}, c::PtStrArray)::Vector{String}
+    n = Int(c.len)
+    result = Vector{String}(undef, n)
+    for i in 1:n
+        result[i] = unsafe_string(unsafe_load(c.data, i))
+    end
+    return result
+end
+
+function to_c(v::Vector{String})::PtStrArray
+    n = length(v)
+    data = Ptr{Ptr{UInt8}}(Libc.malloc(max(1, n) * sizeof(Ptr{UInt8})))
+    for i in 1:n
+        s = v[i]
+        sz = sizeof(s)
+        q = Ptr{UInt8}(Libc.malloc(sz + 1))
+        GC.@preserve s unsafe_copyto!(q, pointer(s), sz)
+        unsafe_store!(q, 0x00, sz + 1)
+        unsafe_store!(data, q, i)
+    end
+    return PtStrArray(data, Int64(n))
+end
+
 # ── N-D numeric array boundary type ───────────────────────────────────
 # Carrier: a C-friendly `PtArray{T,N}` struct (data pointer + inline shape +
 # contiguity flag). Input is zero-copy from any contiguous Python buffer; the
@@ -195,6 +232,17 @@ c_abi_type(::Type{T}) where {T<:Tuple} = Tuple{map(c_abi_type, fieldtypes(T))...
 
 to_c(t::Tuple) = map(to_c, t)   # element-wise; trim-safe (tuple map is unrolled)
 
+# ── NamedTuple return type ─────────────────────────────────────────────
+# A function may return a NamedTuple -> a Python dict{str, Any}. The carrier is
+# the same as the underlying Tuple carrier (same C struct layout, same @ccallable
+# return type). The C shim distinguishes by the original return type in PtExport
+# and emits PyDict_New/PyDict_SetItemString instead of PyTuple_Pack.
+# Supported for RETURNS only (not args — dict args require C-side key lookup by name).
+
+c_abi_type(::Type{T}) where {T<:NamedTuple} = c_abi_type(Tuple{fieldtypes(T)...})
+
+to_c(nt::NamedTuple) = map(to_c, Tuple(nt))  # trim-safe: concrete tuple map is unrolled
+
 # ── Boundary validation (build host) ──────────────────────────────────
 
 # Which of the three protocol methods are missing for `T`. Order-independent;
@@ -246,6 +294,12 @@ Validate a **return** type. Returns need only `c_abi_type` + `to_c` (not `from_c
 """
 function assert_ret_boundary(T::Type)
     T === Nothing && return Cvoid
+    if T <: NamedTuple
+        for S in fieldtypes(T)
+            assert_ret_boundary(S)
+        end
+        return c_abi_type(T)
+    end
     if T <: Tuple
         for S in fieldtypes(T)
             assert_ret_boundary(S)

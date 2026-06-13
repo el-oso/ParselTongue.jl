@@ -22,4 +22,12 @@ using ParselTongue
     # Keyword / default arguments (item 5).
     @pyfunc power(base::Float64; exponent::Float64=2.0)::Float64 = base ^ exponent
     @pyfunc clamp_val(x::Float64; lo::Float64=0.0, hi::Float64=1.0)::Float64 = clamp(x, lo, hi)
+
+    # Vector{String} <-> list[str] (item 8).
+    @pyfunc words(s::String)::Vector{String} = String.(split(s))
+    @pyfunc join_words(ws::Vector{String})::String = join(ws, " ")
+
+    # NamedTuple <-> dict return (item 8).
+    @pyfunc describe(v::Vector{Float64})::NamedTuple{(:min, :max, :n), Tuple{Float64, Float64, Int64}} =
+        (min=minimum(v), max=maximum(v), n=Int64(length(v)))
 end
