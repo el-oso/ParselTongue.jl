@@ -54,17 +54,26 @@ function emit_ccallable(e::PtExport)
     ret_c = c_abi_type(e.ret)
 
     params = String[]
-    conv   = String[]
+    pos_conv = String[]; kw_conv = String[]
     for a in e.args
         ci = c_abi_type(a.jl_type)
         push!(params, string(a.name, "::", _type_src(ci)))
-        push!(conv, string("ParselTongue.from_c(", _type_src(a.jl_type), ", ", a.name, ")"))
+        c = string("ParselTongue.from_c(", _type_src(a.jl_type), ", ", a.name, ")")
+        if a.is_keyword
+            push!(kw_conv, string(a.name, "=", c))
+        else
+            push!(pos_conv, c)
+        end
     end
     # Trailing error out-parameters: signal exceptions to the C shim.
     push!(params, "_pt_err::Ptr{Int32}")
     push!(params, "_pt_errmsg::Ptr{Ptr{UInt8}}")
 
-    call = string(e.jl_func, "(", join(conv, ", "), ")")
+    call = if isempty(kw_conv)
+        string(e.jl_func, "(", join(pos_conv, ", "), ")")
+    else
+        string(e.jl_func, "(", join(pos_conv, ", "), "; ", join(kw_conv, ", "), ")")
+    end
 
     # Catch block: signal the error and copy the message into a malloc'd C buffer.
     # The C shim checks _pt_err, builds the Python exception, and frees the buffer.

@@ -155,15 +155,48 @@ function _c_ctype(@nospecialize(C::Type))
     error("ParselTongue: no C type for carrier `$C`.")
 end
 
-function _arg_plan(@nospecialize(C::Type), i::Int; logical::Bool=false, mutable::Bool=false)
+# Return a C literal string for a float value (guards against Inf/NaN).
+function _c_float_lit(v::Float64)
+    isfinite(v) || error("ParselTongue: Inf/NaN default values are not supported.")
+    s = string(v)
+    # Ensure the string is always parseable as a double (add .0 if no dot/e).
+    occursin('.', s) || occursin('e', s) ? s : s * ".0"
+end
+
+# Return a C literal string for a scalar default value given its carrier type.
+function _c_scalar_lit(@nospecialize(C::Type), val)
+    if C === Bool
+        return val ? "1" : "0"
+    elseif C <: AbstractFloat
+        return _c_float_lit(Float64(val))
+    else
+        return string(Int64(val))
+    end
+end
+
+function _arg_plan(@nospecialize(C::Type), i::Int; logical::Bool=false, mutable::Bool=false,
+                   default::Union{Nothing,Any}=nothing)
     tmp = string("a", i)
     if isscalar(C)
         cs = _CSCALARS[C]
-        return ArgPlan([string(cs.tmptype, " ", tmp, ";")], cs.fmt, [string("&", tmp)],
-                       string("(", cs.ctype, ")", tmp))
+        decl = if default === nothing
+            string(cs.tmptype, " ", tmp, ";")
+        else
+            string(cs.tmptype, " ", tmp, " = (", cs.tmptype, ")", _c_scalar_lit(C, default), ";")
+        end
+        return ArgPlan([decl], cs.fmt, [string("&", tmp)], string("(", cs.ctype, ")", tmp))
     elseif iscomplex(C)
         cc = _CCOMPLEX[C]; pc = string(tmp, "_pc")
-        decls = [string("Py_complex ", pc, ";"), string(cc.cname, " ", tmp, ";")]
+        if default === nothing
+            decls = [string("Py_complex ", pc, ";"), string(cc.cname, " ", tmp, ";")]
+        else
+            v = convert(ComplexF64, default)
+            decls = [
+                string("Py_complex ", pc, " = {(double)", _c_float_lit(real(v)),
+                       ", (double)", _c_float_lit(imag(v)), "};"),
+                string(cc.cname, " ", tmp, ";"),
+            ]
+        end
         setup = [string(tmp, ".re = (", cc.celt, ")", pc, ".real;"),
                  string(tmp, ".im = (", cc.celt, ")", pc, ".imag;")]
         return ArgPlan(decls, "D", [string("&", pc)], setup, tmp, String[])
@@ -282,24 +315,44 @@ end
 function _wrapper_fn(e::PtExport)
     wname = string("pyw_", e.export_name)
     io = IOBuffer()
-    println(io, "static PyObject *", wname, "(PyObject *self, PyObject *args) {")
-
-    fmt = IOBuffer()
-    addrs = String[]; callargs = String[]; setups = String[]; cleanups = String[]
-    for (i, a) in enumerate(e.args)
-        # An AbstractArray (non-concrete) argument selects the logical-view policy.
-        logical = a.jl_type <: AbstractArray && !(a.jl_type <: Array)
-        plan = _arg_plan(c_abi_type(a.jl_type), i; logical, mutable=a.mutable)
-        for d in plan.decls; println(io, "    ", d); end
-        print(fmt, plan.fmt)
-        append!(addrs, plan.addrs); append!(setups, plan.setup); append!(cleanups, plan.cleanup)
-        push!(callargs, plan.callarg)
+    has_defaults = any(a -> a.default !== nothing, e.args)
+    if has_defaults
+        println(io, "static PyObject *", wname,
+                "(PyObject *self, PyObject *args, PyObject *kwargs) {")
+    else
+        println(io, "static PyObject *", wname, "(PyObject *self, PyObject *args) {")
     end
 
-    if isempty(e.args)
+    fmt_req = IOBuffer(); fmt_opt = IOBuffer()
+    addrs = String[]; callargs = String[]; setups = String[]; cleanups = String[]
+    kwnames = String[]
+    for (i, a) in enumerate(e.args)
+        logical = a.jl_type <: AbstractArray && !(a.jl_type <: Array)
+        plan = _arg_plan(c_abi_type(a.jl_type), i; logical, mutable=a.mutable,
+                         default=a.default)
+        for d in plan.decls; println(io, "    ", d); end
+        if a.default === nothing
+            print(fmt_req, plan.fmt)
+        else
+            print(fmt_opt, plan.fmt)
+        end
+        append!(addrs, plan.addrs); append!(setups, plan.setup); append!(cleanups, plan.cleanup)
+        push!(callargs, plan.callarg)
+        push!(kwnames, string(a.name))
+    end
+
+    fmt_str = String(take!(fmt_req)) * (has_defaults ? "|" * String(take!(fmt_opt)) : "")
+
+    if has_defaults
+        # kwlist: all arg names in order, NULL-terminated, declared static.
+        kw_entries = join(("\"$n\"" for n in kwnames), ", ")
+        println(io, "    static char *_kwlist[] = {", kw_entries, ", NULL};")
+        println(io, "    if (!PyArg_ParseTupleAndKeywords(args, kwargs, \"", fmt_str,
+                "\", _kwlist", isempty(addrs) ? "" : (", " * join(addrs, ", ")), ")) return NULL;")
+    elseif isempty(e.args)
         println(io, "    if (!PyArg_ParseTuple(args, \"\")) return NULL;")
     else
-        println(io, "    if (!PyArg_ParseTuple(args, \"", String(take!(fmt)), "\", ",
+        println(io, "    if (!PyArg_ParseTuple(args, \"", fmt_str, "\", ",
                 join(addrs, ", "), ")) return NULL;")
     end
     for s in setups; println(io, "    ", s); end
@@ -471,8 +524,14 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport};
     end
     println(io, "static PyMethodDef ", mod_name, "_methods[] = {")
     for (e, wname) in zip(exports, wnames)
-        println(io, "    {\"", e.export_name, "\", ", wname, ", METH_VARARGS, \"",
-                e.export_name, " (Julia)\"},")
+        has_kw = any(a -> a.default !== nothing, e.args)
+        if has_kw
+            println(io, "    {\"", e.export_name, "\", (PyCFunction)", wname,
+                    ", METH_VARARGS | METH_KEYWORDS, \"", e.export_name, " (Julia)\"},")
+        else
+            println(io, "    {\"", e.export_name, "\", ", wname, ", METH_VARARGS, \"",
+                    e.export_name, " (Julia)\"},")
+        end
     end
     println(io, "    {NULL, NULL, 0, NULL}")
     println(io, "};")

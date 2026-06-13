@@ -198,3 +198,34 @@ end
     @test Set(submodule_names(_EXPORTS)) == Set(["linalg", "stats"])
     @test _EXPORTS[findfirst(e -> e.export_name == "solve", _EXPORTS)].submodule == "linalg"
 end
+
+@testset "keyword/default arguments (item 5)" begin
+    clear_exports!()
+    # Positional-arg default (b::T = val syntax).
+    @pyfunc add_def(a::Int64, b::Int64=10)::Int64 = a + b
+    # Keyword arg via ; syntax.
+    @pyfunc power(base::Float64; exponent::Float64=2.0)::Float64 = base ^ exponent
+
+    @test add_def(1, 2) == 3
+    @test add_def(1) == 11      # Julia: default actually works
+    @test power(3.0) ≈ 9.0
+    @test power(3.0; exponent=3.0) ≈ 27.0
+
+    e_add = _EXPORTS[findfirst(e -> e.export_name == "add_def", _EXPORTS)]
+    @test e_add.args[1].default === nothing   # a is required
+    @test e_add.args[2].default === 10        # b has default
+
+    e_pow = _EXPORTS[findfirst(e -> e.export_name == "power", _EXPORTS)]
+    @test e_pow.args[1].default === nothing       # base is required
+    @test e_pow.args[2].default ≈ 2.0            # exponent has default
+
+    # C shim emits METH_KEYWORDS and PyArg_ParseTupleAndKeywords.
+    c = emit_cshim("demo", _EXPORTS)
+    @test occursin("METH_VARARGS | METH_KEYWORDS", c)
+    @test occursin("PyArg_ParseTupleAndKeywords", c)
+    @test occursin("_kwlist", c)
+    # Required-before-optional constraint is enforced.
+    err = try; @eval @pyfunc bad2(a::Int64=1, b::Int64)::Int64 = a + b; nothing
+         catch e; e; end
+    @test (err isa LoadError ? err.error : err) isa ErrorException
+end

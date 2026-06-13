@@ -6,18 +6,22 @@
 # registry to generate the `@ccallable` wrappers and the C shim.
 
 """
-    PtArg(name, jl_type, mutable=false)
+    PtArg(name, jl_type, mutable=false, default=nothing)
 
 One argument of an exported function: its name, the native Julia type the user
-declared (e.g. `Int`, `String`), and whether it was marked `Mut{…}` (a writable,
-in-place buffer).
+declared (e.g. `Int`, `String`), whether it was marked `Mut{…}` (a writable,
+in-place buffer), and the default value (or `nothing` if the argument is required).
 """
 struct PtArg
     name::Symbol
     jl_type::Type
     mutable::Bool
+    default::Union{Nothing,Any}   # nothing = required; any value = optional
+    is_keyword::Bool              # true = declared after `;` in the Julia signature
 end
-PtArg(name::Symbol, jl_type::Type) = PtArg(name, jl_type, false)
+PtArg(name::Symbol, jl_type::Type) = PtArg(name, jl_type, false, nothing, false)
+PtArg(name::Symbol, jl_type::Type, mutable::Bool) = PtArg(name, jl_type, mutable, nothing, false)
+PtArg(name::Symbol, jl_type::Type, mutable::Bool, default) = PtArg(name, jl_type, mutable, default, false)
 
 """
     PtExport(jl_func, export_name, args, ret, mod)
@@ -73,12 +77,38 @@ function submodule_names(exports::AbstractVector{PtExport})
     subs
 end
 
-# Parse a function-definition expression into (name, [(argname, argtype_expr)...], rettype_expr).
+# Parse one positional or keyword arg node into (name, type_expr, mutable, default_expr).
+# `a` is one element from the sig.args list (or from a :parameters block).
+function _parse_one_arg(a)
+    if a isa Expr && a.head == :kw
+        # `b::T = val` — typed arg with default value
+        typed, default_expr = a.args
+        if typed isa Expr && typed.head == :(::) && length(typed.args) == 2
+            inner, mut = _peel_mut(typed.args[2])
+            typed.args[2] = inner
+            return (typed.args[1]::Symbol, inner, mut, default_expr)
+        end
+        error("@pyfunc: defaulted argument must be typed: `name::Type = default`, got `$a`.")
+    elseif a isa Expr && a.head == :(::) && length(a.args) == 2
+        inner, mut = _peel_mut(a.args[2])
+        a.args[2] = inner
+        return (a.args[1]::Symbol, inner, mut, nothing)
+    elseif a isa Expr && a.head == :(::) && length(a.args) == 1
+        error("@pyfunc: argument needs a name (got `::$(a.args[1])`); write `name::Type`.")
+    else
+        error("@pyfunc: every argument must be typed as `name::Type`, got `$a`.")
+    end
+end
+
+# Parse a function-definition expression into (name, [(name,type,mut,default)…], rettype_expr).
+# Supports positional args, positional args with defaults (`b::T=val`), and
+# keyword args (`; b::T=val` or `; b::T`). Julia's AST puts the :parameters block
+# (keyword args) first in sig.args, so we collect positional and keyword args
+# separately and concatenate them: positional first, keywords after.
 function _parse_fundef(def)
     (def isa Expr && def.head in (:function, :(=))) ||
         error("@pyfunc expects a function definition, got: $(def)")
     sig = def.args[1]
-    # Return type: `f(args)::Ret`
     ret_expr = :Any
     if sig isa Expr && sig.head == :(::)
         ret_expr = sig.args[2]
@@ -88,16 +118,31 @@ function _parse_fundef(def)
         error("@pyfunc: malformed signature in $(def)")
     fname = sig.args[1]
     fname isa Symbol || error("@pyfunc: function name must be a plain symbol, got $fname")
-    args = Tuple{Symbol,Any,Bool}[]
+
+    pos_args = Tuple{Symbol,Any,Bool,Any,Bool}[]   # positional (incl. with defaults)
+    kw_args  = Tuple{Symbol,Any,Bool,Any,Bool}[]   # from ; block (is_keyword=true)
     for a in sig.args[2:end]
-        if a isa Expr && a.head == :(::) && length(a.args) == 2
-            inner, mut = _peel_mut(a.args[2])
-            a.args[2] = inner          # peel `Mut{T}` -> `T` in the emitted function
-            push!(args, (a.args[1]::Symbol, inner, mut))
-        elseif a isa Expr && a.head == :(::) && length(a.args) == 1
-            error("@pyfunc: argument needs a name (got `::$(a.args[1])`); write `name::Type`.")
+        if a isa Expr && a.head == :parameters
+            for ka in a.args
+                (n, t, mut, d) = _parse_one_arg(ka)
+                push!(kw_args, (n, t, mut, d, true))
+            end
         else
-            error("@pyfunc: every argument must be typed as `name::Type`, got `$a`.")
+            (n, t, mut, d) = _parse_one_arg(a)
+            push!(pos_args, (n, t, mut, d, false))
+        end
+    end
+    args = vcat(pos_args, kw_args)
+
+    # Required args must precede optional ones (Python's C-API constraint).
+    saw_optional = false
+    for (_, _, _, d, _) in args
+        if d === nothing
+            saw_optional && error(
+                "@pyfunc: required argument follows an optional one — " *
+                "put all arguments with defaults after those without.")
+        else
+            saw_optional = true
         end
     end
     return fname, args, ret_expr
@@ -146,8 +191,9 @@ macro pyfunc(arg1, arg2=nothing)
         error("@pyfunc: python name must be a string literal, got $pyname_expr")
     end
 
-    # Build the PtExport-construction expr; types are evaluated in the user module.
-    arg_exprs = [:(ParselTongue.PtArg($(QuoteNode(n)), $(esc(t)), $mut)) for (n, t, mut) in args]
+    # Build the PtExport-construction expr; types + defaults are evaluated in the user module.
+    arg_exprs = [:(ParselTongue.PtArg($(QuoteNode(n)), $(esc(t)), $mut, $(esc(d)), $kw))
+                 for (n, t, mut, d, kw) in args]
 
     quote
         $(esc(def))

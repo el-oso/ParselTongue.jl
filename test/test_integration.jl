@@ -77,6 +77,14 @@ end
             assert not any(isinstance(x, bytearray) for x in bases), "array return went through bytearray (not zero-copy)"
         except ImportError:
             pass
+        # Keyword/default arguments (item 5)
+        assert feature.power(3.0) == 9.0,            "power(3.0) default exponent"
+        assert feature.power(3.0, exponent=3.0) == 27.0, "power(3.0, exponent=3.0)"
+        assert feature.power(base=2.0, exponent=10.0) == 1024.0, "power all kwargs"
+        assert feature.clamp_val(0.5) == 0.5,        "clamp_val in [0,1]"
+        assert feature.clamp_val(-1.0) == 0.0,       "clamp_val below lo"
+        assert feature.clamp_val(2.0) == 1.0,        "clamp_val above hi"
+        assert feature.clamp_val(0.5, lo=0.3, hi=0.7) == 0.5, "clamp_val custom range"
         print("FEATURE_OK")
         """
         out = read(`$(Sys.which("python3")) -c $script`, String)

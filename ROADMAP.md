@@ -92,7 +92,7 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   `build_runtime_wheel()` + `build_wheel(...; runtime=:shared)`; the package
   `__init__.py` ctypes-preloads libjulia (RTLD_GLOBAL) before importing the ext.
   Reuses `_vendor_libs`/`_pack_wheel`. Effort M–L · Risk M.
-- [ ] **5. Keyword / default arguments** — `@pyfunc f(a; b=1.0)`; shim uses
+- [x] **5. Keyword / default arguments** — `@pyfunc f(a; b=1.0)`; shim uses
   `PyArg_ParseTupleAndKeywords`. `macros.jl` records defaults; `cshim.jl` emits the
   keyword list. Effort M.
 - [ ] **6. manylinux tagging** — emit `manylinux_2_xx_<plat>` tags; reconcile with the

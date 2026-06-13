@@ -18,4 +18,8 @@ using ParselTongue
     @pyfunc boom()::Int64 = error("boom!")
     @pyfunc safe_div(a::Float64, b::Float64)::Float64 = b == 0.0 ? error("division by zero") : a / b
     @pyfunc sleep_ms(ms::Int64)::Int64 = (Libc.systemsleep(ms / 1000.0); ms)
+
+    # Keyword / default arguments (item 5).
+    @pyfunc power(base::Float64; exponent::Float64=2.0)::Float64 = base ^ exponent
+    @pyfunc clamp_val(x::Float64; lo::Float64=0.0, hi::Float64=1.0)::Float64 = clamp(x, lo, hi)
 end
