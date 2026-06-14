@@ -37,11 +37,10 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y python3-numpy
 
-      # TypeContracts is an unregistered sibling package (not in General registry).
-      # In CI there is no ../TypeContracts on disk, so we resolve it via URL.
-      - name: Resolve TypeContracts and instantiate
+      # TypeContracts is resolved via the [sources] entry in Project.toml.
+      - name: Instantiate
         run: |
-          julia --project=. -e 'using Pkg; Pkg.develop(url="https://github.com/el-oso/TypeContracts.jl.git"); Pkg.instantiate()'
+          julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
       # Run the fast build-free unit tests first for quick feedback.
       # If these fail, the integration build step below is skipped automatically.
