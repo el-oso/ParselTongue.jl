@@ -7,7 +7,8 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     _julia_version_str, _runtime_wheel_tag, _runtime_metadata,
                     _RUNTIME_INIT_PY, _write_shared_pkg_pyfiles,
                     _readelf_needed, _transitive_needed, _resolve_soname,
-                    _vendor_libs_smart,
+                    _vendor_libs_smart, _is_dynlib, _SKIP_LIB,
+                    _parse_otool_output, _otool_needed, _dynlib_needed,
                     PtOpt, _is_optional, _opt_inner, isopt, _opt_inner_c,
                     _to_c_opt,
                     PtError, _ERRORS, _py_exc_cname, _error_globals, _error_inits,
@@ -1213,4 +1214,71 @@ end
     err3_inner = err3 isa LoadError ? err3.error : err3
     @test err3_inner isa ErrorException
     @test occursin("carrier=", err3_inner.msg)
+end
+
+@testset "macOS support helpers (item 7)" begin
+    # ── _is_dynlib ─────────────────────────────────────────────────────────
+    @test  _is_dynlib("libjulia.so.1")
+    @test  _is_dynlib("libjulia.so")
+    @test  _is_dynlib("libfoo.cpython-311-x86_64-linux-gnu.so")
+    @test  _is_dynlib("libjulia.1.12.0.dylib")
+    @test  _is_dynlib("libjulia.dylib")
+    @test !_is_dynlib("libjulia.a")
+    @test !_is_dynlib("sys.bc")
+    @test !_is_dynlib("somefile.txt")
+
+    # ── _SKIP_LIB regex ────────────────────────────────────────────────────
+    # Linux variants (already covered by old pattern)
+    @test  occursin(_SKIP_LIB, "sys.so")
+    @test  occursin(_SKIP_LIB, "libLLVM-14.so")
+    @test  occursin(_SKIP_LIB, "libjulia-codegen.so")
+    @test  occursin(_SKIP_LIB, "libccalltest.so")
+    @test  occursin(_SKIP_LIB, "libllvmcalltest.so")
+    @test  occursin(_SKIP_LIB, "libccalllazybar.so")
+    # macOS variants (new)
+    @test  occursin(_SKIP_LIB, "sys.dylib")
+    @test  occursin(_SKIP_LIB, "libLLVM.dylib")
+    @test  occursin(_SKIP_LIB, "libjulia-codegen.0.dylib")
+    # Should NOT match vendored libs
+    @test !occursin(_SKIP_LIB, "libjulia.so.1")
+    @test !occursin(_SKIP_LIB, "libjulia-internal.so")
+    @test !occursin(_SKIP_LIB, "libjulia.1.12.0.dylib")
+    @test !occursin(_SKIP_LIB, "libjulia-internal.dylib")
+
+    # ── _parse_otool_output ────────────────────────────────────────────────
+    mock_otool = [
+        "/path/to/libfoo.1.0.dylib:",     # first line: the lib itself — skip
+        "\t/abs/path/libjulia.1.dylib (compatibility version 1.0.0, current version 1.12.0)",
+        "\t@rpath/libstdc++.6.dylib (compatibility version 7.0.0, current version 7.0.0)",
+        "\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1336.0.0)",
+    ]
+    parsed = _parse_otool_output(mock_otool)
+    @test length(parsed) == 3
+    @test "libjulia.1.dylib"  in parsed
+    @test "libstdc++.6.dylib" in parsed
+    @test "libSystem.B.dylib" in parsed
+
+    # Empty / single-line output returns nothing.
+    @test isempty(_parse_otool_output(String[]))
+    @test isempty(_parse_otool_output(["only_the_lib_itself:"]))
+
+    # ── _vendor_libs_smart with .dylib files ──────────────────────────────
+    src2 = mktempdir(); dst2 = mktempdir()
+    try
+        write(joinpath(src2, "libjulia.1.12.0.dylib"), "julia")
+        write(joinpath(src2, "libunused.dylib"), "x")
+        write(joinpath(src2, "libjulia-codegen.dylib"), "skip")  # in _SKIP_LIB
+        needed2 = Set(["libjulia.1.12.0.dylib"])
+        _vendor_libs_smart(src2, dst2, needed2)
+        @test  isfile(joinpath(dst2, "libjulia.1.12.0.dylib"))
+        @test !isfile(joinpath(dst2, "libunused.dylib"))
+        @test !isfile(joinpath(dst2, "libjulia-codegen.dylib"))
+    finally
+        rm(src2; recursive=true); rm(dst2; recursive=true)
+    end
+
+    # ── rpath origin string ────────────────────────────────────────────────
+    origin = Sys.isapple() ? "@loader_path" : "\$ORIGIN"
+    @test origin == (Sys.isapple() ? "@loader_path" : "\$ORIGIN")
+    @test occursin(origin, "$origin/julia/lib")
 end

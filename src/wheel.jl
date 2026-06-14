@@ -21,15 +21,18 @@
 # networking): the trimmed runtime runs their JLL `__init__`s at startup, which
 # *fatally* dlopen those libraries even when the user's code never uses them.
 # (A future optimisation would suppress those unused inits and shrink the bundle.)
-const _SKIP_LIB = r"^(sys\.so|libLLVM|libjulia-codegen|libccalltest|libllvmcalltest|libccalllazybar)"
+# Matches both Linux (.so) and macOS (.dylib) variants of libs we never bundle.
+const _SKIP_LIB = r"^(sys\.(so|dylib)|libLLVM|libjulia-codegen|libccalltest|libllvmcalltest|libccalllazybar)"
 
-# Copy every `*.so*` entry in `srcdir` (skipping `_SKIP_LIB`) into `dstdir`,
-# preserving symlink chains so any soname (versioned or not) resolves.
+_is_dynlib(name::AbstractString) = occursin(".so", name) || occursin(".dylib", name)
+
+# Copy every shared-library entry in `srcdir` (skipping `_SKIP_LIB`) into `dstdir`,
+# preserving symlink chains so any soname/install-name resolves.
 function _vendor_libs(srcdir::AbstractString, dstdir::AbstractString)
     mkpath(dstdir)
     n = 0
     for name in readdir(srcdir)
-        occursin(".so", name) || continue
+        _is_dynlib(name) || continue
         occursin(_SKIP_LIB, name) && continue
         cp(joinpath(srcdir, name), joinpath(dstdir, name);
            follow_symlinks=false, force=true)
@@ -111,11 +114,13 @@ function build_wheel(user_path::AbstractString;
     pkgdir = joinpath(stage, mod); mkpath(pkgdir)
 
     # 1. Build the extension as the internal submodule `_<mod>`.
-    #    Bundled: embed $ORIGIN rpaths so the .so finds the vendored libs.
-    #    Shared: no rpaths; resolution happens via LD_LIBRARY_PATH set at import.
+    #    Bundled: embed relative rpaths so the .so finds the vendored libs.
+    #      Linux: $ORIGIN (re-read per dlopen); macOS: @loader_path (resolved by dyld).
+    #    Shared: no rpaths; resolution happens via preloading at import time.
     ext_name = string("_", mod)
+    origin = Sys.isapple() ? "@loader_path" : "\$ORIGIN"
     rpaths = runtime === :bundled ?
-        ["\$ORIGIN/julia/lib", "\$ORIGIN/julia/lib/julia"] : String[]
+        ["$origin/julia/lib", "$origin/julia/lib/julia"] : String[]
     so = build_extension(user_path;
                          mod_name=ext_name, outdir=pkgdir, trim, python, abi3,
                          runtime_rpaths=rpaths,
@@ -378,8 +383,10 @@ function build_runtime_wheel(;
     return whl_path
 end
 
-# Write __init__.py for a shared-runtime extension wheel: sets LD_LIBRARY_PATH
-# to point at parseltongue_runtime's julia/lib dirs before importing the .so.
+# Write __init__.py for a shared-runtime extension wheel.
+# Linux: sets LD_LIBRARY_PATH (re-read by glibc at each dlopen).
+# macOS: uses ctypes.CDLL to preload Julia dylibs globally before import
+#   (DYLD_LIBRARY_PATH is not re-read after process start, so env-var trick fails).
 function _write_shared_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractString,
                                    exports::AbstractVector{PtExport}, mod::AbstractString)
     subs = submodule_names(exports)
@@ -391,8 +398,18 @@ function _write_shared_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractStr
     submod_str = join(("from . import $s  # noqa: F401\n" for s in subs), "")
     all_str = "__all__ = [$(join(("\"$n\"" for n in allnames), ", "))]\n"
 
-    # Python uses single-quoted strings to avoid Julia/Python double-quote conflicts.
-    # LD_LIBRARY_PATH is set before the extension import so glibc re-reads it at dlopen.
+    preload_body = if Sys.isapple()
+        # ctypes global-load every *.dylib in the runtime package's lib dirs.
+        """    import ctypes as _ct, glob as _gl
+    for _lib in sorted(_gl.glob(_os.path.join(_l1, '*.dylib'))) + \\
+                sorted(_gl.glob(_os.path.join(_l2, '*.dylib'))):
+        try: _ct.CDLL(_lib, _ct.RTLD_GLOBAL)
+        except OSError: pass"""
+    else
+        """    _prev = _os.environ.get('LD_LIBRARY_PATH', '')
+    _os.environ['LD_LIBRARY_PATH'] = ':'.join(x for x in (_l1, _l2, _prev) if x)"""
+    end
+
     init_py = """
 \"\"\"$mod — built with ParselTongue. Requires parseltongue-runtime.\"\"\"
 import importlib.util as _ilu, os as _os
@@ -406,8 +423,7 @@ def _preload():
     _rt = _os.path.dirname(_s.origin)
     _l1 = _os.path.join(_rt, 'julia', 'lib')
     _l2 = _os.path.join(_rt, 'julia', 'lib', 'julia')
-    _prev = _os.environ.get('LD_LIBRARY_PATH', '')
-    _os.environ['LD_LIBRARY_PATH'] = ':'.join(x for x in (_l1, _l2, _prev) if x)
+$preload_body
 _preload()
 del _preload, _ilu, _os
 $(imports_str)$(submod_str)$(all_str)"""
@@ -436,6 +452,26 @@ function _readelf_needed(so_path::AbstractString)
     return needed
 end
 
+# Parse `otool -L` output lines into a list of dylib basenames.
+# First line is the library's own install name and is skipped.
+function _parse_otool_output(lines::AbstractVector{<:AbstractString})
+    needed = String[]
+    length(lines) < 2 && return needed
+    for line in lines[2:end]
+        m = match(r"^\s+(\S+)\s+\(", line)
+        m !== nothing && push!(needed, basename(m.captures[1]))
+    end
+    return needed
+end
+
+# Return the LC_LOAD_DYLIB install-name basenames listed in `so_path` (macOS, `otool -L`).
+_otool_needed(so_path::AbstractString) =
+    _parse_otool_output(collect(eachline(ignorestatus(`otool -L $so_path`))))
+
+# Platform dispatch: DT_NEEDED on Linux, LC_LOAD_DYLIB on macOS.
+_dynlib_needed(so_path::AbstractString) =
+    Sys.isapple() ? _otool_needed(so_path) : _readelf_needed(so_path)
+
 # Resolve a soname to an on-disk path by searching `lib_dirs` in order.
 # Returns `nothing` if not found in any of the search dirs.
 function _resolve_soname(soname::AbstractString, lib_dirs::AbstractVector{<:AbstractString})
@@ -460,7 +496,7 @@ function _transitive_needed(so_path::AbstractString,
 
     while !isempty(queue)
         path = popfirst!(queue)
-        for soname in _readelf_needed(path)
+        for soname in _dynlib_needed(path)
             soname in visited && continue
             push!(visited, soname)
             resolved = _resolve_soname(soname, lib_dirs)
@@ -479,7 +515,7 @@ function _vendor_libs_smart(srcdir::AbstractString, dstdir::AbstractString,
     mkpath(dstdir)
     n = 0
     for name in readdir(srcdir)
-        occursin(".so", name) || continue
+        _is_dynlib(name) || continue
         occursin(_SKIP_LIB, name) && continue
         path = joinpath(srcdir, name)
         real_name = islink(path) ? basename(realpath(path)) : name

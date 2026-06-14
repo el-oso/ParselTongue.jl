@@ -160,8 +160,22 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   accept `manylinux=true` (auto), `manylinux="2.17"` (pinned floor — recommended for
   Julia 1.12+ which targets glibc ≥ 2.17), or `manylinux=false` (raw tag). Skips
   auditwheel entirely (it would double-vendor libjulia); just sets the tag. Effort M · Risk M.
-- [ ] **7. macOS support** — `.dylib`, `@loader_path` rpaths, ext suffix; juliac on
-  macOS. `build.jl`/`wheel.jl` platform branches. Effort L.
+- [x] **7. macOS support** — shipped v0.20.0.
+  `_link_extension` now branches on `Sys.isapple()`: macOS uses `-dynamiclib
+  -undefined dynamic_lookup` (vs `-shared -fPIC`) and `-Wl,-force_load,img.a`
+  (vs `--whole-archive`); both `-Wl,-rpath,...` and bare `-rpath` forms are
+  stripped from julia-config output when `strip_abs_rpath=true`. `build_wheel`
+  uses `@loader_path` rpaths on macOS (vs `$ORIGIN`); macOS dyld resolves
+  `@loader_path` at load time relative to the `.so` file, so no env-var trick
+  is needed for bundled wheels. `_vendor_libs`/`_vendor_libs_smart` detect
+  `.dylib` via `_is_dynlib`; `_SKIP_LIB` regex matches both `.so` and `.dylib`
+  variants. `_dynlib_needed` dispatches to `_otool_needed` (macOS, `otool -L`)
+  or `_readelf_needed` (Linux, `readelf -d`) for slim-wheel BFS. Shared-runtime
+  `__init__.py` on macOS uses `ctypes.CDLL(..., RTLD_GLOBAL)` to preload Julia
+  dylibs (DYLD_LIBRARY_PATH is not re-read post-startup; Linux keeps
+  LD_LIBRARY_PATH). Extension suffix (`EXT_SUFFIX` / `.abi3.so`) is handled
+  by Python's sysconfig — no Julia change needed. `juliac --output-o` produces
+  a `.a` archive on both platforms unchanged. Effort L.
 - [x] **8. More boundary types** — `Bool`/`Int` arrays already work; add `Vector{String}`
   ↔ list[str], and `NamedTuple` ↔ dict return. `boundary.jl` + `cshim.jl`. Effort M each.
 

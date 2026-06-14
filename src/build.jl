@@ -177,18 +177,32 @@ function _link_extension(t::BuildTools, cpath::AbstractString, img::AbstractStri
                          strip_abs_rpath::Bool, verbose::Bool)
     cc = _find_cc()
     pyinc = t.py_includes
-    # For a relocatable wheel we drop the absolute `-rpath`s julia-config bakes in
-    # and add our own `$ORIGIN`-relative ones (the bundled libs find each other via
-    # their existing RUNPATHs once the relative layout is preserved).
-    ldflags = strip_abs_rpath ? filter(f -> !startswith(f, "-Wl,-rpath"), t.ldflags) : t.ldflags
-    ldlibs  = strip_abs_rpath ? filter(f -> !startswith(f, "-Wl,-rpath"), t.ldlibs)  : t.ldlibs
     rpath_flags = [string("-Wl,-rpath,", rp) for rp in runtime_rpaths]
     # Extension modules must NOT link libpython (the interpreter provides the symbols).
-    cmd = `$cc -shared -fPIC $cpath $pyinc
-           -Wl,--whole-archive $img -Wl,--no-whole-archive
-           $(t.cflags) $ldflags $ldlibs -ljulia-internal
-           $rpath_flags
-           -o $so_path`
+    if Sys.isapple()
+        # macOS: julia-config may emit `-rpath /abs` (no -Wl,) or `-Wl,-rpath,/abs`.
+        _is_rpath(f) = startswith(f, "-Wl,-rpath") || startswith(f, "-rpath")
+        ldflags = strip_abs_rpath ? filter(!_is_rpath, t.ldflags) : t.ldflags
+        ldlibs  = strip_abs_rpath ? filter(!_is_rpath, t.ldlibs)  : t.ldlibs
+        # -force_load is the macOS equivalent of --whole-archive (archive-specific).
+        # -undefined dynamic_lookup: Python symbols are provided by the interpreter.
+        cmd = `$cc -dynamiclib -undefined dynamic_lookup $cpath $pyinc
+               -Wl,-force_load,$img
+               $(t.cflags) $ldflags $ldlibs -ljulia-internal
+               $rpath_flags
+               -o $so_path`
+    else
+        # For a relocatable wheel we drop the absolute `-rpath`s julia-config bakes in
+        # and add our own `$ORIGIN`-relative ones (the bundled libs find each other via
+        # their existing RUNPATHs once the relative layout is preserved).
+        ldflags = strip_abs_rpath ? filter(f -> !startswith(f, "-Wl,-rpath"), t.ldflags) : t.ldflags
+        ldlibs  = strip_abs_rpath ? filter(f -> !startswith(f, "-Wl,-rpath"), t.ldlibs)  : t.ldlibs
+        cmd = `$cc -shared -fPIC $cpath $pyinc
+               -Wl,--whole-archive $img -Wl,--no-whole-archive
+               $(t.cflags) $ldflags $ldlibs -ljulia-internal
+               $rpath_flags
+               -o $so_path`
+    end
     verbose && @info "ParselTongue: linking" cmd
     if !success(pipeline(cmd; stdout, stderr))
         error("ParselTongue: linking the extension module failed.")
