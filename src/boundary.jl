@@ -531,6 +531,58 @@ end
 
 to_c(v::PtVarArgs{T}) where {T<:_PtVarArgElt} = to_c(v.data)
 
+# ── PyCallable: Python callable objects ───────────────────────────────
+#
+# Carrier: Ptr{Cvoid} (a raw PyObject* cast to void*). The C shim extracts it
+# with the "O" format, checks PyCallable_Check, Py_INCREFs it before the GIL
+# is released, and Py_DECREFs it after the Julia call returns.
+#
+# Calling from Julia: the C shim releases the GIL before calling the Julia
+# function. Use `f(x::Float64)::Float64` (or any supported overload) to call
+# back into Python: it re-acquires the GIL via PyGILState_Ensure, builds a
+# Python tuple, calls PyObject_Call, extracts the result, and releases the GIL.
+# All of this is implemented as direct ccall invocations — no Julia method
+# dispatch — so it is trim-safe under --trim=safe.
+
+struct PyCallable
+    ptr::Ptr{Cvoid}
+end
+
+c_abi_type(::Type{PyCallable}) = Ptr{Cvoid}
+from_c(::Type{PyCallable}, p::Ptr{Cvoid}) = PyCallable(p)
+to_c(f::PyCallable) = f.ptr
+
+# Call the Python callable with a single Float64 argument, returning Float64.
+# Re-acquires the GIL (released by the C shim before calling Julia), builds a
+# one-element tuple, calls PyObject_Call, extracts the double result.
+function (f::PyCallable)(x::Float64)::Float64
+    gstate = ccall(:PyGILState_Ensure, Int32, ())
+    args_tup = ccall(:PyTuple_New, Ptr{Cvoid}, (Int,), 1)
+    if args_tup == Ptr{Cvoid}(0)
+        ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
+        error("PyCallable: failed to build args tuple")
+    end
+    item = ccall(:PyFloat_FromDouble, Ptr{Cvoid}, (Float64,), x)
+    if item == Ptr{Cvoid}(0)
+        ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), args_tup)
+        ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
+        error("PyCallable: failed to box Float64 argument")
+    end
+    ccall(:PyTuple_SetItem, Int32, (Ptr{Cvoid}, Int, Ptr{Cvoid}), args_tup, 0, item)
+    result = ccall(:PyObject_Call, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
+                   f.ptr, args_tup, Ptr{Cvoid}(0))
+    ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), args_tup)
+    if result == Ptr{Cvoid}(0)
+        ccall(:PyErr_Clear, Cvoid, ())
+        ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
+        error("PyCallable: Python callable raised an exception")
+    end
+    r = ccall(:PyFloat_AsDouble, Float64, (Ptr{Cvoid},), result)
+    ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), result)
+    ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
+    return r
+end
+
 # ── Boundary validation (build host) ──────────────────────────────────
 
 # Which of the three protocol methods are missing for `T`. Order-independent;

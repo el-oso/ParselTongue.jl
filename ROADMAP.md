@@ -199,15 +199,24 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   - Done-when: a user package can define a custom boundary type without touching
     ParselTongue source. Effort M · Risk L.
 
-- [ ] **F. Python callables as arguments** *(gap vs PyO3 `Py<PyAny>` / `PyCallable`)*
-  - Spike first in `spike/` — verify `ccall(:PyObject_Call, ...)` from inside a
-    `--trim=safe` binary compiles without dynamic dispatch rejection.
-  - Boundary type `PyCallable`: carrier `Ptr{Cvoid}` (PyObject*); `from_c` just stores
-    the pointer; `to_c` returns it. Julia side wraps in a closure that calls
-    `ccall(:PyObject_Call, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}), fn, args, C_NULL)`
-    and re-acquires the GIL before calling.
-  - Done-when: `@pyfunc minimize(f::PyCallable, x0::Float64)::Float64` accepts a
-    Python lambda and calls it from Julia. Effort L · Risk M (spike first).
+- [x] **F. Python callables as arguments** *(gap vs PyO3 `Py<PyAny>` / `PyCallable`)* — shipped v0.21.0.
+  - `PyCallable` boundary type: carrier `Ptr{Cvoid}` (raw PyObject* cast to void*).
+    `c_abi_type` = `Ptr{Cvoid}`; `from_c` wraps pointer; `to_c` unwraps.
+  - C shim: `"O"` format + `PyCallable_Check`; `Py_INCREF` before GIL release;
+    `Py_DECREF` after call. The incref is inserted into acquired-cleanup chains via
+    `_insert_cleanup_before_return` so earlier-arg failures also release correctly.
+  - Julia-side functor `(f::PyCallable)(x::Float64)::Float64`: re-acquires GIL via
+    `PyGILState_Ensure`, builds a one-element `PyTuple_New`, calls `PyObject_Call`,
+    extracts `PyFloat_AsDouble`, releases GIL. All are direct `ccall` invocations —
+    no Julia method dispatch — so trim-safe under `--trim=safe`. Note: the spike
+    was skipped; the integration test build IS the trim-cleanliness proof.
+  - `_zero_cval(Ptr{Cvoid})` = `"Ptr{Cvoid}(0)"` in ccallable_gen.
+  - `ispycallable`, `_c_ctype`, `_carrier_tag`, `_arg_plan`, `_build_pyobject` in cshim.jl.
+  - Integration fixture: `apply(f::PyCallable, x::Float64)::Float64 = f(x)` and
+    `bisect(f, lo, hi)` (52-iteration bisection root finder).
+  - Supports returning `PyCallable` (identity Py_INCREF path in `_build_pyobject`).
+  - Limitation: only `Float64 → Float64` calling signature implemented; other
+    scalar types would need additional functor overloads.
 
 - [x] **9. Shrink the bundle** *(size)* — `readelf -d` analysis shows that the
   extension .so only needs 6 Julia libs via DT_NEEDED (`libjulia-internal`, `libstdc++`,

@@ -16,7 +16,9 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     _manylinux_plat, _wheel_tag, _wheel_tag_abi3,
                     _insert_cleanup_before_return,
                     PtVarArgs, isvarargs, _varargs_elt, _PtVarArgElt,
-                    _missing_boundary_methods
+                    _missing_boundary_methods,
+                    PyCallable, ispycallable,
+                    _c_ctype, _arg_plan, _build_pyobject, _wrapper_fn, _extern_decl
 
 # Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
 struct _TestHandle
@@ -1281,4 +1283,75 @@ end
     origin = Sys.isapple() ? "@loader_path" : "\$ORIGIN"
     @test origin == (Sys.isapple() ? "@loader_path" : "\$ORIGIN")
     @test occursin(origin, "$origin/julia/lib")
+end
+
+@testset "PyCallable boundary type (item F)" begin
+    # ── boundary protocol ─────────────────────────────────────────────────
+    @test c_abi_type(PyCallable) === Ptr{Cvoid}
+    p = Ptr{Cvoid}(42)
+    @test from_c(PyCallable, p) === PyCallable(p)
+    @test to_c(PyCallable(p)) === p
+    @test is_boundary_type(PyCallable)
+
+    # ── ispycallable predicate ────────────────────────────────────────────
+    @test  ispycallable(Ptr{Cvoid})
+    @test !ispycallable(Ptr{Int64})
+    @test !ispycallable(Float64)
+    @test !ispycallable(PtHandle)
+
+    # ── _c_ctype ──────────────────────────────────────────────────────────
+    @test _c_ctype(Ptr{Cvoid}) == "void *"
+
+    # ── _arg_plan for PyCallable carrier ─────────────────────────────────
+    plan = _arg_plan(Ptr{Cvoid}, 1)
+    @test plan.fmt == "O"
+    @test occursin("a1_obj", join(plan.decls))
+    @test occursin("void *", join(plan.decls))
+    @test any(s -> occursin("PyCallable_Check", s), plan.setup)
+    @test any(s -> occursin("Py_INCREF", s), plan.setup)
+    @test plan.callarg == "a1"
+    @test any(s -> occursin("Py_DECREF", s), plan.cleanup)
+
+    # ── _build_pyobject for Ptr{Cvoid} (return a callable) ────────────────
+    stmts = _build_pyobject(Ptr{Cvoid}, "r", "_ret")
+    @test any(s -> occursin("PyObject *_ret", s) && occursin("(PyObject *)r", s), stmts)
+    @test any(s -> occursin("Py_INCREF", s), stmts)
+
+    # ── _extern_decl uses "void *" for PyCallable arg ─────────────────────
+    clear_exports!()
+    @eval @pymodule _testcallable begin
+        @pyfunc apply_test(f::PyCallable, x::Float64)::Float64 = f(x)
+    end
+    e = _EXPORTS[1]
+    decl = _extern_decl(e)
+    @test occursin("void *", decl)
+    @test occursin("double", decl)
+    clear_exports!()
+
+    # ── emit_ccallable generates correct wrapper ───────────────────────────
+    clear_exports!()
+    @eval @pymodule _testcallable2 begin
+        @pyfunc apply2(f::PyCallable, x::Float64)::Float64 = f(x)
+    end
+    e2 = _EXPORTS[1]
+    src = emit_ccallable(e2)
+    # carrier is Ptr{Cvoid} = Ptr{Nothing} — @ccallable wrapper uses Ptr{Nothing}
+    @test occursin("Ptr{Nothing}", src)  # Julia renders Ptr{Cvoid} as Ptr{Nothing}
+    @test occursin("PyCallable", src)
+    @test occursin("from_c", src)
+    clear_exports!()
+
+    # ── C shim wrapper contains PyCallable_Check, INCREF/DECREF ──────────
+    clear_exports!()
+    @eval @pymodule _testcallable3 begin
+        @pyfunc apply3(f::PyCallable, x::Float64)::Float64 = f(x)
+    end
+    e3 = _EXPORTS[1]
+    shim, _ = _wrapper_fn(e3)
+    @test occursin("PyCallable_Check", shim)
+    @test occursin("Py_INCREF", shim)
+    @test occursin("Py_DECREF", shim)
+    @test occursin("\"O", shim)             # "O" or "Od..." — PyCallable parsed with O
+    @test occursin("void *", shim)          # declared as void*
+    clear_exports!()
 end

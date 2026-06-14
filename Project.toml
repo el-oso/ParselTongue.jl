@@ -1,7 +1,7 @@
 name = "ParselTongue"
 uuid = "f960a036-e00a-43bb-b834-c57a5ea23a66"
 authors = ["el_oso"]
-version = "0.20.0"
+version = "0.21.0"
 
 [deps]
 TypeContracts = "c7a3f1e2-84b5-4d69-9e0a-1f2b3c4d5e6f"

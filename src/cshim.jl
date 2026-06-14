@@ -109,6 +109,7 @@ const _ELTINFO = Dict{Type,EltInfo}(
 isarray(@nospecialize(C::Type)) = C isa DataType && C.name === PtArray.body.body.name
 isstrarr(@nospecialize(C::Type)) = C === PtStrArray
 ishandle(@nospecialize(C::Type)) = C === PtHandle
+ispycallable(@nospecialize(C::Type)) = C === Ptr{Cvoid}
 _elt(@nospecialize(C::Type)) = _ELTINFO[C.parameters[1]]      # T from PtArray{T,N}
 _ndims(@nospecialize(C::Type)) = C.parameters[2]::Int         # N from PtArray{T,N}
 _structname(@nospecialize(C::Type)) = string("PtArray_", _elt(C).tag, "_", _ndims(C))
@@ -132,6 +133,7 @@ function _carrier_tag(@nospecialize(C::Type))
     isarray(C) && return _structname(C)
     isstrarr(C) && return "stra"
     ishandle(C) && return "handle"
+    ispycallable(C) && return "pycallable"
     isopt(C) && return string("opt_", _carrier_tag(_opt_inner_c(C)))
     isdict(C) && return string("dict_", _carrier_tag(_dict_val_c(C)))
     istuple(C) && return string("T", join((_carrier_tag(S) for S in fieldtypes(C)), ""))
@@ -170,6 +172,7 @@ function _c_ctype(@nospecialize(C::Type))
     isarray(C) && return _structname(C)
     isstrarr(C) && return "PtStrArray"
     ishandle(C) && return "PtHandle"
+    ispycallable(C) && return "void *"
     isopt(C) && return _opt_cname(C)
     isdict(C) && return _dict_structname(C)
     istuple(C) && return _tuple_structname(C)
@@ -407,6 +410,20 @@ function _arg_plan(@nospecialize(C::Type), i::Int; logical::Bool=false, mutable:
         ]
         # No cleanup needed: Julia's from_c frees keys, vals, and each key string.
         return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
+    elseif ispycallable(C)
+        obj = string(tmp, "_obj")
+        decls = [
+            string("PyObject *", obj, " = NULL;"),
+            string("void *", tmp, " = NULL;"),
+        ]
+        setup = [
+            string("if (!PyCallable_Check(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"argument must be callable\"); return NULL; }"),
+            string("Py_INCREF(", obj, ");"),
+            string(tmp, " = (void *)", obj, ";"),
+        ]
+        # Py_DECREF after Julia call; also inserted before return NULL in later setup steps.
+        cleanup = [string("Py_DECREF((PyObject *)", tmp, ");")]
+        return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, cleanup)
     end
     error("ParselTongue: no argument marshalling for carrier `$C`.")
 end
@@ -427,6 +444,9 @@ function _build_pyobject(@nospecialize(C::Type), val::AbstractString, out::Abstr
         return [string("PyObject *", out, " = _pt_strarray_to_list(", val, ".data, ", val, ".len);")]
     elseif ishandle(C)
         return [string("PyObject *", out, " = PyCapsule_New(", val, ".ptr, NULL, _pt_capsule_free);")]
+    elseif ispycallable(C)
+        return [string("PyObject *", out, " = (PyObject *)", val, ";"),
+                string("if (", out, ") { Py_INCREF(", out, "); }")]
     elseif isarray(C)
         e = _elt(C); n = _ndims(C)
         # 1-D UInt8 arrays return a Python `bytes` object (the natural Python type for

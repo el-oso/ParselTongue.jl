@@ -22,6 +22,7 @@ function _zero_cval(@nospecialize(C::Type))
     C === Cstring && return "Cstring(Ptr{UInt8}(0))"
     C === ParselTongue.PtStrArray && return "ParselTongue.PtStrArray(Ptr{Ptr{UInt8}}(0), Int64(0))"
     C === ParselTongue.PtHandle && return "ParselTongue.PtHandle(Ptr{Cvoid}(0))"
+    C === Ptr{Cvoid} && return "Ptr{Cvoid}(0)"
     if ParselTongue.isopt(C)
         inner_C = ParselTongue._opt_inner_c(C)
         return string(_type_src(C), "(Int32(0), ", _zero_cval(inner_C), ")")

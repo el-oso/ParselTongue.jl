@@ -102,6 +102,11 @@ end
         p2 = feature.point_scale(p, 2.0)
         assert feature.point_x(p2) == 6.0 and feature.point_y(p2) == 8.0, "point_scale"
         del p, p2   # capsule destructors call free()
+        # Python callables as arguments (item F)
+        assert feature.apply(lambda x: x * 2.0, 3.0) == 6.0,    "apply: identity"
+        assert feature.apply(abs, -5.0) == 5.0,                  "apply: builtin"
+        root = feature.bisect(lambda x: x**2 - 2.0, 1.0, 2.0)
+        assert abs(root - 2.0**0.5) < 1e-10,                     "bisect: sqrt(2)"
         print("FEATURE_OK")
         """
         out = read(`$(Sys.which("python3")) -c $script`, String)

@@ -47,4 +47,14 @@ end
     @pyfunc point_y(p::Pt2D)::Float64 = p.y
     @pyfunc point_norm(p::Pt2D)::Float64 = sqrt(p.x^2 + p.y^2)
     @pyfunc point_scale(p::Pt2D, k::Float64)::Pt2D = Pt2D(p.x * k, p.y * k)
+
+    # Python callables as arguments (item F): accept a Python callable and call it.
+    @pyfunc apply(f::PyCallable, x::Float64)::Float64 = f(x)
+    @pyfunc bisect(f::PyCallable, lo::Float64, hi::Float64)::Float64 = begin
+        for _ in 1:52
+            mid = (lo + hi) / 2.0
+            f(mid) < 0.0 ? (lo = mid) : (hi = mid)
+        end
+        (lo + hi) / 2.0
+    end
 end
