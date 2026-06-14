@@ -271,6 +271,72 @@ function to_c(A::AbstractArray{T,N}) where {T<:PtArrayElt,N}
     return PtArray{T,N}(p, size(B), one(Cint))
 end
 
+# ── Dict{String,V} boundary type ─────────────────────────────────────
+# Carrier: `PtDict{V}` — parallel key (char**) and value (V*) arrays plus a count.
+# The C shim builds these arrays from the Python dict (strdup-ing each key), passes
+# the struct to Julia, which iterates it to build a `Dict{String,V}` and then frees
+# the C memory.  For returns, Julia builds the arrays via `to_c` and the C shim
+# converts them to a PyDict (freeing the C arrays afterwards).
+# Restricted to scalar V (not Complex, String, or Array) for v1.
+
+"""
+    PtDict{V}
+
+C-ABI carrier for `Dict{String,V}`: parallel arrays of strdup'd key strings and
+values plus a length. Both arrays are malloc'd by whichever side builds the struct
+and freed by whichever side consumes it.
+"""
+struct PtDict{V}
+    keys::Ptr{Ptr{UInt8}}   # char** (each NUL-terminated, malloc'd)
+    vals::Ptr{V}            # V* (malloc'd)
+    len::Int64
+end
+
+# Restrict to integer + float scalar types (not Bool/Complex for v1 to keep C
+# value extraction simple — Bool needs PyObject_IsTrue, Complex needs special struct).
+const _DICT_VAL_TYPES = (Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64,
+                          Float32, Float64, Bool)
+
+isdict(@nospecialize(C::Type)) = C isa DataType && C.name === PtDict.body.name
+_dict_val_c(@nospecialize(C::Type)) = C.parameters[1]
+
+for _V in _DICT_VAL_TYPES
+    @eval c_abi_type(::Type{Dict{String,$_V}}) = PtDict{$_V}
+
+    # from_c: iterate parallel arrays → Julia Dict, then free the C memory.
+    # Trim-safe: all types are concrete; Dict{String,V} iteration is type-stable.
+    @eval function from_c(::Type{Dict{String,$_V}}, c::PtDict{$_V})::Dict{String,$_V}
+        n = Int(c.len)
+        d = Dict{String,$_V}()
+        for i in 1:n
+            kptr = unsafe_load(c.keys, i)
+            d[unsafe_string(kptr)] = unsafe_load(c.vals, i)
+            Libc.free(kptr)
+        end
+        Libc.free(c.keys)
+        Libc.free(c.vals)
+        return d
+    end
+
+    # to_c: build parallel arrays from the Julia Dict (malloc'd; C shim frees them).
+    @eval function to_c(d::Dict{String,$_V})::PtDict{$_V}
+        n = length(d)
+        kp = Ptr{Ptr{UInt8}}(Libc.malloc(max(1, n) * sizeof(Ptr{UInt8})))
+        vp = Ptr{$_V}(Libc.malloc(max(1, n) * sizeof($_V)))
+        i = 1
+        for (k, v) in d
+            sz = sizeof(k)
+            q = Ptr{UInt8}(Libc.malloc(sz + 1))
+            GC.@preserve k unsafe_copyto!(q, pointer(k), sz)
+            unsafe_store!(q, 0x00, sz + 1)
+            unsafe_store!(kp, q, i)
+            unsafe_store!(vp, v, i)
+            i += 1
+        end
+        return PtDict{$_V}(kp, vp, Int64(n))
+    end
+end
+
 # ── Optional (Union{T,Nothing}) boundary type ────────────────────────
 # Carrier: PtOpt{C} where C = c_abi_type(inner T).
 # Supported for scalar and String T only (not arrays, handles, or tuples).
@@ -382,8 +448,9 @@ function assert_boundary(T::Type)
         "ParselTongue: type `$T` cannot cross the Python boundary.\n" *
         "Missing boundary methods: $(join(missing, ", ")).\n" *
         "Built-in boundary types: scalars ($(join(SCALAR_BOUNDARY_TYPES, ", "))), " *
-        "String, Vector{String}, Vector{<numeric>}, AbstractArray{<numeric>,N}, " *
-        "Tuple/NamedTuple of the above, and @pyhandle isbitstype structs.\n" *
+        "String, Vector{String}, Vector{UInt8} (bytes), Vector{<numeric>}, " *
+        "AbstractArray{<numeric>,N}, Dict{String,<scalar>}, " *
+        "Tuple/NamedTuple of the above, Union{T,Nothing}, and @pyhandle isbitstype structs.\n" *
         "To add support for `$T`: define `c_abi_type`, `from_c`, and `to_c`."
     )
     return c_abi_type(T)

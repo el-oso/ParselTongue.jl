@@ -117,6 +117,10 @@ _structname(@nospecialize(C::Type)) = string("PtArray_", _elt(C).tag, "_", _ndim
 # C-level struct name: "PtOpt_double", "PtOpt_int64t", "PtOpt_str", etc.
 _opt_cname(@nospecialize(C::Type)) = string("PtOpt_", _carrier_tag(_opt_inner_c(C)))
 
+# Dict carrier (PtDict{V}) — defined in boundary.jl as isdict/_dict_val_c.
+# C-level struct name: "PtDict_double", "PtDict_int64t", etc.
+_dict_structname(@nospecialize(C::Type)) = string("PtDict_", _carrier_tag(_dict_val_c(C)))
+
 # ── Tuple carriers (Python tuple returns) ─────────────────────────────
 istuple(@nospecialize(C::Type)) = C isa DataType && C <: Tuple
 
@@ -129,6 +133,7 @@ function _carrier_tag(@nospecialize(C::Type))
     isstrarr(C) && return "stra"
     ishandle(C) && return "handle"
     isopt(C) && return string("opt_", _carrier_tag(_opt_inner_c(C)))
+    isdict(C) && return string("dict_", _carrier_tag(_dict_val_c(C)))
     istuple(C) && return string("T", join((_carrier_tag(S) for S in fieldtypes(C)), ""))
     return "x"
 end
@@ -166,6 +171,7 @@ function _c_ctype(@nospecialize(C::Type))
     isstrarr(C) && return "PtStrArray"
     ishandle(C) && return "PtHandle"
     isopt(C) && return _opt_cname(C)
+    isdict(C) && return _dict_structname(C)
     istuple(C) && return _tuple_structname(C)
     error("ParselTongue: no C type for carrier `$C`.")
 end
@@ -349,6 +355,58 @@ function _arg_plan(@nospecialize(C::Type), i::Int; logical::Bool=false, mutable:
         for s in inner_stmts; push!(setup, string("    ", s)); end
         push!(setup, "}")
         return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
+    elseif isdict(C)
+        vc = _dict_val_c(C)
+        cs = _CSCALARS[vc]
+        dcn = _dict_structname(C)
+        obj = string(tmp, "_obj")
+        ni = string(tmp, "_n")
+        kv = string(tmp, "_k"); vv = string(tmp, "_v")
+        pos = string(tmp, "_pos"); ii = string(tmp, "_i")
+        klen = string(tmp, "_klen"); ks = string(tmp, "_ks")
+        decls = [
+            string("PyObject *", obj, " = NULL;"),
+            string(dcn, " ", tmp, " = {NULL, NULL, 0};"),
+        ]
+        # Determine value extraction based on type
+        vextract = if vc === Bool
+            (string("int _vb_", tmp, " = PyObject_IsTrue(", vv, ");"),
+             string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+             string(tmp, ".vals[", ii, "] = (bool)_vb_", tmp, ";"))
+        elseif cs.ctype in ("float", "double")
+            (string("double _vd_", tmp, " = PyFloat_AsDouble(", vv, ");"),
+             string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+             string(tmp, ".vals[", ii, "] = (", cs.ctype, ")_vd_", tmp, ";"))
+        elseif startswith(cs.ctype, "u")  # unsigned integer
+            (string("unsigned long long _vu_", tmp, " = PyLong_AsUnsignedLongLong(", vv, ");"),
+             string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+             string(tmp, ".vals[", ii, "] = (", cs.ctype, ")_vu_", tmp, ";"))
+        else  # signed integer
+            (string("long long _vs_", tmp, " = PyLong_AsLongLong(", vv, ");"),
+             string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+             string(tmp, ".vals[", ii, "] = (", cs.ctype, ")_vs_", tmp, ";"))
+        end
+        setup = String[
+            string("if (!PyDict_Check(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"expected a dict[str, ...]\"); return NULL; }"),
+            string("Py_ssize_t ", ni, " = PyDict_Size(", obj, ");"),
+            string(tmp, ".keys = (char **)malloc(", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
+            string(tmp, ".vals = (", cs.ctype, " *)malloc(", ni, " > 0 ? (size_t)", ni, " * sizeof(", cs.ctype, ") : 1);"),
+            string("if (!", tmp, ".keys || !", tmp, ".vals) { free(", tmp, ".keys); free(", tmp, ".vals); PyErr_NoMemory(); return NULL; }"),
+            string(tmp, ".len = (int64_t)", ni, ";"),
+            string("memset(", tmp, ".keys, 0, ", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
+            string("{ PyObject *", kv, ", *", vv, "; Py_ssize_t ", pos, " = 0, ", ii, " = 0;"),
+            string("while (PyDict_Next(", obj, ", &", pos, ", &", kv, ", &", vv, ")) {"),
+            string("    Py_ssize_t ", klen, "; const char *", ks, " = PyUnicode_AsUTF8AndSize(", kv, ", &", klen, ");"),
+            string("    if (!", ks, ") { for (Py_ssize_t _fi = 0; _fi < ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+            string("    ", tmp, ".keys[", ii, "] = (char *)malloc((size_t)(", klen, " + 1));"),
+            string("    if (!", tmp, ".keys[", ii, "]) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); PyErr_NoMemory(); return NULL; }"),
+            string("    memcpy(", tmp, ".keys[", ii, "], ", ks, ", (size_t)(", klen, " + 1));"),
+            vextract[1], vextract[2], vextract[3],
+            string("    ", ii, "++;"),
+            "} }",
+        ]
+        # No cleanup needed: Julia's from_c frees keys, vals, and each key string.
+        return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
     end
     error("ParselTongue: no argument marshalling for carrier `$C`.")
 end
@@ -371,6 +429,15 @@ function _build_pyobject(@nospecialize(C::Type), val::AbstractString, out::Abstr
         return [string("PyObject *", out, " = PyCapsule_New(", val, ".ptr, NULL, _pt_capsule_free);")]
     elseif isarray(C)
         e = _elt(C); n = _ndims(C)
+        # 1-D UInt8 arrays return a Python `bytes` object (the natural Python type for
+        # binary data). All other arrays return a NumPy array via _pt_wrap_ndarray.
+        if e.ctype == "uint8_t" && n == 1
+            nb = string("nbytes_", out)
+            return String[
+                string("Py_ssize_t ", nb, " = (Py_ssize_t)", val, ".shape[0];"),
+                string("PyObject *", out, " = _pt_make_bytes((void *)", val, ".data, ", nb, ");"),
+            ]
+        end
         ne = string("nelem_", out); shp = string("shp_", out); nb = string("nbytes_", out)
         stmts = [string("Py_ssize_t ", ne, " = 1;")]
         for k in 0:n-1
@@ -398,6 +465,29 @@ function _build_pyobject(@nospecialize(C::Type), val::AbstractString, out::Abstr
             string("if (!", val, ".has_value) { Py_INCREF(Py_None); ", out, " = Py_None; }"),
             string("else { ", out, " = ", inner_build, "; }"),
         ]
+    elseif isdict(C)
+        vc = _dict_val_c(C)
+        cs = _CSCALARS[vc]
+        ii = string("_di_", out); vobj = string("_dv_", out)
+        vbuild = if vc === Bool
+            string("PyBool_FromLong((long)", val, ".vals[", ii, "])")
+        elseif cs.ctype in ("float", "double")
+            string("PyFloat_FromDouble((double)", val, ".vals[", ii, "])")
+        else
+            string("PyLong_FromLongLong((long long)", val, ".vals[", ii, "])")
+        end
+        stmts = String[
+            string("PyObject *", out, " = PyDict_New();"),
+            string("for (int64_t ", ii, " = 0; ", ii, " < ", val, ".len; ", ii, "++) {"),
+            string("    PyObject *", vobj, " = ", vbuild, ";"),
+            string("    if (!", vobj, " || PyDict_SetItemString(", out, ", ", val, ".keys[", ii, "], ", vobj, ") < 0) {"),
+            string("        Py_XDECREF(", vobj, "); Py_DECREF(", out, "); ", out, " = NULL; break;"),
+            "    }",
+            string("    Py_DECREF(", vobj, "); free(", val, ".keys[", ii, "]);"),
+            "}",
+            string("free(", val, ".keys); free(", val, ".vals);"),
+        ]
+        return stmts
     end
     error("ParselTongue: no return marshalling for carrier `$C`.")
 end
@@ -596,7 +686,27 @@ function _opt_structs(exports::AbstractVector{PtExport})
     return out
 end
 
+# Dict carrier typedefs.
+function _dict_structs(exports::AbstractVector{PtExport})
+    out = String[]
+    seen = Set{Type}()
+    for C in _all_carriers(exports)
+        if isdict(C) && C ∉ seen
+            push!(seen, C)
+            vc = _dict_val_c(C)
+            push!(out, string("typedef struct { char **keys; ", _c_ctype(vc),
+                              " *vals; int64_t len; } ", _dict_structname(C), ";"))
+        end
+    end
+    sort!(out)
+    return out
+end
+
 _uses_arrays(exports) = !isempty(_array_structs(exports))
+_uses_bytes(exports) = any(e -> c_abi_type(e.ret) === PtArray{UInt8,1} ||
+                                (istuple(c_abi_type(e.ret)) &&
+                                 any(S -> S === PtArray{UInt8,1}, fieldtypes(c_abi_type(e.ret)))),
+                           exports)
 _uses_strarr(exports) = any(e -> any(a -> isstrarr(c_abi_type(a.jl_type)), e.args) ||
                                   isstrarr(c_abi_type(e.ret)) ||
                                   (istuple(c_abi_type(e.ret)) && any(isstrarr, fieldtypes(c_abi_type(e.ret)))),
@@ -605,6 +715,16 @@ _uses_handles(exports) = any(e -> ishandle(c_abi_type(e.ret)) ||
                                    any(a -> ishandle(c_abi_type(a.jl_type)), e.args) ||
                                    (istuple(c_abi_type(e.ret)) && any(ishandle, fieldtypes(c_abi_type(e.ret)))),
                              exports)
+
+const _WRAP_BYTES_HELPER = """
+/* _pt_make_bytes: wrap a Julia-malloc'd byte buffer as a Python bytes object.
+   Copies data into an immutable bytes object, then frees the buffer. */
+static PyObject *_pt_make_bytes(void *data, Py_ssize_t n) {
+    PyObject *b = PyBytes_FromStringAndSize((const char *)data, n);
+    free(data);
+    return b;
+}
+"""
 
 const _WRAP_STRARR_HELPER = """
 /* PtStrArray: carrier for Vector{String} <-> list[str]. */
@@ -748,6 +868,9 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
         for s in cstructs; println(io, s); end
         println(io)
     end
+    if _uses_bytes(exports)
+        print(io, _WRAP_BYTES_HELPER)
+    end
     if _uses_strarr(exports)
         print(io, _WRAP_STRARR_HELPER)
     end
@@ -765,6 +888,12 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
     if !isempty(ostructs)
         println(io, "/* C-ABI carriers for Optional types (match Julia Union{T,Nothing}) */")
         for s in ostructs; println(io, s); end
+        println(io)
+    end
+    dstructs = _dict_structs(exports)
+    if !isempty(dstructs)
+        println(io, "/* C-ABI carriers for Dict{String,V} types */")
+        for s in dstructs; println(io, s); end
         println(io)
     end
     tstructs = _tuple_structs(exports)

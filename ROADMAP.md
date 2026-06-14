@@ -103,17 +103,17 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   Done-when: Python `except mod.DomainError` catches a specific Julia exception type.
   Effort M · Risk L.
 
-- [ ] **B. `Dict{String,V}` + `Vector{UInt8}` boundary types** *(type breadth)*
-  - `Dict{String,V}` (V ∈ scalar boundary types): carrier is `PyObject*`
-    (validated via `PyDict_Check`); `from_c` iterates with `PyDict_Next` + key
-    extraction via `PyUnicode_AsUTF8`; `to_c` builds a new PyDict.
-  - `Vector{UInt8}` / `Bytes`: carrier is `Py_buffer` (`PyBUF_SIMPLE`), same as
-    numeric arrays but no shape check; `from_c` copies bytes to Julia `Vector{UInt8}`;
-    `to_c` allocates a `bytes` object via `PyBytes_FromStringAndSize`.
-  - Files: `boundary.jl` (register types), `cshim.jl` (`_arg_plan` / `_ret_plan`
-    new cases), new example `examples/dictx/dictx.jl`.
-  - Done-when: `@pyfunc f(opts::Dict{String,Float64})::Vector{UInt8}` accepts
-    `{"lr": 0.01}` and returns `b"..."`. Effort M · Risk L.
+- [x] **B. `Dict{String,V}` + `Vector{UInt8}` boundary types** *(type breadth)* — shipped v0.12.0.
+  Carrier `PtDict{V}` (`{char **keys; V *vals; int64_t len;}`) for `Dict{String,V}` where
+  V ∈ scalar types. `from_c` iterates parallel arrays and calls `Libc.free`; `to_c` mallocs
+  and strdup-s keys. All 11 scalar types registered via `@eval` loop. `Vector{UInt8}` returns
+  use the existing `PtArray{UInt8,1}` carrier with a special `_pt_make_bytes` path in
+  `_build_pyobject` → `PyBytes_FromStringAndSize` (instead of numpy). `_uses_bytes` predicate
+  controls when the bytes helper is emitted. Dict arg plan: `PyDict_Check`, `PyDict_Next`,
+  `PyUnicode_AsUTF8AndSize` for keys, `PyFloat_AsDouble`/`PyLong_AsLongLong`/`PyObject_IsTrue`
+  for typed value extraction with inline error+cleanup. Fixed `_missing_boundary_methods` to
+  use try/call (not `hasmethod`) since the Optional catch-all made hasmethod unreliable.
+  Effort M · Risk L.
 
 - [x] **C. `Union{T,Nothing}` nullable arguments** *(type breadth — gap vs PyO3 `Option<T>`)*
   Shipped v0.10.0. Carrier `PtOpt{C}` struct `{ int32_t has_value; <c_abi_type(T)> value; }`;

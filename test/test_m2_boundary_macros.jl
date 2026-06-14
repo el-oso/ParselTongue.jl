@@ -10,7 +10,8 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     _vendor_libs_smart,
                     PtOpt, _is_optional, _opt_inner, isopt, _opt_inner_c,
                     _to_c_opt,
-                    PtError, _ERRORS, _py_exc_cname, _error_globals, _error_inits
+                    PtError, _ERRORS, _py_exc_cname, _error_globals, _error_inits,
+                    PtDict, isdict, _dict_val_c, _dict_structs, _uses_bytes
 
 # Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
 struct _TestHandle
@@ -32,9 +33,10 @@ end
 end
 
 @testset "non-boundary types rejected with a clear error" begin
-    @test !is_boundary_type(Char)              # unsupported scalar
-    @test !is_boundary_type(Dict{String,Int})
-    err = try; assert_boundary(Dict{String,Int}); catch e; e; end
+    @test !is_boundary_type(Char)                  # unsupported scalar
+    @test !is_boundary_type(Dict{String,Any})      # Any value type not supported
+    @test !is_boundary_type(Dict{Int,Float64})     # non-String key not supported
+    err = try; assert_boundary(Dict{String,Any}); catch e; e; end
     @test err isa ErrorException
     @test occursin("cannot cross the Python boundary", err.msg)
 end
@@ -601,4 +603,72 @@ end
     shim_bare = emit_cshim("baremod", _EXPORTS)
     @test occursin("return PyModule_Create", shim_bare)
     @test !occursin("PyErr_NewException", shim_bare)
+end
+
+@testset "Dict{String,V} + bytes boundary types (item B)" begin
+    # ── is_boundary_type for all registered value types ───────────────
+    for V in (Int8, Int16, Int32, Int64, UInt8, UInt16, UInt32, UInt64,
+              Float32, Float64, Bool)
+        @test is_boundary_type(Dict{String,V})
+    end
+    @test !is_boundary_type(Dict{String,String})   # String val not yet supported
+    @test !is_boundary_type(Dict{String,Any})       # unsupported val type
+    @test !is_boundary_type(Dict{Int,Float64})      # non-String key not supported
+
+    # ── PtDict carrier ────────────────────────────────────────────────
+    @test c_abi_type(Dict{String,Float64}) === PtDict{Float64}
+    @test c_abi_type(Dict{String,Int32})   === PtDict{Int32}
+    @test isdict(PtDict{Float64})
+    @test !isdict(Float64)
+    @test _dict_val_c(PtDict{Float64}) === Float64
+    @test _dict_val_c(PtDict{Int32})   === Int32
+
+    # ── round-trip Dict{String,Float64} ──────────────────────────────
+    d = Dict{String,Float64}("a" => 1.0, "b" => 2.5)
+    cv = to_c(d)
+    @test cv isa PtDict{Float64}
+    @test cv.len == 2
+    d2 = from_c(Dict{String,Float64}, cv)   # from_c frees the C arrays
+    @test d2 == d
+
+    # ── round-trip Dict{String,Int32} ────────────────────────────────
+    d3 = Dict{String,Int32}("x" => Int32(7), "y" => Int32(-3))
+    cv3 = to_c(d3)
+    @test cv3 isa PtDict{Int32}
+    d4 = from_c(Dict{String,Int32}, cv3)
+    @test d4 == d3
+
+    # ── bytes: Vector{UInt8} uses the array carrier (c_abi_type) ─────
+    @test is_boundary_type(Vector{UInt8})
+    @test c_abi_type(Vector{UInt8}) === PtArray{UInt8,1}
+
+    # ── cshim.jl: bytes helper + dict codegen ─────────────────────────
+    clear_exports!()
+    @pyfunc b_encode(s::String)::Vector{UInt8} = Vector{UInt8}(s)
+    @pyfunc b_dict_str(opts::Dict{String,Float64})::String =
+        join(string(k) for k in sort(collect(keys(opts))))
+
+    @test _uses_bytes(_EXPORTS)
+    c = emit_cshim("bmod", _EXPORTS)
+
+    # bytes helper emitted for Vector{UInt8} return
+    @test occursin("_pt_make_bytes", c)
+    @test occursin("PyBytes_FromStringAndSize", c)
+
+    # dict struct typedef emitted
+    @test occursin("PtDict_double", c)
+    dstructs = _dict_structs(_EXPORTS)
+    @test any(s -> occursin("PtDict_double", s), dstructs)
+    @test any(s -> occursin("char **keys", s), dstructs)
+
+    # dict arg: validate with PyDict_Check, iterate with PyDict_Next
+    @test occursin("PyDict_Check", c)
+    @test occursin("PyDict_Next", c)
+    @test occursin("PyFloat_AsDouble", c)         # Float64 value extraction
+    @test occursin("PyUnicode_AsUTF8AndSize", c)  # key extraction
+
+    # _uses_bytes false when no Vector{UInt8} return present
+    clear_exports!()
+    @pyfunc no_bytes(s::String)::String = s
+    @test !_uses_bytes(_EXPORTS)
 end
