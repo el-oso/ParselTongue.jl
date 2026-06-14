@@ -18,10 +18,11 @@ makedocs(;
     pages = [
         "Home" => "index.md",
         "Guide" => [
-            "Getting Started" => "guide/getting-started.md",
-            "Boundary Types"  => "guide/boundary-types.md",
-            "Building"        => "guide/building.md",
-            "Limitations"     => "guide/limitations.md",
+            "Getting Started"      => "guide/getting-started.md",
+            "Boundary Types"       => "guide/boundary-types.md",
+            "Building"             => "guide/building.md",
+            "Limitations"          => "guide/limitations.md",
+            "ParselTongue vs PyO3" => "guide/vs-pyo3.md",
         ],
         "Examples" => [
             "Scalars (mathx)"        => "examples/scalars.md",
