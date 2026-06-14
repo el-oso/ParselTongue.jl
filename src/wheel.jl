@@ -67,6 +67,12 @@ runtime. Only use `slim=true` if you are sure your code does not load stdlib JLL
 When `abi3=true` the extension is compiled against the stable ABI
 (`Py_LIMITED_API=0x030B0000`) and the wheel tag is `cp311-abi3-<plat>`,
 making it installable on any CPython ≥ 3.11 without recompilation.
+
+`manylinux` controls the Linux platform tag (ignored on macOS/Windows):
+- `true` (default) — auto-detect glibc from the build host via `platform.libc_ver()`.
+- `"2.17"` — pin to manylinux_2_17 (the Julia 1.12+ / manylinux2014 floor; recommended
+  for wheels intended for PyPI, since Julia 1.12 itself targets glibc ≥ 2.17).
+- `false` — raw `linux_x86_64` tag (local use only; not accepted by PyPI).
 """
 function build_wheel(user_path::AbstractString;
                      version::AbstractString="0.1.0",
@@ -75,6 +81,7 @@ function build_wheel(user_path::AbstractString;
                      python::AbstractString="python3",
                      trim::Symbol=:safe,
                      abi3::Bool=false,
+                     manylinux::Union{Bool,AbstractString}=true,
                      runtime::Symbol=:bundled,
                      slim::Bool=false,
                      keep_build::Bool=false,
@@ -142,7 +149,7 @@ function build_wheel(user_path::AbstractString;
     runtime_req = runtime === :shared ?
         "parseltongue-runtime ~= $(julia_major_minor).0" : nothing
     distinfo = joinpath(stage, string(mod, "-", version, ".dist-info")); mkpath(distinfo)
-    tag = abi3 ? _wheel_tag_abi3(python) : _wheel_tag(python)
+    tag = abi3 ? _wheel_tag_abi3(python; manylinux) : _wheel_tag(python; manylinux)
     write(joinpath(distinfo, "METADATA"), _metadata(mod, version; runtime_requires=runtime_req))
     write(joinpath(distinfo, "WHEEL"), _wheel_meta(tag))
 
@@ -198,15 +205,46 @@ const _PT_VERSION = string(pkgversion(@__MODULE__))
 
 _wheel_meta(tag) = "Wheel-Version: 1.0\nGenerator: ParselTongue ($(_PT_VERSION))\nRoot-Is-Purelib: false\nTag: $tag\n"
 
-# CPython wheel compatibility tag, e.g. "cp314-cp314-linux_x86_64".
-function _wheel_tag(python::AbstractString)
-    out = readchomp(`$python -c "import sysconfig,sys;v=sys.version_info;print(f'cp{v.major}{v.minor}-cp{v.major}{v.minor}-'+sysconfig.get_platform().replace('-','_').replace('.','_'))"`)
-    return out
+"""
+    _manylinux_plat(python; manylinux=true) -> String
+
+Return the platform tag for the build host, with manylinux substitution on Linux.
+
+- `manylinux=true`  — auto-detect glibc from the build system via `platform.libc_ver()`,
+  e.g. `manylinux_2_35_x86_64`. Use when you want a conservative (build-host) floor.
+- `manylinux="2.17"` — pin to a specific glibc floor, e.g. `manylinux_2_17_x86_64`.
+  Correct for Julia 1.12+, which targets the manylinux2014 (glibc ≥ 2.17) baseline.
+- `manylinux=false`  — return the raw platform tag, e.g. `linux_x86_64`. Useful for
+  local use; wheels with a plain `linux` tag cannot be uploaded to PyPI.
+
+On non-Linux hosts (macOS, Windows) the `manylinux` argument is ignored.
+"""
+function _manylinux_plat(python::AbstractString; manylinux::Union{Bool,AbstractString}=true)
+    plat = readchomp(`$python -c "import sysconfig; print(sysconfig.get_platform().replace('-','_').replace('.','_'))"`)
+    (manylinux === false || !startswith(plat, "linux_")) && return plat
+    arch = plat[length("linux_")+1:end]   # e.g. "x86_64", "aarch64"
+    if manylinux isa AbstractString
+        ver = replace(String(manylinux), "." => "_")   # "2.17" -> "2_17"
+        return "manylinux_$(ver)_$arch"
+    else
+        # Auto-detect the build host's glibc version.
+        glibc_ver = readchomp(`$python -c "import platform; l,v=platform.libc_ver(); print(v if l=='glibc' else '')"`)
+        isempty(glibc_ver) && return plat   # non-glibc Linux; return unchanged
+        ver = replace(glibc_ver, "." => "_")
+        return "manylinux_$(ver)_$arch"
+    end
 end
 
-# Stable-ABI wheel tag, e.g. "cp311-abi3-linux_x86_64".
-function _wheel_tag_abi3(python::AbstractString)
-    plat = readchomp(`$python -c "import sysconfig; print(sysconfig.get_platform().replace('-','_').replace('.','_'))"`)
+# CPython wheel compatibility tag, e.g. "cp314-cp314-manylinux_2_35_x86_64".
+function _wheel_tag(python::AbstractString; manylinux::Union{Bool,AbstractString}=true)
+    plat = _manylinux_plat(python; manylinux)
+    pyver = readchomp(`$python -c "import sys; v=sys.version_info; print(f'{v.major}{v.minor}')"`)
+    return "cp$(pyver)-cp$(pyver)-$plat"
+end
+
+# Stable-ABI wheel tag, e.g. "cp311-abi3-manylinux_2_35_x86_64".
+function _wheel_tag_abi3(python::AbstractString; manylinux::Union{Bool,AbstractString}=true)
+    plat = _manylinux_plat(python; manylinux)
     return "cp311-abi3-$plat"
 end
 

@@ -148,9 +148,12 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
 - [x] **5. Keyword / default arguments** — `@pyfunc f(a; b=1.0)`; shim uses
   `PyArg_ParseTupleAndKeywords`. `macros.jl` records defaults; `cshim.jl` emits the
   keyword list. Effort M.
-- [ ] **6. manylinux tagging** — emit `manylinux_2_xx_<plat>` tags; reconcile with the
-  already-bundled libjulia (auditwheel would double-vendor — likely just set the tag
-  given a known glibc floor). Effort M · Risk M.
+- [x] **6. manylinux tagging** — shipped v0.13.0. `_manylinux_plat(python; manylinux=true)`
+  detects glibc via `platform.libc_ver()` and substitutes `linux_ARCH` →
+  `manylinux_MAJOR_MINOR_ARCH`. `_wheel_tag` / `_wheel_tag_abi3` / `build_wheel` all
+  accept `manylinux=true` (auto), `manylinux="2.17"` (pinned floor — recommended for
+  Julia 1.12+ which targets glibc ≥ 2.17), or `manylinux=false` (raw tag). Skips
+  auditwheel entirely (it would double-vendor libjulia); just sets the tag. Effort M · Risk M.
 - [ ] **7. macOS support** — `.dylib`, `@loader_path` rpaths, ext suffix; juliac on
   macOS. `build.jl`/`wheel.jl` platform branches. Effort L.
 - [x] **8. More boundary types** — `Bool`/`Int` arrays already work; add `Vector{String}`

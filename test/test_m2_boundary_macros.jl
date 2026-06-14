@@ -11,7 +11,8 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     PtOpt, _is_optional, _opt_inner, isopt, _opt_inner_c,
                     _to_c_opt,
                     PtError, _ERRORS, _py_exc_cname, _error_globals, _error_inits,
-                    PtDict, isdict, _dict_val_c, _dict_structs, _uses_bytes
+                    PtDict, isdict, _dict_val_c, _dict_structs, _uses_bytes,
+                    _manylinux_plat, _wheel_tag, _wheel_tag_abi3
 
 # Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
 struct _TestHandle
@@ -671,4 +672,80 @@ end
     clear_exports!()
     @pyfunc no_bytes(s::String)::String = s
     @test !_uses_bytes(_EXPORTS)
+end
+
+@testset "manylinux tagging (item 6)" begin
+    python = get(ENV, "PYTHON3", "python3")
+
+    # ── _manylinux_plat ──────────────────────────────────────────────
+    # manylinux=false → raw "linux_ARCH" (no substitution)
+    plat_raw = _manylinux_plat(python; manylinux=false)
+    if Sys.islinux()
+        @test startswith(plat_raw, "linux_")
+        @test !startswith(plat_raw, "manylinux_")
+    end
+
+    # manylinux="2.17" → pinned floor
+    plat_pinned = _manylinux_plat(python; manylinux="2.17")
+    if Sys.islinux()
+        @test startswith(plat_pinned, "manylinux_2_17_")
+        arch = plat_raw[length("linux_")+1:end]
+        @test plat_pinned == "manylinux_2_17_$arch"
+    end
+
+    # manylinux=true → auto-detected glibc floor (e.g. manylinux_2_35_x86_64)
+    plat_auto = _manylinux_plat(python; manylinux=true)
+    if Sys.islinux()
+        @test startswith(plat_auto, "manylinux_")
+        @test endswith(plat_auto, arch)           # same arch as raw tag
+        # version part is "2_XX" — check it's at least 2_17
+        parts = split(plat_auto, "_")             # ["manylinux", "2", "XX", arch...]
+        @test parts[1] == "manylinux"
+        @test parse(Int, parts[2]) == 2
+        @test parse(Int, parts[3]) >= 17
+    end
+
+    # On macOS / other: manylinux argument is a no-op
+    if !Sys.islinux()
+        @test plat_auto == plat_raw
+        @test plat_pinned == plat_raw
+    end
+
+    # ── _wheel_tag ───────────────────────────────────────────────────
+    tag = _wheel_tag(python)
+    @test startswith(tag, "cp")
+    parts = split(tag, "-")
+    @test length(parts) == 3      # "cpXY-cpXY-<plat>"
+    if Sys.islinux()
+        @test startswith(parts[3], "manylinux_")
+    end
+
+    tag_raw = _wheel_tag(python; manylinux=false)
+    if Sys.islinux()
+        @test !occursin("manylinux", tag_raw)
+        @test occursin("linux_", tag_raw)
+    end
+
+    tag_pinned = _wheel_tag(python; manylinux="2.17")
+    if Sys.islinux()
+        @test occursin("manylinux_2_17_", tag_pinned)
+    end
+
+    # ── _wheel_tag_abi3 ──────────────────────────────────────────────
+    tag_abi3 = _wheel_tag_abi3(python)
+    @test startswith(tag_abi3, "cp311-abi3-")
+    if Sys.islinux()
+        @test occursin("manylinux_", tag_abi3)
+    end
+
+    tag_abi3_raw = _wheel_tag_abi3(python; manylinux=false)
+    @test startswith(tag_abi3_raw, "cp311-abi3-")
+    if Sys.islinux()
+        @test !occursin("manylinux_", tag_abi3_raw)
+    end
+
+    tag_abi3_pinned = _wheel_tag_abi3(python; manylinux="2.17")
+    if Sys.islinux()
+        @test occursin("manylinux_2_17_", tag_abi3_pinned)
+    end
 end
