@@ -7,11 +7,14 @@ version = "0.21.0"
 TypeContracts = "c7a3f1e2-84b5-4d69-9e0a-1f2b3c4d5e6f"
 
 [compat]
-TypeContracts = "0.6"
+TypeContracts = "0.12"
 julia = "1.12"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[sources]
+TypeContracts = {url = "https://github.com/el-oso/TypeContracts.jl", rev = "master"}
 
 [targets]
 test = ["Test"]

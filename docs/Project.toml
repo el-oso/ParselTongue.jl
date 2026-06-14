@@ -11,4 +11,4 @@ julia = "1.12"
 
 [sources]
 ParselTongue = {path = ".."}
-TypeContracts = {path = "../../TypeContracts"}
+TypeContracts = {url = "https://github.com/el-oso/TypeContracts.jl", rev = "master"}
