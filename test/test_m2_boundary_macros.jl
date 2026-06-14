@@ -788,3 +788,75 @@ end
         rm(td; recursive=true)
     end
 end
+
+# ── pt CLI app (item 16) ──────────────────────────────────────────────────────
+
+# Include pt.jl in an isolated module so julia_main() doesn't collide with Main.
+module _PtAppTest
+    include(joinpath(@__DIR__, "..", "app", "pt.jl"))
+end
+
+@testset "pt CLI: argument parser (_parse_flags)" begin
+    pf = _PtAppTest._parse_flags
+
+    pos, flags = pf(["file.jl", "--outdir=./out", "--verbose"])
+    @test pos == ["file.jl"]
+    @test flags["outdir"] == "./out"
+    @test flags["verbose"] == "true"
+
+    pos, flags = pf(["--trim=unsafe", "--abi3", "src.jl", "--mod-name=mymod"])
+    @test pos == ["src.jl"]
+    @test flags["trim"] == "unsafe"
+    @test flags["abi3"] == "true"
+    @test flags["mod-name"] == "mymod"
+
+    pos, flags = pf(String[])
+    @test isempty(pos)
+    @test isempty(flags)
+
+    pos, flags = pf(["-h"])
+    @test isempty(pos)
+    @test flags["h"] == "true"
+
+    pos, flags = pf(["--manylinux=2.17"])
+    @test flags["manylinux"] == "2.17"
+
+    pos, flags = pf(["--manylinux=false"])
+    @test flags["manylinux"] == "false"
+
+    # Multiple positionals
+    pos, flags = pf(["a.jl", "b.jl", "--verbose"])
+    @test pos == ["a.jl", "b.jl"]
+    @test flags["verbose"] == "true"
+end
+
+@testset "pt CLI: _bool_flag" begin
+    bf = _PtAppTest._bool_flag
+    @test  bf(Dict("abi3" => "true"),  "abi3")
+    @test !bf(Dict("abi3" => "true"),  "slim")
+    @test !bf(Dict("verbose" => "false"), "verbose")
+    @test  bf(Dict("slim" => "true"),  "slim")
+end
+
+@testset "pt CLI: command dispatch (no-arg / help returns)" begin
+    # No file → returns 1 (usage error)
+    @test _PtAppTest._cmd_build(String[]) == 1
+    @test _PtAppTest._cmd_wheel(String[]) == 1
+    @test _PtAppTest._cmd_bench(String[]) == 1
+
+    # File + --help → returns 0 (help was explicitly requested alongside a file)
+    @test _PtAppTest._cmd_build(["myfile.jl", "--help"]) == 0
+    @test _PtAppTest._cmd_wheel(["myfile.jl", "--help"]) == 0
+    @test _PtAppTest._cmd_bench(["ext.so",   "--help"]) == 0
+
+    # -h short flag works the same as --help
+    @test _PtAppTest._cmd_build(["myfile.jl", "-h"]) == 0
+end
+
+@testset "pt CLI: _USAGE and _PT_CLI_VERSION constants" begin
+    @test !isempty(_PtAppTest._PT_CLI_VERSION)
+    @test occursin("build",   _PtAppTest._USAGE)
+    @test occursin("wheel",   _PtAppTest._USAGE)
+    @test occursin("bench",   _PtAppTest._USAGE)
+    @test occursin("version", _PtAppTest._USAGE)
+end

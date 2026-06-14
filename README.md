@@ -104,9 +104,33 @@ metadata. The boundary type system reuses
 
 ## Status
 
-v0.14 — full build pipeline shipping: scalars, strings, N-D numeric arrays,
+v0.16 — full build pipeline shipping: scalars, strings, N-D numeric arrays,
 `ComplexF64`, `Vector{String}`, `Dict{String,V}`, `Vector{UInt8}` (bytes),
 `Union{T,Nothing}` (Optional), `NamedTuple`, `Tuple`, opaque handles
 (`@pyhandle`), custom Python exception types (`@pyerror`), keyword/default
 arguments, manylinux tagging, abi3 stable-ABI wheels, shared-runtime wheels,
-slim bundling, and startup benchmarking. See `examples/` and `ROADMAP.md`.
+slim bundling, startup benchmarking, and a compiled `pt` CLI binary.
+See `examples/`, `app/`, and `ROADMAP.md`.
+
+## pt CLI
+
+Build the `pt` binary once (requires Julia ≥ 1.12 with juliac):
+
+```bash
+julia --project=. app/build_app.jl   # → ./pt
+```
+
+Then compile extensions without starting a Julia session each time:
+
+```bash
+./pt build examples/mathx/mathx.jl --outdir=build
+./pt wheel examples/mathx/mathx.jl --outdir=dist --version=0.1.0
+./pt bench build/mathx.cpython-*.so --call="mathx.add(1,2)" --n=5
+./pt help
+```
+
+Or run without compiling (slower — starts Julia each time):
+
+```bash
+julia --project=. app/pt.jl build examples/mathx/mathx.jl
+```
