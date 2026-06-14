@@ -134,6 +134,14 @@ end
 # Restriction: `T` must satisfy `isbitstype(T)` (immutable struct, all-isbits
 # fields). This guarantees safe `unsafe_store!`/`unsafe_load` on C-heap memory.
 
+"""
+    PtHandle
+
+C-ABI carrier for opaque-handle boundary types registered with [`@pyhandle`](@ref).
+Wraps a `void *` pointing to a heap-allocated copy of the Julia struct. On the Python
+side the handle appears as a `PyCapsule`; `free` is called automatically when the
+capsule is garbage-collected.
+"""
 struct PtHandle
     ptr::Ptr{Cvoid}
 end
@@ -503,6 +511,15 @@ to_c(nt::NamedTuple) = map(to_c, Tuple(nt))  # trim-safe: concrete tuple map is 
 # Restriction: T must be a real numeric scalar (Int*/UInt*/Float*). Complex and
 # Bool are excluded because they require non-trivial Python extraction.
 
+"""
+    PtVarArgs{T} <: AbstractVector{T}
+
+Boundary type for variadic positional arguments. Mark the last positional argument
+of a `@pyfunc` as `PtVarArgs{T}` to accept any number of extra Python positional
+values. `T` must be a numeric scalar type (Int8–Int64, UInt8–UInt64, Float32,
+Float64). Python callers pass values as ordinary positional arguments; Julia sees a
+zero-copy `AbstractVector{T}`.
+"""
 struct PtVarArgs{T} <: AbstractVector{T}
     data::Vector{T}
 end
@@ -544,6 +561,16 @@ to_c(v::PtVarArgs{T}) where {T<:_PtVarArgElt} = to_c(v.data)
 # All of this is implemented as direct ccall invocations — no Julia method
 # dispatch — so it is trim-safe under --trim=safe.
 
+"""
+    PyCallable
+
+Boundary type for a Python callable passed as a `@pyfunc` argument. On the Julia
+side, calling `f(x::Float64)::Float64` re-acquires the GIL, boxes the argument,
+invokes `PyObject_Call`, and returns the unwrapped `Float64` result — all via direct
+`ccall` invocations, so it is trim-safe under `--trim=safe`.
+
+The Python callable must accept a single positional `float` and return a `float`.
+"""
 struct PyCallable
     ptr::Ptr{Cvoid}
 end
