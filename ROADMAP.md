@@ -167,15 +167,22 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
 
 ## Phase 3 — performance & polish
 
-- [ ] **E. `@boundary` extensibility protocol** *(ecosystem — gap vs PyO3 derive macros)*
+- [x] **E. `@boundary` extensibility protocol** *(ecosystem — gap vs PyO3 derive macros)* — shipped v0.19.0.
   - PyO3: `derive(FromPyObject)` / `derive(IntoPyObject)` let any crate add types.
     ParselTongue: `c_abi_type`/`from_c`/`to_c` exist but require manual impl with no
     convenience macro and no error guidance.
-  - Add `@boundary T carrier=C from_c=(carrier -> T) to_c=(T -> carrier)` macro that
-    auto-registers all three methods and validates against the `PyBoundary` contract at
-    definition time (not silently at build time).
-  - Files: `macros.jl` (new macro), `boundary.jl` (expose hook).
-  - Done-when: a user package can define Arrow.Table → list-of-dicts without touching
+  - `@boundary T carrier=C begin from_c(c) = ...; to_c(x) = ... end` registers all
+    three methods and validates against the `PyBoundary` contract immediately at macro
+    expansion time via `_missing_boundary_methods`. Errors are raised at definition time
+    (missing `from_c`, missing `to_c`, wrong `carrier=` syntax) rather than silently at
+    juliac build time.
+  - The macro emits `ParselTongue.c_abi_type`, `ParselTongue.from_c`, and
+    `ParselTongue.to_c` method definitions (fully-qualified so they extend the right
+    module from user code) then runs the validation check in the same `quote` block.
+  - `@eval`-wrapped macro calls throw `LoadError` wrapping the `ErrorException`; test
+    helpers unwrap via `err isa LoadError ? err.error : err`.
+  - Files: `boundary.jl` (macro + export), `ParselTongue.jl` (`@boundary` in exports).
+  - Done-when: a user package can define a custom boundary type without touching
     ParselTongue source. Effort M · Risk L.
 
 - [ ] **F. Python callables as arguments** *(gap vs PyO3 `Py<PyAny>` / `PyCallable`)*

@@ -166,6 +166,100 @@ macro pyhandle(T_expr)
     end
 end
 
+"""
+    @boundary T carrier=C begin
+        from_c(c) = ...
+        to_c(x) = ...
+    end
+
+Register a user-defined type `T` as a boundary type with carrier `C` (an
+existing boundary carrier, e.g. `PtArray{Float64,1}`, `Cstring`, a scalar).
+
+The `begin...end` block must contain:
+- `from_c(c) = ...` — converts an incoming carrier `c::C` to a value of type `T`.
+  Runs inside the trimmed library → **must be trim-safe** (type-stable, no dynamic
+  dispatch).
+- `to_c(x) = ...` — converts a value `x::T` to carrier `C`. Also trim-safe.
+
+Validates the protocol immediately: errors at `@boundary` time rather than
+deep in a juliac build if the implementation is missing or wrong.
+
+The carrier `C` must be marshallable by the C shim: scalars, `Cstring`,
+`PtArray{T,N}`, `PtStrArray`, `PtHandle`, `PtOpt{C}`, or `PtDict{V}`.
+User types may share a carrier — each gets its own `from_c`/`to_c` dispatch.
+
+## Example
+
+```julia
+struct Point2D; x::Float64; y::Float64; end
+
+@boundary Point2D carrier=PtArray{Float64,1} begin
+    from_c(c) = Point2D(unsafe_load(c.data, 1), unsafe_load(c.data, 2))
+    to_c(p) = ParselTongue.to_c([p.x, p.y])
+end
+
+@pyfunc scale(pt::Point2D, s::Float64)::Point2D = Point2D(pt.x*s, pt.y*s)
+```
+
+Python callers pass/receive a 2-element 1-D float64 numpy array.
+"""
+macro boundary(T_expr, carrier_eq, block)
+    (carrier_eq isa Expr && carrier_eq.head === :(=) &&
+     carrier_eq.args[1] isa Symbol && carrier_eq.args[1] === :carrier) ||
+        error("@boundary: second argument must be `carrier=C`, got: $carrier_eq")
+    C_expr = carrier_eq.args[2]
+
+    (block isa Expr && block.head === :block) ||
+        error("@boundary: third argument must be a `begin...end` block")
+
+    # Locate from_c and to_c definitions in the block.
+    from_c_def = nothing
+    to_c_def = nothing
+    for stmt in block.args
+        stmt isa LineNumberNode && continue
+        if stmt isa Expr && stmt.head in (:function, :(=)) && length(stmt.args) >= 2
+            sig = stmt.args[1]
+            if sig isa Expr && sig.head === :call
+                fname = sig.args[1]
+                if fname === :from_c; from_c_def = stmt
+                elseif fname === :to_c; to_c_def = stmt
+                end
+            end
+        end
+    end
+    from_c_def !== nothing || error("@boundary: `from_c(c) = ...` missing from block")
+    to_c_def   !== nothing || error("@boundary: `to_c(x) = ...` missing from block")
+
+    # Validate arg count and extract arg names (stripping any user type annotation).
+    fc_sig = from_c_def.args[1]; tc_sig = to_c_def.args[1]
+    length(fc_sig.args) == 2 || error("@boundary: from_c must have exactly one argument")
+    length(tc_sig.args) == 2 || error("@boundary: to_c must have exactly one argument")
+    _strip(a) = (a isa Expr && a.head === :(::)) ? a.args[1] : a
+    fc_arg = _strip(fc_sig.args[2])
+    tc_arg = _strip(tc_sig.args[2])
+    fc_body = from_c_def.args[2]
+    tc_body = to_c_def.args[2]
+
+    quote
+        ParselTongue.c_abi_type(::Type{$(esc(T_expr))}) = $(esc(C_expr))
+        function ParselTongue.from_c(::Type{$(esc(T_expr))}, $(esc(fc_arg))::$(esc(C_expr)))
+            $(esc(fc_body))
+        end
+        function ParselTongue.to_c($(esc(tc_arg))::$(esc(T_expr)))
+            $(esc(tc_body))
+        end
+        let _t = $(esc(T_expr))
+            _m = ParselTongue._missing_boundary_methods(_t)
+            if !isempty(_m)
+                error("@boundary: type `" * string(_t) *
+                      "` failed protocol validation after registration. Missing: " *
+                      join(_m, ", ") * ".")
+            end
+        end
+        nothing
+    end
+end
+
 # ── String-array boundary type ────────────────────────────────────────
 # Carrier: `PtStrArray` (`{char **data; int64_t len;}`).
 #   arg:  Python list[str] → C shim strdup's each item into `data`. Julia builds a

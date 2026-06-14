@@ -14,7 +14,8 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     PtDict, isdict, _dict_val_c, _dict_structs, _uses_bytes,
                     _manylinux_plat, _wheel_tag, _wheel_tag_abi3,
                     _insert_cleanup_before_return,
-                    PtVarArgs, isvarargs, _varargs_elt, _PtVarArgElt
+                    PtVarArgs, isvarargs, _varargs_elt, _PtVarArgElt,
+                    _missing_boundary_methods
 
 # Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
 struct _TestHandle
@@ -1094,4 +1095,122 @@ end
     c4 = emit_cshim("vmod4", _EXPORTS)
     @test occursin("Py_RETURN_NONE", c4)
     @test occursin("_va_data", c4)
+end
+
+# ── Item E: @boundary extensibility protocol ─────────────────────────────────
+
+# Define test types at file scope so Core.eval resolves them.
+struct _BoundaryPoint2D
+    x::Float64
+    y::Float64
+end
+struct _BoundaryScalar
+    val::Int32
+end
+
+# Register _BoundaryPoint2D: maps to a 2-element float64 array carrier.
+@boundary _BoundaryPoint2D carrier=PtArray{Float64,1} begin
+    from_c(c) = _BoundaryPoint2D(unsafe_load(c.data, 1), unsafe_load(c.data, 2))
+    to_c(p) = ParselTongue.to_c(Float64[p.x, p.y])
+end
+
+# Register _BoundaryScalar: maps to Int32 carrier (trivial).
+@boundary _BoundaryScalar carrier=Int32 begin
+    from_c(c) = _BoundaryScalar(c)
+    to_c(s) = s.val
+end
+
+@testset "@boundary extensibility protocol (item E)" begin
+    # ── protocol registration ────────────────────────────────────────────
+    @test is_boundary_type(_BoundaryPoint2D)
+    @test is_boundary_type(_BoundaryScalar)
+
+    @test c_abi_type(_BoundaryPoint2D) === PtArray{Float64,1}
+    @test c_abi_type(_BoundaryScalar)  === Int32
+
+    @test assert_boundary(_BoundaryPoint2D) === PtArray{Float64,1}
+    @test assert_boundary(_BoundaryScalar)  === Int32
+
+    # ── round-trip _BoundaryPoint2D ──────────────────────────────────────
+    p = _BoundaryPoint2D(3.0, 4.0)
+    c_carr = to_c(p)
+    @test c_carr isa PtArray{Float64,1}
+    @test c_carr.shape == (Int64(2),)
+
+    p2 = from_c(_BoundaryPoint2D, c_carr)
+    @test p2.x ≈ 3.0
+    @test p2.y ≈ 4.0
+
+    # ── round-trip _BoundaryScalar ───────────────────────────────────────
+    s = _BoundaryScalar(Int32(7))
+    @test to_c(s) === Int32(7)
+    @test from_c(_BoundaryScalar, Int32(7)) == _BoundaryScalar(Int32(7))
+
+    # ── _missing_boundary_methods returns empty for registered types ──────
+    @test isempty(_missing_boundary_methods(_BoundaryPoint2D))
+    @test isempty(_missing_boundary_methods(_BoundaryScalar))
+
+    # ── @pyfunc accepts @boundary types ──────────────────────────────────
+    clear_exports!()
+    @pyfunc _bpt_scale(pt::_BoundaryPoint2D, s::Float64)::_BoundaryPoint2D =
+        _BoundaryPoint2D(pt.x * s, pt.y * s)
+    @pyfunc _bpt_norm(pt::_BoundaryPoint2D)::Float64 = sqrt(pt.x^2 + pt.y^2)
+
+    @test length(_EXPORTS) == 2
+    e_scale = _EXPORTS[1]
+    @test e_scale.args[1].jl_type === _BoundaryPoint2D
+    @test e_scale.args[2].jl_type === Float64
+    @test e_scale.ret === _BoundaryPoint2D
+
+    # ── emit_ccallable uses carrier type in @ccallable signature ─────────
+    src = emit_ccallable(e_scale)
+    # The @ccallable arg type must be the carrier (PtArray{Float64,1}), not the user type.
+    @test occursin("PtArray{Float64", src)
+    # from_c must convert to the user type.
+    @test occursin("from_c(", src)
+    # to_c must convert back.
+    @test occursin("to_c(", src)
+
+    # ── emit_cshim generates correct shim for @boundary types ────────────
+    c = emit_cshim("bmod", _EXPORTS)
+    # Array struct typedef emitted for the carrier.
+    @test occursin("PtArray_f64_1", c)
+    # Arg plan: GetBuffer (PtArray input).
+    @test occursin("PyObject_GetBuffer", c)
+    # Return: _pt_wrap_ndarray (PtArray output).
+    @test occursin("_pt_wrap_ndarray", c)
+
+    # ── error: missing from_c ─────────────────────────────────────────────
+    err = try
+        @eval @boundary _BoundaryPoint2D carrier=Int32 begin
+            to_c(p) = Int32(0)
+        end
+        nothing
+    catch e; e; end
+    err_inner = err isa LoadError ? err.error : err
+    @test err_inner isa ErrorException
+    @test occursin("from_c", err_inner.msg)
+
+    # ── error: missing to_c ───────────────────────────────────────────────
+    err2 = try
+        @eval @boundary _BoundaryPoint2D carrier=Int32 begin
+            from_c(c) = _BoundaryPoint2D(0.0, 0.0)
+        end
+        nothing
+    catch e; e; end
+    err2_inner = err2 isa LoadError ? err2.error : err2
+    @test err2_inner isa ErrorException
+    @test occursin("to_c", err2_inner.msg)
+
+    # ── error: wrong carrier= syntax ─────────────────────────────────────
+    err3 = try
+        @eval @boundary _BoundaryPoint2D Int32 begin
+            from_c(c) = _BoundaryPoint2D(0.0, 0.0)
+            to_c(p) = Int32(0)
+        end
+        nothing
+    catch e; e; end
+    err3_inner = err3 isa LoadError ? err3.error : err3
+    @test err3_inner isa ErrorException
+    @test occursin("carrier=", err3_inner.msg)
 end
