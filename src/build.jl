@@ -83,23 +83,31 @@ function build_extension(user_path::AbstractString;
                          runtime_rpaths::Vector{String}=String[],
                          strip_abs_rpath::Bool=false,
                          keep_build::Bool=false,
-                         verbose::Bool=false)
+                         verbose::Bool=false,
+                         # Internal: pass (exports, errors) from build_wheel to skip the
+                         # second include of the user source (the first is in build_wheel).
+                         _preloaded::Union{Nothing,Tuple{Vector{PtExport},Vector{PtError}}}=nothing)
     user_path = abspath(user_path)
     isfile(user_path) || error("ParselTongue: source file not found: $user_path")
     trim in (:safe, :unsafe, :unsafe_warn) ||
         error("ParselTongue: trim must be :safe, :unsafe, or :unsafe_warn (got :$trim)")
 
     # 1. Populate the export registry by including the user source in a sandbox.
-    clear_exports!()
-    _MODULE_NAME[] = nothing
-    sandbox = Module(:ParselTongueUserSandbox)
-    Core.eval(sandbox, :(using ParselTongue))
-    Base.include(sandbox, user_path)
-    isempty(_EXPORTS) && error(
+    #    When called from build_wheel, the caller already included the file and passes
+    #    pre-populated exports/errors to avoid a redundant second include.
+    exports, errors = if _preloaded !== nothing
+        _preloaded
+    else
+        clear_exports!()
+        _MODULE_NAME[] = nothing
+        sandbox = Module(:ParselTongueUserSandbox)
+        Core.eval(sandbox, :(using ParselTongue))
+        Base.include(sandbox, user_path)
+        copy(_EXPORTS), copy(_ERRORS)
+    end
+    isempty(exports) && error(
         "ParselTongue: no @pyfunc exports found in $user_path. " *
         "Annotate functions with @pyfunc.")
-    exports = copy(_EXPORTS)
-    errors  = copy(_ERRORS)
 
     mod = mod_name !== nothing ? String(mod_name) :
           _MODULE_NAME[] !== nothing ? _MODULE_NAME[] :

@@ -510,8 +510,12 @@ function _ret_plan(@nospecialize(C::Type); @nospecialize(jl_type::Type=Any))
             names = fieldnames(jl_type)
             decref_all = join((string(" Py_DECREF(", oi, ");") for oi in outs), "")
             push!(stmts, string("PyObject *rt = PyDict_New(); if (!rt) {", decref_all, " return NULL; }"))
-            for (nm, o) in zip(names, outs)
-                push!(stmts, string("PyDict_SetItemString(rt, \"", nm, "\", ", o, "); Py_DECREF(", o, ");"))
+            for (i, (nm, o)) in enumerate(zip(names, outs))
+                # On SetItemString failure: decref remaining (unowned) objects + the dict.
+                remaining = join((string(" Py_DECREF(", oi, ");") for oi in outs[i:end]), "")
+                push!(stmts, string("if (PyDict_SetItemString(rt, \"", nm, "\", ", o, ") < 0) {",
+                                    remaining, " Py_DECREF(rt); return NULL; }"))
+                push!(stmts, string("Py_DECREF(", o, ");"))
             end
         else
             push!(stmts, string("PyObject *rt = PyTuple_Pack(", length(carriers), ", ", join(outs, ", "), ");"))
@@ -557,6 +561,21 @@ function _error_inits(mod_name::AbstractString, errors::AbstractVector{PtError})
     return stmts
 end
 
+# Insert `cleanups` statements before each `return NULL;` (or PyErr_NoMemory) in a
+# single setup line, so that resources acquired by earlier args are released on failure.
+# Handles two patterns: bare `if (COND) return NULL;` (wrapped with braces) and
+# embedded `return NULL;` inside an existing brace block (simple textual insertion).
+function _insert_cleanup_before_return(s::String, cleanups::Vector{String})
+    isempty(cleanups) && return s
+    (contains(s, "return NULL;") || contains(s, "return PyErr_NoMemory();")) || return s
+    cl = join(cleanups, " ")
+    m = match(r"^(if\s*\(.+\))\s+return NULL;$", s)
+    m !== nothing && return "$(m.captures[1]) { $cl return NULL; }"
+    s = replace(s, "return NULL;" => cl * " return NULL;")
+    s = replace(s, "return PyErr_NoMemory();" => cl * " return PyErr_NoMemory();")
+    return s
+end
+
 function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=false)
     wname = string("pyw_", e.export_name)
     io = IOBuffer()
@@ -569,8 +588,10 @@ function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=
     end
 
     fmt_req = IOBuffer(); fmt_opt = IOBuffer()
-    addrs = String[]; callargs = String[]; setups = String[]; cleanups = String[]
+    addrs = String[]; callargs = String[]; cleanups = String[]
     kwnames = String[]
+    per_arg_setups   = Vector{String}[]
+    per_arg_cleanups = Vector{String}[]
     for (i, a) in enumerate(e.args)
         logical = a.jl_type <: AbstractArray && !(a.jl_type <: Array)
         plan = _arg_plan(c_abi_type(a.jl_type), i; logical, mutable=a.mutable,
@@ -581,7 +602,9 @@ function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=
         else
             print(fmt_opt, plan.fmt)
         end
-        append!(addrs, plan.addrs); append!(setups, plan.setup); append!(cleanups, plan.cleanup)
+        append!(addrs, plan.addrs); append!(cleanups, plan.cleanup)
+        push!(per_arg_setups, plan.setup)
+        push!(per_arg_cleanups, plan.cleanup)
         push!(callargs, plan.callarg)
         push!(kwnames, string(a.name))
     end
@@ -600,7 +623,15 @@ function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=
         println(io, "    if (!PyArg_ParseTuple(args, \"", fmt_str, "\", ",
                 join(addrs, ", "), ")) return NULL;")
     end
-    for s in setups; println(io, "    ", s); end
+    # Emit setups arg-by-arg, inserting accumulated release calls before return-NULL so
+    # that a failure in arg i properly releases resources acquired by args 0..i-1.
+    acquired = String[]
+    for (slist, clist) in zip(per_arg_setups, per_arg_cleanups)
+        for s in slist
+            println(io, "    ", _insert_cleanup_before_return(s, acquired))
+        end
+        append!(acquired, clist)
+    end
 
     println(io, "    int32_t _pt_err = 0;")
     println(io, "    char *_pt_errmsg = NULL;")

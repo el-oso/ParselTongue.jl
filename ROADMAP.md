@@ -223,14 +223,16 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
 - ~~**`_link_extension` redundant Python query**~~ — fixed v0.8.0.
 - ~~**`assert_boundary` stale error message**~~ — fixed v0.8.0.
 - ~~**`_wheel_meta` hardcodes version**~~ — fixed v0.8.0 (now uses `pkgversion`).
-- **`PyDict_SetItemString` return unchecked** (`cshim.jl:_ret_plan`): for NamedTuple
-  returns, `PyDict_SetItemString` can return -1 on OOM. Should check and propagate.
-- **Multiple array args: buffer leak on late arg failure** (`cshim.jl:_wrapper_fn`):
-  if arg 2's `PyObject_GetBuffer` fails after arg 1's succeeded, arg 1's
-  `PyBuffer_Release` is in `cleanup` which never runs. Low severity (Python GC
-  eventually handles it) but incorrect. Fix: add cleanup to setup's early-return paths.
-- **`build_wheel` double-includes user file**: once for mod name, once in
-  `build_extension`. Refactor to accept an already-resolved mod name.
+- ~~**`PyDict_SetItemString` return unchecked**~~ — fixed v0.17.0. Each call in
+  the NamedTuple → dict return path now checks the return value and propagates
+  OOM errors with correct refcount cleanup.
+- ~~**Multiple array args: buffer leak on late arg failure**~~ — fixed v0.17.0.
+  `_insert_cleanup_before_return` rewrites each arg's setup error paths to include
+  releases of all previously acquired buffers/arrays. Handles bare `if (cond)
+  return NULL;` (wrapped with braces) and embedded `return NULL;` inside blocks.
+- ~~**`build_wheel` double-includes user file**~~ — fixed v0.17.0. `build_wheel`
+  now passes `_preloaded=(exports, errors)` to `build_extension`, which skips the
+  second include. The user file is loaded exactly once per `build_wheel` call.
 
 ## Cross-cutting conventions
 

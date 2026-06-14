@@ -92,7 +92,9 @@ function build_wheel(user_path::AbstractString;
         error("ParselTongue: slim=true is not meaningful with runtime=:shared (no libs are vendored)")
 
     user_path = abspath(user_path)
-    # Resolve the user-facing module name the same way build_extension does.
+    # Include the user source once to resolve the module name and populate the export
+    # registry.  The result is passed to build_extension as _preloaded to skip a
+    # redundant second include.
     clear_exports!(); _MODULE_NAME[] = nothing
     sandbox = Module(:ParselTongueUserSandbox)
     Core.eval(sandbox, :(using ParselTongue))
@@ -101,6 +103,8 @@ function build_wheel(user_path::AbstractString;
           _MODULE_NAME[] !== nothing ? _MODULE_NAME[] :
           _default_mod_name(user_path)
     _is_valid_modname(mod) || error("ParselTongue: invalid module name '$mod'.")
+    preloaded = (copy(_EXPORTS), copy(_ERRORS))
+    exports   = preloaded[1]
 
     mkpath(outdir)
     stage = mktempdir(; prefix="ptwheel_", cleanup=!keep_build)
@@ -115,8 +119,8 @@ function build_wheel(user_path::AbstractString;
     so = build_extension(user_path;
                          mod_name=ext_name, outdir=pkgdir, trim, python, abi3,
                          runtime_rpaths=rpaths,
-                         strip_abs_rpath=true, keep_build, verbose)
-    exports = copy(_EXPORTS)   # build_extension repopulated the registry
+                         strip_abs_rpath=true, keep_build, verbose,
+                         _preloaded=preloaded)
 
     # 2. Vendor the Julia runtime (bundled only).
     if runtime === :bundled
