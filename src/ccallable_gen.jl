@@ -66,13 +66,17 @@ function _type_src(@nospecialize(T::Type))
 end
 
 """
-    emit_ccallable(e::PtExport) -> String
+    emit_ccallable(e::PtExport; errors=PtError[]) -> String
 
 Return the Julia source for the `Base.@ccallable` wrapper exporting `e`. The
 wrapper references the user function by its bare name, so it must be emitted into
 the same scope into which the user code was `include`d.
+
+`errors` is the list of `@pyerror`-registered exception types for this build.
+Each registered type gets an isa check in the catch block; the error code encodes
+which Python exception the C shim should raise (1 = RuntimeError, 2+ = registered).
 """
-function emit_ccallable(e::PtExport)
+function emit_ccallable(e::PtExport; errors::Vector{PtError}=PtError[])
     sym   = cabi_symbol(e)
     ret_c = c_abi_type(e.ret)
 
@@ -101,29 +105,41 @@ function emit_ccallable(e::PtExport)
     # Catch block: signal the error and copy the message into a malloc'd C buffer.
     # The C shim checks _pt_err, builds the Python exception, and frees the buffer.
     #
-    # Nested isa checks are required for --trim=safe:
-    #   _e::Any  (general catch; user function may throw any exception type)
-    #   → isa ErrorException narrows _e to ErrorException
-    #   → _e.msg::AbstractString (field is declared AbstractString in Julia base)
-    #   → isa String narrows _m to String, making pointer/_n concrete
-    # Without the inner `isa String`, assigning to ::String triggers
-    # convert(String, ::AbstractString) which is dynamic dispatch.
-    catch_stmts = string(
-        "        unsafe_store!(_pt_err, Int32(1))\n",
-        "        local _buf::Ptr{UInt8} = Ptr{UInt8}(0)\n",
-        "        if _e isa ErrorException\n",
-        "            local _m = _e.msg\n",
-        "            if _m isa String\n",
-        "                local _n::Int = sizeof(_m)\n",
-        "                _buf = Ptr{UInt8}(Libc.malloc(_n + 1))\n",
-        "                if _buf != C_NULL\n",
-        "                    unsafe_copyto!(_buf, pointer(_m), _n)\n",
-        "                    unsafe_store!(_buf, UInt8(0), _n + 1)\n",
-        "                end\n",
-        "            end\n",
-        "        end\n",
-        "        unsafe_store!(_pt_errmsg, _buf)\n",
-    )
+    # Trim-safety invariants:
+    # - isa checks narrow the type without dynamic dispatch.
+    # - Registered exception types are checked first (if/elseif/else);
+    #   _pt_err encodes the exception index: 1=RuntimeError, 2+=registered[i-2].
+    # - ErrorException message extraction is a separate block: types that are
+    #   <: ErrorException get both a typed error code AND a message string.
+    # - Without the inner `isa String`, converting AbstractString triggers dynamic
+    #   dispatch which --trim=safe rejects.
+    io_catch = IOBuffer()
+    print(io_catch, "        local _buf::Ptr{UInt8} = Ptr{UInt8}(0)\n")
+    if !isempty(errors)
+        for (i, err) in enumerate(errors)
+            kw = i == 1 ? "if" : "elseif"
+            print(io_catch, "        $kw _e isa ", err.jl_type, "\n")
+            print(io_catch, "            unsafe_store!(_pt_err, Int32(", i + 1, "))\n")
+        end
+        print(io_catch, "        else\n")
+        print(io_catch, "            unsafe_store!(_pt_err, Int32(1))\n")
+        print(io_catch, "        end\n")
+    else
+        print(io_catch, "        unsafe_store!(_pt_err, Int32(1))\n")
+    end
+    print(io_catch, "        if _e isa ErrorException\n")
+    print(io_catch, "            local _m = _e.msg\n")
+    print(io_catch, "            if _m isa String\n")
+    print(io_catch, "                local _n::Int = sizeof(_m)\n")
+    print(io_catch, "                _buf = Ptr{UInt8}(Libc.malloc(_n + 1))\n")
+    print(io_catch, "                if _buf != C_NULL\n")
+    print(io_catch, "                    unsafe_copyto!(_buf, pointer(_m), _n)\n")
+    print(io_catch, "                    unsafe_store!(_buf, UInt8(0), _n + 1)\n")
+    print(io_catch, "                end\n")
+    print(io_catch, "            end\n")
+    print(io_catch, "        end\n")
+    print(io_catch, "        unsafe_store!(_pt_errmsg, _buf)\n")
+    catch_stmts = String(take!(io_catch))
 
     sig = string("Base.@ccallable function ", sym, "(", join(params, ", "), ")")
     if ret_c === Cvoid
@@ -163,20 +179,21 @@ function emit_ccallable(e::PtExport)
 end
 
 """
-    emit_entry(exports, user_path) -> String
+    emit_entry(exports, user_path; errors=PtError[]) -> String
 
 Return the full source of the juliac entry file: load ParselTongue, `include`
 the user's source, then define every `@ccallable` wrapper. `user_path` must be
 absolute (juliac's buildscript resolves includes relative to itself otherwise).
 """
-function emit_entry(exports::AbstractVector{PtExport}, user_path::AbstractString)
+function emit_entry(exports::AbstractVector{PtExport}, user_path::AbstractString;
+                    errors::Vector{PtError}=PtError[])
     io = IOBuffer()
     println(io, "# Generated by ParselTongue — do not edit.")
     println(io, "using ParselTongue")
     println(io, "include(", repr(abspath(user_path)), ")")
     println(io)
     for e in exports
-        println(io, emit_ccallable(e))
+        println(io, emit_ccallable(e; errors))
     end
     return String(take!(io))
 end

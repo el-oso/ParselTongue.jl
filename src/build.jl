@@ -99,6 +99,7 @@ function build_extension(user_path::AbstractString;
         "ParselTongue: no @pyfunc exports found in $user_path. " *
         "Annotate functions with @pyfunc.")
     exports = copy(_EXPORTS)
+    errors  = copy(_ERRORS)
 
     mod = mod_name !== nothing ? String(mod_name) :
           _MODULE_NAME[] !== nothing ? _MODULE_NAME[] :
@@ -115,7 +116,7 @@ function build_extension(user_path::AbstractString;
     # Use invokelatest: @pyhandle definitions in the sandbox bump the world counter,
     # so c_abi_type dispatch inside the codegen must use the current latest world.
     entry_path = joinpath(builddir, "_pt_entry.jl")
-    write(entry_path, Base.invokelatest(emit_entry, exports, user_path))
+    write(entry_path, Base.invokelatest(emit_entry, exports, user_path; errors))
 
     # 3. Run juliac --trim to produce the trimmed object archive.
     img = joinpath(builddir, "img.a")
@@ -123,7 +124,7 @@ function build_extension(user_path::AbstractString;
 
     # 4. Generate the C PyInit shim.
     cpath = joinpath(builddir, string("_", mod, "module.c"))
-    write(cpath, Base.invokelatest(emit_cshim, mod, exports; abi3))
+    write(cpath, Base.invokelatest(emit_cshim, mod, exports, errors; abi3))
 
     # 5. Link the shim + archive into the extension module.
     so_path = joinpath(outdir, string(mod, ext_suffix))

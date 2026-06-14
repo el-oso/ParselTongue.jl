@@ -445,7 +445,29 @@ function _extern_decl(e::PtExport)
     string("extern ", ret, " ", cabi_symbol(e), "(", args, ");")
 end
 
-function _wrapper_fn(e::PtExport; abi3::Bool=false)
+# Emit `static PyObject *pt_err_<Name> = NULL;` globals for each registered error.
+function _error_globals(errors::AbstractVector{PtError})
+    isempty(errors) && return String[]
+    return [string("static PyObject *pt_err_", e.py_name, " = NULL;") for e in errors]
+end
+
+# Emit PyErr_NewException + PyModule_AddObject calls for PyInit_<mod>.
+function _error_inits(mod_name::AbstractString, errors::AbstractVector{PtError})
+    isempty(errors) && return String[]
+    stmts = String[]
+    for e in errors
+        gname = string("pt_err_", e.py_name)
+        push!(stmts, string(gname, " = PyErr_NewException(\"", mod_name, ".", e.py_name,
+                            "\", ", e.parent, ", NULL);"))
+        push!(stmts, string("if (!", gname, ") { Py_DECREF(m); return NULL; }"))
+        push!(stmts, string("Py_INCREF(", gname, ");"))
+        push!(stmts, string("if (PyModule_AddObject(m, \"", e.py_name, "\", ", gname,
+                            ") < 0) { Py_DECREF(", gname, "); Py_DECREF(m); return NULL; }"))
+    end
+    return stmts
+end
+
+function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=false)
     wname = string("pyw_", e.export_name)
     io = IOBuffer()
     has_defaults = any(a -> a.default !== nothing, e.args)
@@ -507,7 +529,19 @@ function _wrapper_fn(e::PtExport; abi3::Bool=false)
     end
     for s in cleanups; println(io, "    ", s); end
     println(io, "    if (_pt_err) {")
-    println(io, "        PyErr_SetString(PyExc_RuntimeError, _pt_errmsg ? _pt_errmsg : \"Julia exception\");")
+    println(io, "        const char *_msg = _pt_errmsg ? _pt_errmsg : \"Julia exception\";")
+    if isempty(errors)
+        println(io, "        PyErr_SetString(PyExc_RuntimeError, _msg);")
+    else
+        # Error codes: 1=RuntimeError, 2=errors[1], 3=errors[2], ...
+        for (i, err) in enumerate(errors)
+            kw = i == 1 ? "if" : "else if"
+            println(io, "        $kw (_pt_err == ", i + 1, ")")
+            println(io, "            PyErr_SetString(pt_err_", err.py_name, ", _msg);")
+        end
+        println(io, "        else")
+        println(io, "            PyErr_SetString(PyExc_RuntimeError, _msg);")
+    end
     println(io, "        free(_pt_errmsg);")
     println(io, "        return NULL;")
     println(io, "    }")
@@ -685,7 +719,8 @@ When `abi3=true` the shim defines `Py_LIMITED_API 0x030B0000` (Python 3.11 floor
 the version that added `PyObject_GetBuffer` to the stable ABI) and emits only
 stable-ABI calls. The resulting `.abi3.so` is compatible with any CPython ≥ 3.11.
 """
-function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport};
+function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
+                    errors::Vector{PtError}=PtError[];
                     doc::AbstractString="", abi3::Bool=false)
     isempty(doc) && (doc = "ParselTongue extension (Julia via juliac --trim)")
     io = IOBuffer()
@@ -701,6 +736,12 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport};
     println(io, "#include <stdlib.h>")
     println(io, "#include <string.h>")
     println(io)
+    eglobals = _error_globals(errors)
+    if !isempty(eglobals)
+        println(io, "/* Custom Python exception type globals (@pyerror) */")
+        for s in eglobals; println(io, s); end
+        println(io)
+    end
     cstructs = _complex_structs(exports)
     if !isempty(cstructs)
         println(io, "/* C-ABI carriers for complex numbers (match Julia Complex{T}) */")
@@ -739,7 +780,7 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport};
     println(io)
     wnames = String[]
     for e in exports
-        fn, wname = _wrapper_fn(e; abi3)
+        fn, wname = _wrapper_fn(e; errors, abi3)
         println(io, fn); println(io)
         push!(wnames, wname)
     end
@@ -768,7 +809,16 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport};
         println(io, "    if (!_PtBufType) return NULL;")
     end
     println(io, "    /* trimmed Julia lib self-initializes on first @ccallable call */")
-    println(io, "    return PyModule_Create(&", mod_name, "_module);")
+    if isempty(errors)
+        println(io, "    return PyModule_Create(&", mod_name, "_module);")
+    else
+        println(io, "    PyObject *m = PyModule_Create(&", mod_name, "_module);")
+        println(io, "    if (!m) return NULL;")
+        for s in _error_inits(mod_name, errors)
+            println(io, "    ", s)
+        end
+        println(io, "    return m;")
+    end
     println(io, "}")
     return String(take!(io))
 end

@@ -43,6 +43,22 @@ PtExport(jl_func, export_name, args, ret, mod) =
 
 cabi_symbol(e::PtExport) = string("pt_", e.export_name)
 
+"""
+    PtError(jl_type, py_name, parent)
+
+One custom Python exception registered via `@pyerror`. `jl_type` is the Julia
+exception type, `py_name` is its Python-visible name, and `parent` is the C
+expression for its Python parent class (e.g. `"PyExc_ValueError"`).
+"""
+struct PtError
+    jl_type::Type
+    py_name::String
+    parent::String    # C expression, e.g. "PyExc_Exception"
+end
+
+# Build-host registry for custom exception types.
+const _ERRORS = PtError[]
+
 # A valid Python / C identifier (also the C-ABI symbol name).
 _is_py_ident(s::AbstractString) = occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", s)
 
@@ -65,7 +81,7 @@ const _EXPORTS = PtExport[]
 
 Reset the export registry. Called at the start of each `build_extension`.
 """
-clear_exports!() = (empty!(_EXPORTS); _MODULE_NAME[] = nothing; _CURRENT_SUBMODULE[] = ""; nothing)
+clear_exports!() = (empty!(_EXPORTS); empty!(_ERRORS); _MODULE_NAME[] = nothing; _CURRENT_SUBMODULE[] = ""; nothing)
 
 # Distinct, ordered submodule names among `exports` (excluding the "" top level).
 function submodule_names(exports::AbstractVector{PtExport})
@@ -75,6 +91,65 @@ function submodule_names(exports::AbstractVector{PtExport})
         !isempty(s) && !(s in subs) && push!(subs, s)
     end
     subs
+end
+
+# Map a Python exception class name symbol to its C global expression.
+const _PY_EXC_CNAMES = Dict{Symbol,String}(
+    :Exception          => "PyExc_Exception",
+    :ValueError         => "PyExc_ValueError",
+    :TypeError          => "PyExc_TypeError",
+    :RuntimeError       => "PyExc_RuntimeError",
+    :ArithmeticError    => "PyExc_ArithmeticError",
+    :LookupError        => "PyExc_LookupError",
+    :IndexError         => "PyExc_IndexError",
+    :KeyError           => "PyExc_KeyError",
+    :AttributeError     => "PyExc_AttributeError",
+    :ImportError        => "PyExc_ImportError",
+    :MemoryError        => "PyExc_MemoryError",
+    :NotImplementedError=> "PyExc_NotImplementedError",
+    :OSError            => "PyExc_OSError",
+    :OverflowError      => "PyExc_OverflowError",
+    :StopIteration      => "PyExc_StopIteration",
+)
+
+function _py_exc_cname(parent_sym::Symbol)
+    haskey(_PY_EXC_CNAMES, parent_sym) && return _PY_EXC_CNAMES[parent_sym]
+    error("@pyerror: unknown Python exception parent `$parent_sym`. " *
+          "Supported: $(join(sort!(collect(string.(keys(_PY_EXC_CNAMES)))), ", ")).")
+end
+
+"""
+    @pyerror ExcType
+    @pyerror ExcType <: PythonParent
+
+Register a Julia exception type as a named Python exception. The generated Python
+module will have an `ExcType` attribute that Python callers can `except`. Any
+`@pyfunc` that `throw`s a value of this type will raise that specific Python
+exception rather than a generic `RuntimeError`.
+
+`PythonParent` is a standard Python exception class name (e.g. `ValueError`,
+`ArithmeticError`); defaults to `Exception`.
+"""
+macro pyerror(expr)
+    # Accepted forms:
+    #   @pyerror MyError          → expr = :MyError
+    #   @pyerror MyError <: Foo   → expr = :(MyError <: Foo)
+    if expr isa Expr && expr.head === :(<:) && length(expr.args) == 2
+        err_sym    = expr.args[1]::Symbol
+        parent_sym = expr.args[2]::Symbol
+        parent_c   = _py_exc_cname(parent_sym)
+    elseif expr isa Symbol
+        err_sym  = expr
+        parent_c = "PyExc_Exception"
+    else
+        error("@pyerror: expected `ExcType` or `ExcType <: PythonParent`, got: $expr")
+    end
+    py_name = string(err_sym)
+    quote
+        let _et = Core.eval(@__MODULE__, $(QuoteNode(err_sym)))
+            push!(ParselTongue._ERRORS, ParselTongue.PtError(_et, $py_name, $parent_c))
+        end
+    end
 end
 
 # Parse one positional or keyword arg node into (name, type_expr, mutable, default_expr).

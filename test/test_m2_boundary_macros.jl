@@ -9,7 +9,8 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     _readelf_needed, _transitive_needed, _resolve_soname,
                     _vendor_libs_smart,
                     PtOpt, _is_optional, _opt_inner, isopt, _opt_inner_c,
-                    _to_c_opt
+                    _to_c_opt,
+                    PtError, _ERRORS, _py_exc_cname, _error_globals, _error_inits
 
 # Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
 struct _TestHandle
@@ -518,4 +519,86 @@ end
     # Return plan: check has_value, return Py_None or inner
     @test occursin("Py_INCREF(Py_None)", shim)
     @test occursin("PyFloat_FromDouble", shim)
+end
+
+@testset "custom exception types (@pyerror, item A)" begin
+    # ── _py_exc_cname helper ─────────────────────────────────────────────
+    @test _py_exc_cname(:Exception)      == "PyExc_Exception"
+    @test _py_exc_cname(:ValueError)     == "PyExc_ValueError"
+    @test _py_exc_cname(:ArithmeticError)== "PyExc_ArithmeticError"
+    @test _py_exc_cname(:RuntimeError)   == "PyExc_RuntimeError"
+    err = try; _py_exc_cname(:NoSuchError); catch e; e; end
+    @test err isa ErrorException
+    @test occursin("NoSuchError", err.msg)
+
+    # ── @pyerror populates _ERRORS ───────────────────────────────────────
+    clear_exports!()
+    @test isempty(_ERRORS)
+
+    @pyerror DomainError
+    @test length(_ERRORS) == 1
+    @test _ERRORS[1].jl_type === DomainError
+    @test _ERRORS[1].py_name == "DomainError"
+    @test _ERRORS[1].parent  == "PyExc_Exception"
+
+    @pyerror ArgumentError <: ValueError
+    @test length(_ERRORS) == 2
+    @test _ERRORS[2].jl_type === ArgumentError
+    @test _ERRORS[2].py_name == "ArgumentError"
+    @test _ERRORS[2].parent  == "PyExc_ValueError"
+
+    # clear_exports! empties _ERRORS too
+    clear_exports!()
+    @test isempty(_ERRORS)
+    @test isempty(_EXPORTS)
+
+    # ── ccallable_gen.jl: catch block with errors ─────────────────────────
+    clear_exports!()
+    @pyerror DomainError
+    @pyerror ArgumentError <: ValueError
+    @pyfunc typed_exc(x::Float64)::Float64 = x < 0 ? throw(DomainError(x, "negative")) : x
+
+    e = _EXPORTS[1]
+    errs = copy(_ERRORS)
+
+    src_no_errors = emit_ccallable(e)
+    # Without errors: only code 1 (RuntimeError)
+    @test occursin("Int32(1)", src_no_errors)
+    @test !occursin("Int32(2)", src_no_errors)
+
+    src_with_errors = emit_ccallable(e; errors=errs)
+    # With errors: code 2 for DomainError, code 3 for ArgumentError, else code 1
+    @test occursin("Int32(2)", src_with_errors)
+    @test occursin("Int32(3)", src_with_errors)
+    @test occursin("DomainError", src_with_errors)
+    @test occursin("ArgumentError", src_with_errors)
+    # Fallback still present
+    @test occursin("Int32(1)", src_with_errors)
+
+    # ── cshim.jl: error globals and PyInit code ───────────────────────────
+    eglobals = _error_globals(errs)
+    @test length(eglobals) == 2
+    @test occursin("pt_err_DomainError", eglobals[1])
+    @test occursin("pt_err_ArgumentError", eglobals[2])
+
+    einits = _error_inits("mymod", errs)
+    @test any(s -> occursin("PyErr_NewException", s) && occursin("mymod.DomainError", s), einits)
+    @test any(s -> occursin("PyExc_ValueError", s), einits)
+    @test any(s -> occursin("PyModule_AddObject", s) && occursin("\"DomainError\"", s), einits)
+
+    shim = emit_cshim("mymod", _EXPORTS, errs)
+    @test occursin("static PyObject *pt_err_DomainError = NULL;", shim)
+    @test occursin("static PyObject *pt_err_ArgumentError = NULL;", shim)
+    @test occursin("PyErr_NewException(\"mymod.DomainError\"", shim)
+    @test occursin("PyErr_NewException(\"mymod.ArgumentError\"", shim)
+    @test occursin("PyExc_ValueError", shim)
+    # Error dispatch in wrapper
+    @test occursin("_pt_err == 2", shim)
+    @test occursin("_pt_err == 3", shim)
+    @test occursin("PyExc_RuntimeError", shim)   # fallback
+
+    # Without errors: shim returns PyModule_Create directly
+    shim_bare = emit_cshim("baremod", _EXPORTS)
+    @test occursin("return PyModule_Create", shim_bare)
+    @test !occursin("PyErr_NewException", shim_bare)
 end

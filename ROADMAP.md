@@ -91,21 +91,17 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
 
 ## Phase 2 — broaden distribution + ergonomics
 
-- [ ] **A. Custom exception types** *(ergonomics — gap vs PyO3)* — every Julia `error()`
-  today maps to a generic Python `RuntimeError`; callers cannot `except MyMod.MyError`.
-  Add `@pyerror MyError [<: ParentExcClass]` macro (defaults to `PyException`).
-  - `macros.jl`: new `PtError` struct + `@pyerror` macro records error types in a
-    separate `_ERRORS` registry (cleared/populated alongside `_EXPORTS`).
-  - `cshim.jl`: `emit_cshim` emits `static PyObject *pt_err_<Name> = NULL;` globals;
-    `PyInit_<mod>` calls `PyErr_NewException("mod.Name", parent, NULL)` and
-    `PyModule_AddObject` for each; `_wrapper_fn` try/catch block inspects the caught
-    exception's type name (via `sprint(showerror, …)`) and dispatches to the matching
-    `PyErr_SetObject` or falls back to `PyErr_SetString(PyExc_RuntimeError, …)`.
-  - `ccallable_gen.jl`: `emit_entry` includes error type declarations so the trimmed
-    binary knows the registered types.
-  - Done-when: `@pyerror DomainError; @pyfunc f(x::Float64)::Float64 = x < 0 ?
-    error(DomainError(x)) : sqrt(x)` and Python `try: f(-1) except mod.DomainError: …`
-    catches the specific type. Effort M · Risk L.
+- [x] **A. Custom exception types** *(ergonomics — gap vs PyO3)* — shipped v0.11.0.
+  `@pyerror DomainError` / `@pyerror MyError <: ValueError` registers a Julia exception
+  type as a named Python exception. `clear_exports!` clears both `_EXPORTS` and `_ERRORS`.
+  ABI: `_pt_err` encodes the exception index (1=RuntimeError, 2+=registered[i-2]) — no
+  4th out-param needed. Catch block emits trim-safe isa chain in registration order;
+  ErrorException message extraction is independent (fires for any `<: ErrorException`).
+  C shim emits `static PyObject *pt_err_<Name>` globals + `PyErr_NewException` +
+  `PyModule_AddObject` in `PyInit_<mod>`; wrapper dispatch uses if/else code chain.
+  `build.jl` copies `_ERRORS` alongside `_EXPORTS` and passes both to codegen.
+  Done-when: Python `except mod.DomainError` catches a specific Julia exception type.
+  Effort M · Risk L.
 
 - [ ] **B. `Dict{String,V}` + `Vector{UInt8}` boundary types** *(type breadth)*
   - `Dict{String,V}` (V ∈ scalar boundary types): carrier is `PyObject*`
