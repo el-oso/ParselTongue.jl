@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+# Cancel in-progress runs for the same ref when new commits arrive.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Julia ${{ matrix.julia-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        julia-version: ['1.12']
+        os: [ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.julia-version }}
+
+      - uses: julia-actions/cache@v2
+
+      # numpy is optional (array returns fall back to memoryview without it),
+      # but the integration test exercises the numpy path when it is available.
+      - name: Install Python extras
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y python3-numpy
+
+      # TypeContracts is an unregistered sibling package (not in General registry).
+      # In CI there is no ../TypeContracts on disk, so we resolve it via URL.
+      - name: Resolve TypeContracts and instantiate
+        run: |
+          julia --project=. -e 'using Pkg; Pkg.develop(url="https://github.com/el-oso/TypeContracts.jl.git"); Pkg.instantiate()'
+
+      # Run the fast build-free unit tests first for quick feedback.
+      # If these fail, the integration build step below is skipped automatically.
+      - name: Unit tests (boundary types, macros, codegen — no build tools needed)
+        run: julia --project=. test/test_m2_boundary_macros.jl
+
+      # Full integration: juliac --trim build + Python import in a subprocess.
+      # Skips gracefully when juliac / python3 / cc are unavailable (see _have_tools).
+      - name: Integration tests (juliac build + Python import)
+        run: julia --project=. test/test_integration.jl

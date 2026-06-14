@@ -193,8 +193,15 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   **Warning**: `slim=true` breaks extensions that `using LinearAlgebra`/`SuiteSparse`
   — those JLL `__init__`s dlopen their libs at startup via `dlopen` (not DT_NEEDED),
   so those libs are absent from the transitive closure and will cause `ImportError`.
-- [ ] **10. CI + distribution polish** — GitHub Actions wheel matrix (Python × plat),
-  doctest the docs examples, prep for Julia General registry. Effort M.
+- [x] **10. CI + distribution polish** — shipped v0.15.0.
+  `.github/workflows/ci.yml`: single job, Julia 1.12 on ubuntu-latest; installs numpy,
+  resolves TypeContracts via `Pkg.develop(url=...)` (unregistered sibling — no `../` path
+  in CI), runs unit tests first (fast feedback), then integration tests (juliac build +
+  Python import; skips gracefully if tools absent). README updated with installation
+  instructions (`Pkg.add(url=...)` for both TypeContracts and ParselTongue) and a current
+  status section. **General registry**: blocked on TypeContracts being registered in
+  General first; the rest of Project.toml (UUID, compat, extras) is already correct.
+  Doctest of docs examples deferred (requires node/npm). Effort M.
 - [x] **11. Startup latency** — shipped v0.14.0. `startup_benchmark(ext_path; call_expr, n, python)`
   runs `n` fresh-subprocess trials, times import and optional first call, returns a
   NamedTuple with `import_ms_median/min/max` and `call_ms_median/min/max`. Integration

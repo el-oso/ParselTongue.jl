@@ -57,10 +57,22 @@ numpy is **never a build-time dependency** — it is resolved at runtime and lis
 as an optional extra. A non-boundary type in a signature is rejected at build time
 with a clear message (not a cryptic trim error), via a `TypeContracts` contract.
 
+## Installation
+
+ParselTongue depends on
+[TypeContracts.jl](https://github.com/el-oso/TypeContracts.jl) (not yet in
+the Julia General registry). Install both from GitHub:
+
+```julia
+using Pkg
+Pkg.develop(url="https://github.com/el-oso/TypeContracts.jl.git")
+Pkg.add(url="https://github.com/el-oso/parseltongue.git")
+```
+
 ## Requirements
 
 - Julia ≥ 1.12 with bundled `juliac` (e.g. via `juliaup`).
-- A C compiler (`cc`/`gcc`/`clang`) and `python3` with development headers.
+- A C compiler (`cc`/`gcc`/`clang`) and `python3`.
 
 ## Known limitations (v1)
 
@@ -92,6 +104,9 @@ metadata. The boundary type system reuses
 
 ## Status
 
-v0.1 — milestones M1–M6 complete: scalars, strings, and 1-D numeric arrays build
-end-to-end into importable, self-contained wheels. See `examples/` (`mathx`,
-`strx`, `arrx`) and `test/`.
+v0.14 — full build pipeline shipping: scalars, strings, N-D numeric arrays,
+`ComplexF64`, `Vector{String}`, `Dict{String,V}`, `Vector{UInt8}` (bytes),
+`Union{T,Nothing}` (Optional), `NamedTuple`, `Tuple`, opaque handles
+(`@pyhandle`), custom Python exception types (`@pyerror`), keyword/default
+arguments, manylinux tagging, abi3 stable-ABI wheels, shared-runtime wheels,
+slim bundling, and startup benchmarking. See `examples/` and `ROADMAP.md`.
