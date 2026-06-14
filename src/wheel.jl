@@ -487,6 +487,86 @@ function _vendor_libs_smart(srcdir::AbstractString, dstdir::AbstractString,
 end
 
 """
+    startup_benchmark(ext_path; mod_name=nothing, call_expr=nothing,
+                      n=5, python="python3") -> NamedTuple
+
+Measure first-import and (optionally) first-call latency for a built extension.
+Each of the `n` trials runs in a **fresh subprocess** so import caching never
+interferes. Typical numbers for a full-runtime bundled wheel: ~1–3 s import
+(libjulia init dominates), < 1 ms first call (AOT-compiled, no JIT overhead).
+With `slim=true` the import drops to ~0.3–0.8 s.
+
+- `ext_path`: an importable file or directory — a `.so` built by `build_extension`,
+  or a directory on `sys.path` containing the package.
+- `mod_name`: module name to import; inferred from the filename if `nothing`
+  (the first token before `.`).
+- `call_expr`: Python expression to time as the **first call**, where the module
+  is named `mod`, e.g. `"mod.add(1, 2)"`. Omit to measure import time only.
+- `n`: number of independent subprocess trials (must be ≥ 1).
+
+Returns a `NamedTuple` with fields:
+  `n`, `import_ms_median`, `import_ms_min`, `import_ms_max`,
+  `call_ms_median`, `call_ms_min`, `call_ms_max`
+  (the `call_ms_*` fields are `nothing` when `call_expr` is not provided).
+
+```julia-repl
+julia> so = build_extension("mymod.jl"; outdir="build")
+julia> r = startup_benchmark(so; call_expr="mod.add(1, 2)", n=5)
+julia> @info "import \$(round(r.import_ms_median))ms  call \$(round(r.call_ms_median, digits=2))ms"
+```
+"""
+function startup_benchmark(ext_path::AbstractString;
+                           mod_name::Union{Nothing,AbstractString}=nothing,
+                           call_expr::Union{Nothing,AbstractString}=nothing,
+                           n::Int=5,
+                           python::AbstractString="python3")
+    n >= 1 || error("ParselTongue: startup_benchmark requires n ≥ 1")
+    ext_path = abspath(ext_path)
+    ext_dir  = isfile(ext_path) ? dirname(ext_path) : ext_path
+    mname    = mod_name !== nothing ? String(mod_name) :
+               String(split(basename(ext_path), '.')[1])
+
+    call_block = call_expr !== nothing ? string(
+        "t2 = time.perf_counter()\n",
+        call_expr, "\n",
+        "t3 = time.perf_counter()\n",
+        "print(f',{(t3-t2)*1000:.6f}', end='')\n") : ""
+
+    script = string(
+        "import sys, time\n",
+        "sys.path.insert(0, ", repr(ext_dir), ")\n",
+        "t0 = time.perf_counter()\n",
+        "import ", mname, " as mod\n",
+        "t1 = time.perf_counter()\n",
+        "print(f'{(t1-t0)*1000:.6f}', end='')\n",
+        call_block,
+        "print('')\n")
+
+    import_times = Float64[]
+    call_times   = Float64[]
+    for _ in 1:n
+        out = readchomp(`$python -c $script`)
+        parts = split(strip(out), ',')
+        push!(import_times, parse(Float64, parts[1]))
+        call_expr !== nothing && length(parts) >= 2 &&
+            push!(call_times, parse(Float64, parts[2]))
+    end
+
+    sort!(import_times); sort!(call_times)
+    med(v) = isempty(v) ? nothing : v[div(length(v) + 1, 2)]
+
+    return (
+        n                = n,
+        import_ms_median = med(import_times),
+        import_ms_min    = isempty(import_times) ? nothing : import_times[1],
+        import_ms_max    = isempty(import_times) ? nothing : import_times[end],
+        call_ms_median   = med(call_times),
+        call_ms_min      = isempty(call_times) ? nothing : call_times[1],
+        call_ms_max      = isempty(call_times) ? nothing : call_times[end],
+    )
+end
+
+"""
     bundle_size_report(whl_path; python="python3") -> Vector{NamedTuple}
 
 Return a list of `(; name, bytes, compressed_bytes)` NamedTuples for every file

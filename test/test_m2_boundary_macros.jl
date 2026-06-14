@@ -749,3 +749,42 @@ end
         @test occursin("manylinux_2_17_", tag_abi3_pinned)
     end
 end
+
+@testset "startup_benchmark utility (item 11)" begin
+    python = get(ENV, "PYTHON3", "python3")
+
+    # Use a trivial .py module as a stand-in for a real .so — the timing
+    # mechanism (subprocess + stdout parsing) is identical.
+    td = mktempdir()
+    try
+        dummy = joinpath(td, "dummy_ext.py")
+        write(dummy, "def add(a, b): return a + b\n")
+
+        # Import-only mode
+        r = startup_benchmark(dummy; n=3, python)
+        @test r.n == 3
+        @test r.import_ms_median !== nothing
+        @test r.import_ms_median >= 0.0
+        @test r.import_ms_min <= r.import_ms_median <= r.import_ms_max
+        @test r.call_ms_median === nothing     # not requested
+        @test r.call_ms_min    === nothing
+        @test r.call_ms_max    === nothing
+
+        # Import + first-call mode
+        r2 = startup_benchmark(dummy; call_expr="mod.add(1, 2)", n=3, python)
+        @test r2.n == 3
+        @test r2.call_ms_median !== nothing
+        @test r2.call_ms_median >= 0.0
+        @test r2.call_ms_min <= r2.call_ms_median <= r2.call_ms_max
+
+        # mod_name override: works even when the filename is ambiguous
+        r3 = startup_benchmark(dummy; mod_name="dummy_ext", n=1, python)
+        @test r3.n == 1
+        @test r3.import_ms_median !== nothing
+
+        # Error on n < 1
+        @test_throws ErrorException startup_benchmark(dummy; n=0, python)
+    finally
+        rm(td; recursive=true)
+    end
+end

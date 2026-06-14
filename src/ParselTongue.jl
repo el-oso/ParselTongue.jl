@@ -22,7 +22,7 @@ include("build.jl")
 include("wheel.jl")
 
 export @pyfunc, @pymodule, @pyhandle, @pyerror, build_extension, build_wheel, build_runtime_wheel
-export bundle_size_report
+export bundle_size_report, startup_benchmark
 export PyBoundary, Mut, PtHandle, c_abi_type, from_c, to_c
 
 end # module ParselTongue

@@ -195,7 +195,11 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   so those libs are absent from the transitive closure and will cause `ImportError`.
 - [ ] **10. CI + distribution polish** — GitHub Actions wheel matrix (Python × plat),
   doctest the docs examples, prep for Julia General registry. Effort M.
-- [ ] **11. Startup latency** — measure/trim first-call runtime init. Effort S.
+- [x] **11. Startup latency** — shipped v0.14.0. `startup_benchmark(ext_path; call_expr, n, python)`
+  runs `n` fresh-subprocess trials, times import and optional first call, returns a
+  NamedTuple with `import_ms_median/min/max` and `call_ms_median/min/max`. Integration
+  test now logs latency numbers after each build. Typical: ~1–3 s import (libjulia init),
+  <1 ms first call (AOT-compiled). Effort S.
 
 ## Phase 4 — optional capability track (stateful objects)
 
