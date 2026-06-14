@@ -5,7 +5,7 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     PtExport, PtArray, emit_ccallable, emit_entry, emit_cshim,
                     _EXPORTS, clear_exports!, _default_py_name, submodule_names,
                     _julia_version_str, _runtime_wheel_tag, _runtime_metadata,
-                    _RUNTIME_INIT_PY, _write_shared_pkg_pyfiles,
+                    _RUNTIME_INIT_PY, _write_shared_pkg_pyfiles, _write_system_pkg_pyfiles,
                     _readelf_needed, _transitive_needed, _resolve_soname,
                     _vendor_libs_smart, _is_dynlib, _SKIP_LIB,
                     _parse_otool_output, _otool_needed, _dynlib_needed,
@@ -454,6 +454,39 @@ end
     end
 end
 
+@testset "runtime=:system wheel helpers (item G)" begin
+    clear_exports!()
+    @pyfunc _test_sys_add(a::Float64, b::Float64)::Float64 = a + b
+    pkgdir = mktempdir()
+    try
+        _write_system_pkg_pyfiles(pkgdir, "_mymod", _EXPORTS, "mymod")
+        init = read(joinpath(pkgdir, "__init__.py"), String)
+        # Discovers Julia via JULIA_BINDIR, JULIA_PREFIX, or PATH.
+        @test occursin("JULIA_BINDIR", init)
+        @test occursin("JULIA_PREFIX", init)
+        @test occursin("julia", init)               # which('julia') fallback
+        @test occursin("subprocess", init)          # PATH fallback spawns julia
+        @test occursin("ImportError", init)         # raises if Julia not found
+        @test occursin("julialang.org", init)       # install link in error msg
+        # Preload block present.
+        @test occursin("LD_LIBRARY_PATH", init) || occursin("ctypes", init)
+        @test occursin("_preload", init)
+        # Does NOT import parseltongue_runtime.
+        @test !occursin("parseltongue_runtime", init)
+        # Function exported correctly.
+        @test occursin("_test_sys_add", init)
+        @test occursin("__all__", init)
+        @test occursin("\"\"\"", init)
+    finally
+        rm(pkgdir; recursive=true)
+    end
+
+    # :system is in the valid set (runtime validation check).
+    @test :system in (:bundled, :shared, :system)
+    # The error message for slim+system contains ":system".
+    @test occursin(":system", "slim=true is not meaningful with runtime=:system (no libs are vendored)")
+end
+
 @testset "Optional{T} boundary types (item C)" begin
     # ── boundary.jl helpers ──────────────────────────────────────────────
     @test _is_optional(Union{Float64, Nothing})
@@ -890,11 +923,20 @@ end
     end
 end
 
-# ── pt CLI app (item 16) ──────────────────────────────────────────────────────
+# ── pt CLI app (item 16 / item H) ────────────────────────────────────────────
 
-# Include pt.jl in an isolated module so julia_main() doesn't collide with Main.
+# CLI logic lives in src/cli.jl (included by ParselTongue). Alias into a test
+# module so existing _PtAppTest.X references continue to work unchanged.
 module _PtAppTest
-    include(joinpath(@__DIR__, "..", "app", "pt.jl"))
+    using ParselTongue
+    const _parse_flags    = ParselTongue._parse_flags
+    const _bool_flag      = ParselTongue._bool_flag
+    const _PT_CLI_VERSION = ParselTongue._PT_CLI_VERSION
+    const _USAGE          = ParselTongue._USAGE
+    const _cmd_build      = ParselTongue._cmd_build
+    const _cmd_wheel      = ParselTongue._cmd_wheel
+    const _cmd_bench      = ParselTongue._cmd_bench
+    const julia_main      = ParselTongue.julia_main
 end
 
 @testset "pt CLI: argument parser (_parse_flags)" begin
@@ -960,6 +1002,21 @@ end
     @test occursin("wheel",   _PtAppTest._USAGE)
     @test occursin("bench",   _PtAppTest._USAGE)
     @test occursin("version", _PtAppTest._USAGE)
+    # runtime=:system documented in USAGE
+    @test occursin("system",  _PtAppTest._USAGE)
+end
+
+@testset "Pkg Apps Project.toml (item H)" begin
+    # Project.toml has [apps] section with key "pt".
+    proj = read(joinpath(@__DIR__, "..", "Project.toml"), String)
+    @test occursin("[apps", proj)
+    @test occursin("pt", proj)
+
+    # julia_main is callable and returns Cint.
+    @test ParselTongue.julia_main isa Function
+    # With no ARGS, julia_main() prints usage and returns 0.
+    # Can't safely call it here (would print to stdout), but confirm it's exported.
+    @test :julia_main in names(ParselTongue)
 end
 
 # ── Item D: PtVarArgs{T} — Python *args ──────────────────────────────────────

@@ -58,6 +58,11 @@ Returns the path to the `.whl`.
   extension wheels. The extension's `__init__.py` sets `LD_LIBRARY_PATH` to point at
   the runtime package's `julia/lib` dirs before importing the extension `.so`.
   Build the runtime wheel with [`build_runtime_wheel`](@ref).
+- `:system` — the wheel is tiny (~1 MB) and has no runtime dependency; the extension
+  locates Julia at import time via `JULIA_BINDIR` or `JULIA_PREFIX` environment
+  variables, or by querying `julia` on `PATH`. **Requires Julia ≥ 1.12 to be
+  installed on the target machine.** Suitable for teams that already use Julia
+  alongside Python.
 
 When `slim=true` the bundled Julia runtime is trimmed to only the libraries that the
 extension `.so` actually needs (via `readelf -d` BFS), reducing wheel size from ~100 MB
@@ -89,10 +94,10 @@ function build_wheel(user_path::AbstractString;
                      slim::Bool=false,
                      keep_build::Bool=false,
                      verbose::Bool=false)
-    runtime in (:bundled, :shared) ||
-        error("ParselTongue: runtime must be :bundled or :shared, got :$runtime")
-    slim && runtime === :shared &&
-        error("ParselTongue: slim=true is not meaningful with runtime=:shared (no libs are vendored)")
+    runtime in (:bundled, :shared, :system) ||
+        error("ParselTongue: runtime must be :bundled, :shared, or :system, got :$runtime")
+    slim && runtime !== :bundled &&
+        error("ParselTongue: slim=true is not meaningful with runtime=:$runtime (no libs are vendored)")
 
     user_path = abspath(user_path)
     # Include the user source once to resolve the module name and populate the export
@@ -120,7 +125,7 @@ function build_wheel(user_path::AbstractString;
     ext_name = string("_", mod)
     origin = Sys.isapple() ? "@loader_path" : "\$ORIGIN"
     rpaths = runtime === :bundled ?
-        ["$origin/julia/lib", "$origin/julia/lib/julia"] : String[]
+        ["$origin/julia/lib", "$origin/julia/lib/julia"] : String[]   # :shared/:system: no rpaths
     so = build_extension(user_path;
                          mod_name=ext_name, outdir=pkgdir, trim, python, abi3,
                          runtime_rpaths=rpaths,
@@ -149,8 +154,10 @@ function build_wheel(user_path::AbstractString;
     # 3. __init__.py + per-submodule re-export files.
     if runtime === :bundled
         _write_pkg_pyfiles(pkgdir, ext_name, exports)
-    else
+    elseif runtime === :shared
         _write_shared_pkg_pyfiles(pkgdir, ext_name, exports, mod)
+    else  # :system
+        _write_system_pkg_pyfiles(pkgdir, ext_name, exports, mod)
     end
 
     # 4. dist-info metadata.
@@ -166,7 +173,7 @@ function build_wheel(user_path::AbstractString;
     whl_name = string(mod, "-", version, "-", tag, ".whl")
     whl_path = joinpath(abspath(outdir), whl_name)
     _pack_wheel(python, stage, whl_path, string(mod, "-", version, ".dist-info"))
-    verbose && @info "ParselTongue: built wheel $whl_path (runtime=$runtime)"
+    verbose && @info "ParselTongue: built wheel $whl_path (runtime=$runtime, size=$(stat(whl_path).size÷1024) KB)"
     return whl_path
 end
 
@@ -426,6 +433,77 @@ def _preload():
 $preload_body
 _preload()
 del _preload, _ilu, _os
+$(imports_str)$(submod_str)$(all_str)"""
+
+    write(joinpath(pkgdir, "__init__.py"), lstrip(init_py))
+
+    for s in subs
+        names = [e.export_name for e in exports if e.submodule == s]
+        write(joinpath(pkgdir, string(s, ".py")),
+              string("\"\"\"", s, " submodule.\"\"\"\n",
+                     "from .", ext_name, " import (", join(names, ", "), ")\n",
+                     "__all__ = [", join(("\"$n\"" for n in names), ", "), "]\n"))
+    end
+    return nothing
+end
+
+# Write __init__.py for a system-runtime extension wheel.
+# Locates Julia on the target machine at import time via env vars or PATH.
+# Linux: sets LD_LIBRARY_PATH; macOS: ctypes.CDLL preload (same as :shared).
+function _write_system_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractString,
+                                   exports::AbstractVector{PtExport}, mod::AbstractString)
+    subs = submodule_names(exports)
+    toplevel = [e.export_name for e in exports if isempty(e.submodule)]
+    allnames = vcat(toplevel, subs)
+
+    imports_str = isempty(toplevel) ? "" :
+        "from .$ext_name import ($(join(toplevel, ", ")))\n"
+    submod_str = join(("from . import $s  # noqa: F401\n" for s in subs), "")
+    all_str = "__all__ = [$(join(("\"$n\"" for n in allnames), ", "))]\n"
+
+    preload_body = if Sys.isapple()
+        """    import ctypes as _ct, glob as _gl
+    for _lib in sorted(_gl.glob(_os.path.join(_l1, '*.dylib'))) + \\
+                sorted(_gl.glob(_os.path.join(_l2, '*.dylib'))):
+        try: _ct.CDLL(_lib, _ct.RTLD_GLOBAL)
+        except OSError: pass"""
+    else
+        """    _prev = _os.environ.get('LD_LIBRARY_PATH', '')
+    _os.environ['LD_LIBRARY_PATH'] = ':'.join(x for x in (_l1, _l2, _prev) if x)"""
+    end
+
+    init_py = """
+\"\"\"$mod — built with ParselTongue. Requires Julia ≥ 1.12 on the system.\"\"\"
+import os as _os, shutil as _sh
+def _preload():
+    def _find_libdirs():
+        _d = _os.environ.get('JULIA_BINDIR')
+        if _d and _os.path.isdir(_d):
+            _b = _os.path.normpath(_os.path.join(_d, '..'))
+            return _os.path.join(_b, 'lib'), _os.path.join(_b, 'lib', 'julia')
+        _p = _os.environ.get('JULIA_PREFIX')
+        if _p and _os.path.isdir(_p):
+            return _os.path.join(_p, 'lib'), _os.path.join(_p, 'lib', 'julia')
+        _j = _sh.which('julia')
+        if _j:
+            try:
+                import subprocess as _sp
+                _d2 = _sp.check_output(
+                    [_j, '-e', 'print(Sys.BINDIR)'],
+                    stderr=_sp.DEVNULL, timeout=30).decode().strip()
+                if _d2:
+                    _b = _os.path.normpath(_os.path.join(_d2, '..'))
+                    return _os.path.join(_b, 'lib'), _os.path.join(_b, 'lib', 'julia')
+            except Exception:
+                pass
+        raise ImportError(
+            '$mod: Julia not found. Set JULIA_BINDIR or JULIA_PREFIX, '
+            "or install Julia and add it to PATH. "
+            "See https://julialang.org/downloads/")
+    _l1, _l2 = _find_libdirs()
+$preload_body
+_preload()
+del _preload, _os, _sh
 $(imports_str)$(submod_str)$(all_str)"""
 
     write(joinpath(pkgdir, "__init__.py"), lstrip(init_py))

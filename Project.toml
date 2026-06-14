@@ -1,20 +1,15 @@
 name = "ParselTongue"
 uuid = "f960a036-e00a-43bb-b834-c57a5ea23a66"
 authors = ["el_oso"]
-version = "0.21.0"
+version = "0.23.0"
+[sources]
+TypeContracts = {url = "https://github.com/el-oso/TypeContracts.jl", rev = "master"}
 
 [deps]
 TypeContracts = "c7a3f1e2-84b5-4d69-9e0a-1f2b3c4d5e6f"
 
+[apps.pt]
+
 [compat]
 TypeContracts = "0.12"
 julia = "1.12"
-
-[extras]
-Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
-
-[sources]
-TypeContracts = {url = "https://github.com/el-oso/TypeContracts.jl", rev = "master"}
-
-[targets]
-test = ["Test"]
