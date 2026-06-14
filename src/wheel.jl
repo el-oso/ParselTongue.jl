@@ -22,9 +22,27 @@
 # *fatally* dlopen those libraries even when the user's code never uses them.
 # (A future optimisation would suppress those unused inits and shrink the bundle.)
 # Matches both Linux (.so) and macOS (.dylib) variants of libs we never bundle.
-const _SKIP_LIB = r"^(sys\.(so|dylib)|libLLVM|libjulia-codegen|libccalltest|libllvmcalltest|libccalllazybar)"
+const _SKIP_LIB = r"^(sys\.(so|dylib|dll)|libLLVM|libjulia-codegen|libccalltest|libllvmcalltest|libccalllazybar)"
 
-_is_dynlib(name::AbstractString) = occursin(".so", name) || occursin(".dylib", name)
+_is_dynlib(name::AbstractString) =
+    occursin(".so", name) || occursin(".dylib", name) || endswith(name, ".dll")
+
+# Current OS identifier used to select __init__.py preload strategy.
+# Parameterisable so tests can exercise non-host branches without a real Windows build.
+_current_os_kernel() = Sys.iswindows() ? :windows : Sys.isapple() ? :apple : :linux
+
+# Copy every .dll in Julia's bin/ directory (Windows) into `dstdir`.
+function _vendor_libs_win(srcdir::AbstractString, dstdir::AbstractString)
+    mkpath(dstdir)
+    n = 0
+    for name in readdir(srcdir)
+        endswith(name, ".dll") || continue
+        occursin(_SKIP_LIB, name) && continue
+        cp(joinpath(srcdir, name), joinpath(dstdir, name); follow_symlinks=false, force=true)
+        n += 1
+    end
+    n
+end
 
 # Copy every shared-library entry in `srcdir` (skipping `_SKIP_LIB`) into `dstdir`,
 # preserving symlink chains so any soname/install-name resolves.
@@ -121,11 +139,12 @@ function build_wheel(user_path::AbstractString;
     # 1. Build the extension as the internal submodule `_<mod>`.
     #    Bundled: embed relative rpaths so the .so finds the vendored libs.
     #      Linux: $ORIGIN (re-read per dlopen); macOS: @loader_path (resolved by dyld).
-    #    Shared: no rpaths; resolution happens via preloading at import time.
+    #      Windows: no rpaths — DLLs found via add_dll_directory in __init__.py.
+    #    Shared/System: no rpaths; resolution happens via preloading at import time.
     ext_name = string("_", mod)
     origin = Sys.isapple() ? "@loader_path" : "\$ORIGIN"
-    rpaths = runtime === :bundled ?
-        ["$origin/julia/lib", "$origin/julia/lib/julia"] : String[]   # :shared/:system: no rpaths
+    rpaths = (runtime === :bundled && !Sys.iswindows()) ?
+        ["$origin/julia/lib", "$origin/julia/lib/julia"] : String[]
     so = build_extension(user_path;
                          mod_name=ext_name, outdir=pkgdir, trim, python, abi3,
                          runtime_rpaths=rpaths,
@@ -134,30 +153,44 @@ function build_wheel(user_path::AbstractString;
 
     # 2. Vendor the Julia runtime (bundled only).
     if runtime === :bundled
-        libsrc = abspath(joinpath(Sys.BINDIR, "..", "lib"))
-        libsrc_julia = joinpath(libsrc, "julia")
-        dst_lib      = joinpath(pkgdir, "julia", "lib")
-        dst_lib_j    = joinpath(pkgdir, "julia", "lib", "julia")
-        if slim
-            # BFS over DT_NEEDED from the compiled .so; only vendor what's reachable.
-            lib_dirs = [libsrc, libsrc_julia]
-            needed   = _transitive_needed(so, lib_dirs)
-            verbose && @info "ParselTongue: slim=true — vendoring $(length(needed)) libs (of $(length(readdir(libsrc_julia))) total)"
-            _vendor_libs_smart(libsrc,       dst_lib,   needed)
-            _vendor_libs_smart(libsrc_julia, dst_lib_j, needed)
+        if Sys.iswindows()
+            # On Windows, Julia DLLs live in bin/ (not lib/).
+            binsrc  = String(Sys.BINDIR)
+            dst_bin = joinpath(pkgdir, "julia", "bin")
+            if slim
+                needed = _transitive_needed(so, [binsrc])
+                verbose && @info "ParselTongue: slim=true — vendoring $(length(needed)) DLLs"
+                _vendor_libs_smart(binsrc, dst_bin, needed)
+            else
+                _vendor_libs_win(binsrc, dst_bin)
+            end
         else
-            _vendor_libs(libsrc,       dst_lib)
-            _vendor_libs(libsrc_julia, dst_lib_j)
+            libsrc = abspath(joinpath(Sys.BINDIR, "..", "lib"))
+            libsrc_julia = joinpath(libsrc, "julia")
+            dst_lib      = joinpath(pkgdir, "julia", "lib")
+            dst_lib_j    = joinpath(pkgdir, "julia", "lib", "julia")
+            if slim
+                # BFS over DT_NEEDED from the compiled .so; only vendor what's reachable.
+                lib_dirs = [libsrc, libsrc_julia]
+                needed   = _transitive_needed(so, lib_dirs)
+                verbose && @info "ParselTongue: slim=true — vendoring $(length(needed)) libs (of $(length(readdir(libsrc_julia))) total)"
+                _vendor_libs_smart(libsrc,       dst_lib,   needed)
+                _vendor_libs_smart(libsrc_julia, dst_lib_j, needed)
+            else
+                _vendor_libs(libsrc,       dst_lib)
+                _vendor_libs(libsrc_julia, dst_lib_j)
+            end
         end
     end
 
+    os_k = _current_os_kernel()
     # 3. __init__.py + per-submodule re-export files.
     if runtime === :bundled
-        _write_pkg_pyfiles(pkgdir, ext_name, exports)
+        _write_pkg_pyfiles(pkgdir, ext_name, exports; _os_kernel=os_k)
     elseif runtime === :shared
-        _write_shared_pkg_pyfiles(pkgdir, ext_name, exports, mod)
+        _write_shared_pkg_pyfiles(pkgdir, ext_name, exports, mod; _os_kernel=os_k)
     else  # :system
-        _write_system_pkg_pyfiles(pkgdir, ext_name, exports, mod)
+        _write_system_pkg_pyfiles(pkgdir, ext_name, exports, mod; _os_kernel=os_k)
     end
 
     # 4. dist-info metadata.
@@ -181,12 +214,25 @@ end
 # single compiled extension `ext_name` (which holds every function). Top-level
 # functions (no submodule) are exposed on the package itself.
 function _write_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractString,
-                            exports::AbstractVector{PtExport})
+                            exports::AbstractVector{PtExport};
+                            _os_kernel::Symbol=_current_os_kernel())
     subs = submodule_names(exports)
     toplevel = [e.export_name for e in exports if isempty(e.submodule)]
 
     io = IOBuffer()
     println(io, "\"\"\"Built with ParselTongue (juliac --trim).\"\"\"")
+    if _os_kernel === :windows
+        # On Windows, $ORIGIN rpaths don't exist. Add the bundled julia/bin to the
+        # DLL search path before importing the extension so libjulia*.dll is found.
+        println(io, "import os as _os")
+        println(io, "_d = _os.path.dirname(_os.path.abspath(__file__))")
+        println(io, "_bin = _os.path.join(_d, 'julia', 'bin')")
+        println(io, "if hasattr(_os, 'add_dll_directory'):")
+        println(io, "    _os.add_dll_directory(_bin)")
+        println(io, "else:")
+        println(io, "    _os.environ['PATH'] = _bin + ';' + _os.environ.get('PATH', '')")
+        println(io, "del _os, _d, _bin")
+    end
     isempty(toplevel) || println(io, "from .", ext_name, " import (", join(toplevel, ", "), ")")
     for s in subs
         println(io, "from . import ", s, "  # noqa: F401")
@@ -371,9 +417,14 @@ function build_runtime_wheel(;
     stage = mktempdir(; prefix="ptruntime_", cleanup=true)
     pkgdir = joinpath(stage, mod); mkpath(pkgdir)
 
-    libsrc = abspath(joinpath(Sys.BINDIR, "..", "lib"))
-    _vendor_libs(libsrc, joinpath(pkgdir, "julia", "lib"))
-    _vendor_libs(joinpath(libsrc, "julia"), joinpath(pkgdir, "julia", "lib", "julia"))
+    if Sys.iswindows()
+        # On Windows, Julia DLLs are in bin/ rather than lib/ and lib/julia/.
+        _vendor_libs_win(String(Sys.BINDIR), joinpath(pkgdir, "julia", "bin"))
+    else
+        libsrc = abspath(joinpath(Sys.BINDIR, "..", "lib"))
+        _vendor_libs(libsrc, joinpath(pkgdir, "julia", "lib"))
+        _vendor_libs(joinpath(libsrc, "julia"), joinpath(pkgdir, "julia", "lib", "julia"))
+    end
 
     write(joinpath(pkgdir, "__init__.py"), _RUNTIME_INIT_PY)
 
@@ -395,7 +446,8 @@ end
 # macOS: uses ctypes.CDLL to preload Julia dylibs globally before import
 #   (DYLD_LIBRARY_PATH is not re-read after process start, so env-var trick fails).
 function _write_shared_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractString,
-                                   exports::AbstractVector{PtExport}, mod::AbstractString)
+                                   exports::AbstractVector{PtExport}, mod::AbstractString;
+                                   _os_kernel::Symbol=_current_os_kernel())
     subs = submodule_names(exports)
     toplevel = [e.export_name for e in exports if isempty(e.submodule)]
     allnames = vcat(toplevel, subs)
@@ -405,20 +457,39 @@ function _write_shared_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractStr
     submod_str = join(("from . import $s  # noqa: F401\n" for s in subs), "")
     all_str = "__all__ = [$(join(("\"$n\"" for n in allnames), ", "))]\n"
 
-    preload_body = if Sys.isapple()
-        # ctypes global-load every *.dylib in the runtime package's lib dirs.
-        """    import ctypes as _ct, glob as _gl
+    init_py = if _os_kernel === :windows
+        # Windows: parseltongue_runtime vendors DLLs in julia/bin/; add that dir.
+        """\"\"\"$mod — built with ParselTongue. Requires parseltongue-runtime.\"\"\"
+import importlib.util as _ilu, os as _os
+def _preload():
+    _s = _ilu.find_spec('parseltongue_runtime')
+    if _s is None:
+        raise ImportError(
+            '$mod requires parseltongue-runtime. Install with:\\n'
+            '  pip install parseltongue-runtime'
+        )
+    _rt = _os.path.dirname(_s.origin)
+    _bin = _os.path.join(_rt, 'julia', 'bin')
+    if hasattr(_os, 'add_dll_directory'):
+        _os.add_dll_directory(_bin)
+    else:
+        _os.environ['PATH'] = _bin + ';' + _os.environ.get('PATH', '')
+_preload()
+del _preload, _ilu, _os
+$(imports_str)$(submod_str)$(all_str)"""
+    else
+        preload_body = if _os_kernel === :apple
+            # ctypes global-load every *.dylib in the runtime package's lib dirs.
+            """    import ctypes as _ct, glob as _gl
     for _lib in sorted(_gl.glob(_os.path.join(_l1, '*.dylib'))) + \\
                 sorted(_gl.glob(_os.path.join(_l2, '*.dylib'))):
         try: _ct.CDLL(_lib, _ct.RTLD_GLOBAL)
         except OSError: pass"""
-    else
-        """    _prev = _os.environ.get('LD_LIBRARY_PATH', '')
+        else
+            """    _prev = _os.environ.get('LD_LIBRARY_PATH', '')
     _os.environ['LD_LIBRARY_PATH'] = ':'.join(x for x in (_l1, _l2, _prev) if x)"""
-    end
-
-    init_py = """
-\"\"\"$mod — built with ParselTongue. Requires parseltongue-runtime.\"\"\"
+        end
+        """\"\"\"$mod — built with ParselTongue. Requires parseltongue-runtime.\"\"\"
 import importlib.util as _ilu, os as _os
 def _preload():
     _s = _ilu.find_spec('parseltongue_runtime')
@@ -434,8 +505,9 @@ $preload_body
 _preload()
 del _preload, _ilu, _os
 $(imports_str)$(submod_str)$(all_str)"""
+    end
 
-    write(joinpath(pkgdir, "__init__.py"), lstrip(init_py))
+    write(joinpath(pkgdir, "__init__.py"), init_py)
 
     for s in subs
         names = [e.export_name for e in exports if e.submodule == s]
@@ -451,7 +523,8 @@ end
 # Locates Julia on the target machine at import time via env vars or PATH.
 # Linux: sets LD_LIBRARY_PATH; macOS: ctypes.CDLL preload (same as :shared).
 function _write_system_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractString,
-                                   exports::AbstractVector{PtExport}, mod::AbstractString)
+                                   exports::AbstractVector{PtExport}, mod::AbstractString;
+                                   _os_kernel::Symbol=_current_os_kernel())
     subs = submodule_names(exports)
     toplevel = [e.export_name for e in exports if isempty(e.submodule)]
     allnames = vcat(toplevel, subs)
@@ -461,19 +534,53 @@ function _write_system_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractStr
     submod_str = join(("from . import $s  # noqa: F401\n" for s in subs), "")
     all_str = "__all__ = [$(join(("\"$n\"" for n in allnames), ", "))]\n"
 
-    preload_body = if Sys.isapple()
-        """    import ctypes as _ct, glob as _gl
+    init_py = if _os_kernel === :windows
+        # Windows: find Julia's bin/ dir (holds all DLLs) and add it via add_dll_directory.
+        """\"\"\"$mod — built with ParselTongue. Requires Julia ≥ 1.12 on the system.\"\"\"
+import os as _os, shutil as _sh
+def _preload():
+    def _find_julia_bin():
+        _d = _os.environ.get('JULIA_BINDIR')
+        if _d and _os.path.isdir(_d):
+            return _d
+        _p = _os.environ.get('JULIA_PREFIX')
+        if _p and _os.path.isdir(_p):
+            return _os.path.join(_p, 'bin')
+        _j = _sh.which('julia')
+        if _j:
+            try:
+                import subprocess as _sp
+                _d2 = _sp.check_output(
+                    [_j, '-e', 'print(Sys.BINDIR)'],
+                    stderr=_sp.DEVNULL, timeout=30).decode().strip()
+                if _d2:
+                    return _d2
+            except Exception:
+                pass
+        raise ImportError(
+            '$mod: Julia not found. Set JULIA_BINDIR or JULIA_PREFIX, '
+            "or install Julia and add it to PATH. "
+            "See https://julialang.org/downloads/")
+    _bin = _find_julia_bin()
+    if hasattr(_os, 'add_dll_directory'):
+        _os.add_dll_directory(_bin)
+    else:
+        _os.environ['PATH'] = _bin + ';' + _os.environ.get('PATH', '')
+_preload()
+del _preload, _os, _sh
+$(imports_str)$(submod_str)$(all_str)"""
+    else
+        preload_body = if _os_kernel === :apple
+            """    import ctypes as _ct, glob as _gl
     for _lib in sorted(_gl.glob(_os.path.join(_l1, '*.dylib'))) + \\
                 sorted(_gl.glob(_os.path.join(_l2, '*.dylib'))):
         try: _ct.CDLL(_lib, _ct.RTLD_GLOBAL)
         except OSError: pass"""
-    else
-        """    _prev = _os.environ.get('LD_LIBRARY_PATH', '')
+        else
+            """    _prev = _os.environ.get('LD_LIBRARY_PATH', '')
     _os.environ['LD_LIBRARY_PATH'] = ':'.join(x for x in (_l1, _l2, _prev) if x)"""
-    end
-
-    init_py = """
-\"\"\"$mod — built with ParselTongue. Requires Julia ≥ 1.12 on the system.\"\"\"
+        end
+        """\"\"\"$mod — built with ParselTongue. Requires Julia ≥ 1.12 on the system.\"\"\"
 import os as _os, shutil as _sh
 def _preload():
     def _find_libdirs():
@@ -505,8 +612,9 @@ $preload_body
 _preload()
 del _preload, _os, _sh
 $(imports_str)$(submod_str)$(all_str)"""
+    end
 
-    write(joinpath(pkgdir, "__init__.py"), lstrip(init_py))
+    write(joinpath(pkgdir, "__init__.py"), init_py)
 
     for s in subs
         names = [e.export_name for e in exports if e.submodule == s]
@@ -519,6 +627,17 @@ $(imports_str)$(submod_str)$(all_str)"""
 end
 
 # ── Slim vendoring (item 9) ────────────────────────────────────────────
+
+# Parse `objdump -p` output for imported DLL names (Windows / MinGW-w64).
+# Requires objdump on PATH (present in MinGW-w64 toolchain).
+function _objdump_needed(so_path::AbstractString)
+    needed = String[]
+    for line in eachline(ignorestatus(`objdump -p $so_path`))
+        m = match(r"^\s+DLL Name: (.+)$", line)
+        m !== nothing && push!(needed, strip(m.captures[1]))
+    end
+    return needed
+end
 
 # Return the DT_NEEDED sonames listed in `so_path` (requires `readelf` on PATH).
 function _readelf_needed(so_path::AbstractString)
@@ -546,9 +665,11 @@ end
 _otool_needed(so_path::AbstractString) =
     _parse_otool_output(collect(eachline(ignorestatus(`otool -L $so_path`))))
 
-# Platform dispatch: DT_NEEDED on Linux, LC_LOAD_DYLIB on macOS.
+# Platform dispatch: DT_NEEDED on Linux, LC_LOAD_DYLIB on macOS, ImportTable on Windows.
 _dynlib_needed(so_path::AbstractString) =
-    Sys.isapple() ? _otool_needed(so_path) : _readelf_needed(so_path)
+    Sys.isapple()   ? _otool_needed(so_path)   :
+    Sys.iswindows() ? _objdump_needed(so_path)  :
+    _readelf_needed(so_path)
 
 # Resolve a soname to an on-disk path by searching `lib_dirs` in order.
 # Returns `nothing` if not found in any of the search dirs.

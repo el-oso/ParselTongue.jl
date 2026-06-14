@@ -145,10 +145,12 @@ end
 _default_mod_name(p) = first(split(basename(p), '.'))
 _is_valid_modname(s) = occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", s)
 
-# Query Python's importlib for the abi3 extension suffix (`.abi3.so` on Linux/macOS).
-# Falls back to `.abi3.so` if the interpreter reports none (e.g. on Windows, TBD).
+# Query Python's importlib for the abi3 extension suffix.
+# On POSIX: '.abi3.so'; on Windows there is no 'abi3' in EXTENSION_SUFFIXES, fall back to '.pyd'.
 function _abi3_ext_suffix(python::AbstractString)
-    script = "import importlib.machinery as m; s=next((x for x in m.EXTENSION_SUFFIXES if 'abi3' in x),None); print(s or '.abi3.so')"
+    script = "import importlib.machinery as m, sys; " *
+             "s = next((x for x in m.EXTENSION_SUFFIXES if 'abi3' in x), None); " *
+             "print(s or ('.pyd' if sys.platform == 'win32' else '.abi3.so'))"
     return readchomp(`$python -c $script`)
 end
 
@@ -178,8 +180,18 @@ function _link_extension(t::BuildTools, cpath::AbstractString, img::AbstractStri
     cc = _find_cc()
     pyinc = t.py_includes
     rpath_flags = [string("-Wl,-rpath,", rp) for rp in runtime_rpaths]
-    # Extension modules must NOT link libpython (the interpreter provides the symbols).
-    if Sys.isapple()
+    # Extension modules must NOT link libpython on Unix (the interpreter provides
+    # the symbols). On Windows, Python symbols must be linked explicitly.
+    if Sys.iswindows()
+        # Windows / MinGW-w64. No rpaths — DLL search handled by __init__.py
+        # add_dll_directory. Link Python DLL explicitly. MSVC not yet supported.
+        pylibs = _py_lib_flags(t.python)
+        cmd = `$cc -shared $cpath $pyinc
+               -Wl,--whole-archive $img -Wl,--no-whole-archive
+               $(t.cflags) $(t.ldflags) $(t.ldlibs) -ljulia-internal
+               $pylibs
+               -o $so_path`
+    elseif Sys.isapple()
         # macOS: julia-config may emit `-rpath /abs` (no -Wl,) or `-Wl,-rpath,/abs`.
         _is_rpath(f) = startswith(f, "-Wl,-rpath") || startswith(f, "-rpath")
         ldflags = strip_abs_rpath ? filter(!_is_rpath, t.ldflags) : t.ldflags
@@ -192,9 +204,8 @@ function _link_extension(t::BuildTools, cpath::AbstractString, img::AbstractStri
                $rpath_flags
                -o $so_path`
     else
-        # For a relocatable wheel we drop the absolute `-rpath`s julia-config bakes in
-        # and add our own `$ORIGIN`-relative ones (the bundled libs find each other via
-        # their existing RUNPATHs once the relative layout is preserved).
+        # Linux: drop absolute rpaths julia-config bakes in; add our own $ORIGIN-relative
+        # ones so the bundled libs resolve each other via their existing RUNPATHs.
         ldflags = strip_abs_rpath ? filter(f -> !startswith(f, "-Wl,-rpath"), t.ldflags) : t.ldflags
         ldlibs  = strip_abs_rpath ? filter(f -> !startswith(f, "-Wl,-rpath"), t.ldlibs)  : t.ldlibs
         cmd = `$cc -shared -fPIC $cpath $pyinc
@@ -214,8 +225,30 @@ end
 function _find_cc()
     cc = get(ENV, "JULIA_CC", get(ENV, "CC", nothing))
     cc !== nothing && return Cmd(Base.shell_split(cc))
+    if Sys.iswindows()
+        # Prefer MinGW-w64 GCC; MSVC (cl.exe) is not yet supported.
+        for c in ("gcc", "x86_64-w64-mingw32-gcc", "clang")
+            Sys.which(c) !== nothing && return `$c`
+        end
+        error("ParselTongue: no C compiler found on Windows. " *
+              "Install MinGW-w64 (via MSYS2 or Julia's bundled toolchain) " *
+              "and ensure gcc is on PATH, or set JULIA_CC.")
+    end
     for c in ("cc", "gcc", "clang")
         Sys.which(c) !== nothing && return `$c`
     end
     error("ParselTongue: no C compiler found (looked for cc, gcc, clang).")
+end
+
+# On Windows, extension modules must link the Python DLL explicitly at link time
+# (there is no -undefined dynamic_lookup equivalent). On Unix the interpreter
+# provides all Python-API symbols at load time via the process's symbol table.
+# Returns ["-L<libs_dir>", "-l<pythonXY>"] on Windows; String[] on Unix.
+function _py_lib_flags(python::AbstractString)
+    Sys.iswindows() || return String[]
+    script = "import sys; v=f'{sys.version_info.major}{sys.version_info.minor}'; " *
+             "print(sys.prefix+'/libs'); print('python'+v)"
+    parts = readlines(`$python -c $script`)
+    length(parts) >= 2 || return String[]
+    ["-L" * strip(parts[1]), "-l" * strip(parts[2])]
 end

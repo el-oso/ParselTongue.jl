@@ -9,24 +9,37 @@ runs one build command, and gets an importable module or a self-contained, pip-i
 ## Commands
 
 ```bash
-# Instantiate (the sole dep, TypeContracts, is an unregistered sibling at ../TypeContracts).
-# The Manifest already dev's it; if resolving from scratch:
-julia --project=. -e 'using Pkg; Pkg.develop(path="../TypeContracts"); Pkg.instantiate()'
+# Instantiate — TypeContracts is resolved via the [sources] URL in Project.toml.
+julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
-# Run the full test suite (unit + an end-to-end build/import; ~15s)
+# Run the full test suite (unit + an end-to-end build/import; ~20s)
 julia --project=. test/runtests.jl
 #   or: julia --project=. -e 'using Pkg; Pkg.test()'
 
-# Run only the fast, build-free unit tests
+# Run only the fast, build-free unit tests (~2s)
 julia --project=. test/test_m2_boundary_macros.jl
 
 # Build an extension / wheel by hand (what the tests and examples do)
 julia --project=. -e 'using ParselTongue; build_extension("examples/mathx/mathx.jl"; outdir="build")'
 julia --project=. -e 'using ParselTongue; build_wheel("examples/mathx/mathx.jl"; outdir="dist")'
 
-# Verify a wheel is self-contained: import it with NO Julia in the environment
+# Slim wheel (~38 MB instead of ~100 MB; safe for extensions without stdlib JLLs)
+julia --project=. -e 'using ParselTongue; build_wheel("examples/mathx/mathx.jl"; slim=true, outdir="dist")'
+
+# System-runtime wheel (~1 MB; requires Julia on target machine)
+julia --project=. -e 'using ParselTongue; build_wheel("examples/mathx/mathx.jl"; runtime=:system, outdir="dist")'
+
+# Verify a bundled wheel is self-contained: import it with NO Julia in the environment
 python3 -c "import zipfile,glob; zipfile.ZipFile(glob.glob('dist/mathx-*.whl')[0]).extractall('/tmp/x')"
 env -i HOME="$HOME" PATH="/usr/bin:/bin" PYTHONPATH=/tmp/x python3 -c "import mathx; print(mathx.add(40,2))"
+
+# Use the pt CLI (runs interpreted; no compile step)
+julia --project=. app/pt.jl build examples/mathx/mathx.jl --outdir=build
+julia --project=. app/pt.jl wheel examples/mathx/mathx.jl --runtime=system --outdir=dist
+
+# Install pt as a Pkg App (Julia 1.12+; installs shim at ~/.julia/bin/pt)
+julia -e 'using Pkg; Pkg.Apps.develop(path=".")'
+# then: pt build examples/mathx/mathx.jl
 
 # Build the docs (DocumenterVitepress; needs node/npm). Output in docs/build/
 julia --project=docs -e 'using Pkg; Pkg.instantiate()'
@@ -42,20 +55,24 @@ A single `build_extension`/`build_wheel` call runs this pipeline; understanding 
 reading `src/build.jl`, `src/macros.jl`, `src/ccallable_gen.jl`, and `src/cshim.jl` together:
 
 ```
-user .jl with @pyfunc
-  └─ macros.jl     records each export's signature into the build-host registry _EXPORTS
+user .jl with @pyfunc / @pymodule / @pyerror / @pyhandle
+  └─ macros.jl     records each export's signature into _EXPORTS; errors into _ERRORS
 build_extension (build.jl):
-  ├─ include the user file in a sandbox module → populates _EXPORTS
+  ├─ include the user file in a sandbox module → populates _EXPORTS, _ERRORS
   ├─ ccallable_gen.jl  emits a _pt_entry.jl: `using ParselTongue`, include(user), and a
   │                    Base.@ccallable wrapper per export (args/returns are C-ABI carriers)
   ├─ run juliac --output-lib --experimental --trim=safe  → img.a  (trimmed object archive)
   ├─ cshim.jl      emits _<mod>module.c from the SAME export metadata: PyInit_<mod>, a
-  │                PyObject↔C wrapper per function, the method table, struct typedefs
-  └─ cc -shared: link the C shim + img.a + libjulia → <mod>.<EXT_SUFFIX>.so (one self-contained module)
+  │                PyObject↔C wrapper per function, the method table, struct typedefs,
+  │                custom exception globals (from _ERRORS), capsule destructor for handles
+  └─ cc -shared: link the C shim + img.a + libjulia → <mod>.<EXT_SUFFIX>.so
 build_wheel (wheel.jl) additionally:
   ├─ builds the extension as the internal submodule `_<mod>` with $ORIGIN-relative rpaths
-  ├─ vendors the Julia runtime into <mod>/julia/lib[/julia] preserving the original layout
-  └─ writes __init__.py + dist-info; a generated Python helper computes RECORD and zips the .whl
+  ├─ runtime=:bundled (default): vendors Julia runtime into <mod>/julia/lib[/julia]
+  │     slim=true: only libs reachable via DT_NEEDED BFS (~38 MB vs ~100 MB)
+  ├─ runtime=:shared: no vendoring; __init__.py loads runtime from parseltongue-runtime pkg
+  ├─ runtime=:system: no vendoring; __init__.py finds Julia on the target machine at import
+  └─ writes __init__.py + dist-info; a generated Python helper computes RECORD and zips .whl
 ```
 
 Key point: the `@ccallable` wrappers and the C shim are both generated from ParselTongue's own
@@ -65,11 +82,36 @@ and we don't need it — we generate the wrappers, so we already know every sign
 ## The boundary type system (`src/boundary.jl`)
 
 Every `@pyfunc` argument/return must be a *boundary type*, lowered to a C-ABI "carrier" via three
-functions: `c_abi_type(::Type{T})` (the carrier type, build-host only), `from_c(::Type{T}, c)`
-(carrier → native), and `to_c(x::T)` (native → carrier). v1 supports scalars, `String` (carrier
-`Cstring`), and 1-D numeric `Vector{T}` (carrier `PtBuffer{T}`). The protocol is registered as a
-`TypeContracts` `@contract` (`PyBoundary`) so a non-boundary type is rejected at build time with a
-clear message rather than a cryptic trim failure (`assert_boundary`).
+functions: `c_abi_type(::Type{T})` (the carrier type), `from_c(::Type{T}, c)` (carrier → native),
+and `to_c(x::T)` (native → carrier). Built-in boundary types:
+
+| Julia type | Python type | Carrier |
+|---|---|---|
+| Scalars (`Int8`–`Int64`, `UInt*`, `Float32/64`, `Bool`, `ComplexF32/64`) | int/float/complex | same scalar |
+| `String` | str | `Cstring` |
+| `Vector{T}` (numeric) | numpy array / memoryview | `PtArray{T,1}` |
+| `Vector{String}` | list[str] | `PtStrArray` |
+| `Dict{String,V}` | dict[str,V] | `PtDict{V}` |
+| `NamedTuple` | dict | tuple carrier |
+| `Union{T,Nothing}` | T or None | `PtOpt{C}` |
+| `PtVarArgs{T}` | *args (variadic) | `PtArray{T,1}` |
+| `PyCapsule` handle (`@pyhandle T`) | opaque capsule | `PtHandle` |
+| `PyCallable` | callable (Float64→Float64) | `Ptr{Cvoid}` |
+| User type via `@boundary T carrier=C` | depends on carrier | any existing carrier |
+
+The protocol is registered as a `TypeContracts` `@contract` (`PyBoundary`) so a non-boundary type
+is rejected at build time with a clear message rather than a cryptic trim failure (`assert_boundary`).
+
+## The CLI (`app/pt.jl`, `src/cli.jl`)
+
+`src/cli.jl` is included by `src/ParselTongue.jl` and defines `julia_main()` inside the module.
+This enables two invocation paths:
+
+1. **Interpreted** (development): `julia --project=. app/pt.jl build FILE.jl`
+   `app/pt.jl` is a 2-line wrapper: `using ParselTongue: julia_main`
+2. **Compiled binary**: `julia --project=. app/build_app.jl` → `./pt` (juliac, `--trim=unsafe`)
+3. **Pkg App** (Julia 1.12+): `julia -e 'using Pkg; Pkg.Apps.develop(path=".")` installs
+   `~/.julia/bin/pt` which runs `julia -m ParselTongue [args]` → calls `ParselTongue.julia_main()`
 
 ## Non-obvious constraints — read before changing build/runtime code
 
@@ -83,21 +125,33 @@ clear message rather than a cryptic trim failure (`assert_boundary`).
   build. Trim-safety is a *static* property — code is rejected even if the bad path is never executed.
 - **One ParselTongue extension per Python process.** Each wheel embeds its own `libjulia`; importing
   two such extensions in one process aborts (two Julia runtimes cannot coexist). Co-locate functions
-  in one `@pymodule`.
+  in one `@pymodule`. (`runtime=:shared` / `:system` extensions share one runtime and are safe to
+  combine, but only one `libjulia` can be in-process at a time.)
 - **The integration test runs the built `.so` in a *subprocess***, never in the test's own Julia — a
   second `libjulia` cannot load into the already-running runtime (`test/test_integration.jl`).
-- **Wheels bundle most of `lib/julia`**, excluding only the system image, `libLLVM`, and
-  `libjulia-codegen` (`_SKIP_LIB` in `src/wheel.jl`). The stdlib JLL `__init__`s (OpenBLAS, …) run at
-  startup and fatally dlopen their libraries even when unused, so they cannot be dropped → ~100 MB wheels.
+- **Bundled wheels include most of `lib/julia`** (~100 MB), excluding the system image, `libLLVM`,
+  and `libjulia-codegen` (`_SKIP_LIB` in `src/wheel.jl`). `slim=true` reduces this to ~38 MB via
+  DT_NEEDED BFS but breaks stdlib JLL users. `runtime=:system` / `:shared` skip vendoring entirely.
 - **Extension modules do not link `libpython`** — the interpreter provides those symbols at import.
 - **juliac requires absolute paths** for its input/output files (`build.jl` uses `abspath`).
 - **numpy is never a build dependency.** Array inputs use the buffer protocol; array returns import
   numpy at *runtime* via the generic `PyObject` API (`frombuffer`), falling back to `memoryview`.
+- **`runtime=:system` PATH fallback spawns a subprocess** (`julia -e 'print(Sys.BINDIR)'`) at first
+  import to locate juliaup-managed installations. This is slow (~2 s) but only runs once and only
+  when `JULIA_BINDIR`/`JULIA_PREFIX` are not set. CI/containers should set `JULIA_BINDIR`.
+- **Windows support targets MinGW-w64 (gcc)**. MSVC (`cl.exe`) is not yet supported. On Windows,
+  Julia DLLs live in `bin/` (not `lib/`); bundled wheels vendor from `Sys.BINDIR`. Extension
+  `.pyd` files must link the Python DLL explicitly (`_py_lib_flags`). DLL resolution uses
+  `os.add_dll_directory()` (Python 3.8+) in `__init__.py` instead of rpaths. The
+  `_current_os_kernel()` helper parameterises `__init__.py` generation so Windows paths can be
+  unit-tested on Linux by passing `_os_kernel=:windows` to the `_write_*` functions.
 
 ## Reference material
 
-- `README.md` — user-facing overview and the same limitation list.
+- `README.md` — user-facing overview and limitation list.
 - `docs/` — DocumenterVitepress site (guide + worked examples per boundary kind).
 - `spike/` — the Milestone-1 hand-built proof (`add.jl` → trimmed `.so` → `import spikemod`); a minimal
   reference for the raw juliac → PyInit flow.
 - `examples/{mathx,strx,arrx}` — scalars, strings, arrays; each builds and imports end-to-end.
+- `app/pt.jl` — thin juliac wrapper (2 lines); `app/build_app.jl` — compile the `pt` binary.
+- `src/cli.jl` — full `pt` CLI implementation; included by `src/ParselTongue.jl`.

@@ -21,9 +21,8 @@ Code map: `src/boundary.jl` (carriers + `c_abi_type`/`from_c`/`to_c`),
 
 - Full `#[pyclass]`-style objects with inheritance / dunder protocols (a *scoped*
   opaque-handle track is optional — Phase 4).
-- Callbacks into Python / passing Python callables into Julia.
 - `async`, free-threading, sub-interpreters.
-- Windows (initially — macOS first).
+- Windows (macOS shipped v0.20.0; Windows deferred — see analysis below).
 - Removing one-extension-per-process (inherent to the trim-image model; mitigated
   by `@pymodule pkg.sub` submodules, already shipped).
 
@@ -229,12 +228,12 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   **Warning**: `slim=true` breaks extensions that `using LinearAlgebra`/`SuiteSparse`
   — those JLL `__init__`s dlopen their libs at startup via `dlopen` (not DT_NEEDED),
   so those libs are absent from the transitive closure and will cause `ImportError`.
-- [x] **10. CI + distribution polish** — shipped v0.15.0.
+- [x] **10. CI + distribution polish** — shipped v0.15.0; updated v0.23.0.
   `.github/workflows/ci.yml`: single job, Julia 1.12 on ubuntu-latest; installs numpy,
-  resolves TypeContracts via `Pkg.develop(url=...)` (unregistered sibling — no `../` path
-  in CI), runs unit tests first (fast feedback), then integration tests (juliac build +
-  Python import; skips gracefully if tools absent). README updated with installation
-  instructions (`Pkg.add(url=...)` for both TypeContracts and ParselTongue) and a current
+  resolves TypeContracts via `[sources]` in `Project.toml` (URL entry replaces the old
+  `Pkg.develop(url=...)` CI workaround — `Pkg.instantiate()` suffices). Runs unit tests
+  first (fast feedback), then integration tests (juliac build + Python import; skips
+  gracefully if tools absent). README updated with installation instructions and a current
   status section. **General registry**: blocked on TypeContracts being registered in
   General first; the rest of Project.toml (UUID, compat, extras) is already correct.
   Doctest of docs examples deferred (requires node/npm). Effort M.
@@ -243,6 +242,29 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   NamedTuple with `import_ms_median/min/max` and `call_ms_median/min/max`. Integration
   test now logs latency numbers after each build. Typical: ~1–3 s import (libjulia init),
   <1 ms first call (AOT-compiled). Effort S.
+
+- [x] **G. `runtime=:system` wheel mode** *(size — ~1 MB, no bundled Julia)* — shipped v0.23.0.
+  `build_wheel(file; runtime=:system)` produces a wheel with no vendored Julia runtime (~1 MB vs
+  ~100 MB bundled). At import time, `__init__.py` locates Julia on the host via
+  `_find_libdirs()` which tries in order: `JULIA_BINDIR` env var → `JULIA_PREFIX` env var →
+  `julia` on PATH (subprocess `julia -e 'print(Sys.BINDIR)'`, handles juliaup launchers).
+  After locating the lib dirs, the preload block is identical to `:shared`: Linux sets
+  `LD_LIBRARY_PATH`; macOS loops `ctypes.CDLL(..., RTLD_GLOBAL)`. No `Requires-Dist` added
+  (Julia is a system dependency, not a pip one). Wheel tag: `py3-none-<plat>`.
+  The PATH fallback spawns a subprocess (~2 s) only once at first import; set `JULIA_BINDIR`
+  in CI and containers to skip it. Files: `src/wheel.jl` (`_write_system_pkg_pyfiles` +
+  `:system` branch); `src/cli.jl` (`--runtime=system` flag). Effort M.
+
+- [x] **H. Pkg Apps CLI — `pt` via `julia app add`** *(distribution ergonomics)* — shipped v0.23.0.
+  Julia 1.12 `Pkg.Apps` installs a shim at `~/.julia/bin/pt` that runs
+  `julia -m ParselTongue [args]` → calls `ParselTongue.julia_main()`. Previously `julia_main`
+  lived in `app/pt.jl` (Main namespace, for juliac). Moved all CLI logic into `src/cli.jl`
+  (included by the module); `app/pt.jl` reduced to a 2-line juliac wrapper
+  (`using ParselTongue: julia_main`). `Project.toml` declares `[apps.pt]`.
+  Three invocation paths all work: (1) interpreted `julia --project=. app/pt.jl`, 
+  (2) compiled binary (`app/build_app.jl` → juliac `--output-exe`), 
+  (3) Pkg App shim (`julia app develop .` → `pt`). Files: `src/cli.jl` (new),
+  `src/ParselTongue.jl`, `app/pt.jl`, `Project.toml`. Effort S.
 
 ## Phase 4 — optional capability track (stateful objects)
 
@@ -269,6 +291,42 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
 - ~~**`build_wheel` double-includes user file**~~ — fixed v0.17.0. `build_wheel`
   now passes `_preloaded=(exports, errors)` to `build_extension`, which skips the
   second include. The user file is loaded exactly once per `build_wheel` call.
+
+- [ ] **I. Windows support (MinGW-w64)** *(platform breadth)* — v0.24.0 (partial; not yet verified on Windows hardware).
+  Implements all Windows platform branches; actual `.pyd` compilation requires Windows + Julia.
+  See gap analysis below for what was implemented and what needs on-Windows verification.
+  Files: `src/build.jl` (`_find_cc` Windows search, `_py_lib_flags`, `_link_extension` Windows branch,
+  `_abi3_ext_suffix` `.pyd` fallback); `src/wheel.jl` (`_is_dynlib` `.dll`, `_SKIP_LIB` `.dll`,
+  `_vendor_libs_win`, `_objdump_needed`, `_dynlib_needed` Windows dispatch, `build_wheel` Windows
+  vendoring from `bin/`, `_write_pkg_pyfiles`/`_write_shared_pkg_pyfiles`/`_write_system_pkg_pyfiles`
+  Windows preload via `os.add_dll_directory`, `build_runtime_wheel` Windows vendoring,
+  `_current_os_kernel` helper). MSVC not yet supported — use MinGW-w64 gcc.
+  Tests: 20 unit tests (all pass on Linux) covering `_is_dynlib`, `_SKIP_LIB`, bundled/shared/system
+  `__init__.py` Windows content, `_py_lib_flags` Unix no-op, `_os_kernel` cross-platform param.
+
+## Windows support — gap analysis
+
+Windows is deferred but not blocked on any fundamental design issue. The gaps are
+mechanical (platform branches), not architectural. Everything below is `build.jl` /
+`wheel.jl` / `__init__.py` work:
+
+| Area | Current (Linux/macOS) | Windows needed |
+|---|---|---|
+| **Extension suffix** | `.so` / `.dylib` via `EXT_SUFFIX` | `.pyd` — `sysconfig` already returns the right value; `build.jl:149` has a `TBD` note |
+| **Linker flags** | `-shared -fPIC -Wl,--whole-archive img.a` (Linux) / `-dynamiclib -force_load` (macOS) | MSVC: `cl /LD /WHOLEARCHIVE:img.lib`; MinGW: same as Linux |
+| **Compiler search** | `_find_cc()` looks for `cc`, `gcc`, `clang` | Add `cl.exe`; prefer MinGW-w64 if GCC on Windows desired |
+| **rpaths** | `$ORIGIN` (Linux) / `@loader_path` (macOS) | Windows has no rpath; DLLs found via `PATH` or `AddDllDirectory` (Python 3.8+) |
+| **Bundled wheel preload** | `LD_LIBRARY_PATH` (Linux) / `ctypes.CDLL` loop (macOS) | `os.add_dll_directory(lib_dir)` (Python 3.8+) before importing `_mod.pyd` |
+| **System/shared `__init__.py`** | Same preload as bundled | Same `os.add_dll_directory` branch |
+| **Julia lib layout** | `lib/` and `lib/julia/` (Unix) | `bin/` holds DLLs on Windows (different tree to vendor) |
+| **slim BFS** | `readelf -d` (Linux) / `otool -L` (macOS) | `dumpbin /dependents` or `objdump -p` (MinGW) |
+| **juliac itself** | Ships in Julia 1.12+ for Linux/macOS | Must work on Windows — outside ParselTongue's control but Julia team ships it |
+| **Platform wheel tag** | `linux_x86_64` / `manylinux_*` / `macosx_*` | `win_amd64` or `win32` — `wheel.jl` `_wheel_plat` branch needed |
+
+**Effort estimate**: M–L. No fundamental blockers — each gap is a known if/else branch.
+MinGW-w64 (GCC on Windows) is the lower-risk path since the linker flags are nearly
+identical to Linux. MSVC requires a different link command and `.lib` import library.
+The `juliac` prerequisite and Julia's Windows arm64 status are the only external dependencies.
 
 ## Cross-cutting conventions
 

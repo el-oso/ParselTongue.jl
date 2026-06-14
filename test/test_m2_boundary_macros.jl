@@ -5,10 +5,12 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     PtExport, PtArray, emit_ccallable, emit_entry, emit_cshim,
                     _EXPORTS, clear_exports!, _default_py_name, submodule_names,
                     _julia_version_str, _runtime_wheel_tag, _runtime_metadata,
-                    _RUNTIME_INIT_PY, _write_shared_pkg_pyfiles, _write_system_pkg_pyfiles,
+                    _RUNTIME_INIT_PY, _write_pkg_pyfiles,
+                    _write_shared_pkg_pyfiles, _write_system_pkg_pyfiles,
+                    _current_os_kernel,
                     _readelf_needed, _transitive_needed, _resolve_soname,
-                    _vendor_libs_smart, _is_dynlib, _SKIP_LIB,
-                    _parse_otool_output, _otool_needed, _dynlib_needed,
+                    _vendor_libs_smart, _vendor_libs_win, _is_dynlib, _SKIP_LIB,
+                    _parse_otool_output, _otool_needed, _dynlib_needed, _objdump_needed,
                     PtOpt, _is_optional, _opt_inner, isopt, _opt_inner_c,
                     _to_c_opt,
                     PtError, _ERRORS, _py_exc_cname, _error_globals, _error_inits,
@@ -18,7 +20,8 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     PtVarArgs, isvarargs, _varargs_elt, _PtVarArgElt,
                     _missing_boundary_methods,
                     PyCallable, ispycallable,
-                    _c_ctype, _arg_plan, _build_pyobject, _wrapper_fn, _extern_decl
+                    _c_ctype, _arg_plan, _build_pyobject, _wrapper_fn, _extern_decl,
+                    _py_lib_flags, _find_cc
 
 # Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
 struct _TestHandle
@@ -1410,5 +1413,83 @@ end
     @test occursin("Py_DECREF", shim)
     @test occursin("\"O", shim)             # "O" or "Od..." — PyCallable parsed with O
     @test occursin("void *", shim)          # declared as void*
+    clear_exports!()
+end
+
+@testset "Windows platform support (item I)" begin
+    # ── _is_dynlib recognises .dll ─────────────────────────────────────
+    @test _is_dynlib("libjulia-internal.dll")
+    @test _is_dynlib("python312.dll")
+    @test _is_dynlib("libfoo.so.1")
+    @test _is_dynlib("libbar.dylib")
+    @test !_is_dynlib("README.md")
+    @test !_is_dynlib("img.a")
+
+    # ── _SKIP_LIB matches sys.dll and the usual skip set ──────────────
+    @test occursin(_SKIP_LIB, "sys.dll")
+    @test occursin(_SKIP_LIB, "sys.so")
+    @test occursin(_SKIP_LIB, "sys.dylib")
+    @test occursin(_SKIP_LIB, "libLLVM-17.so")
+    @test occursin(_SKIP_LIB, "libjulia-codegen.dll")
+    @test !occursin(_SKIP_LIB, "libjulia-internal.dll")
+
+    # ── _current_os_kernel returns a valid symbol ──────────────────────
+    k = _current_os_kernel()
+    @test k in (:linux, :apple, :windows)
+
+    # ── bundled __init__.py on :windows uses add_dll_directory ─────────
+    clear_exports!()
+    @eval @pymodule _wintest begin
+        @pyfunc wadd(a::Float64, b::Float64)::Float64 = a + b
+    end
+    exports = copy(_EXPORTS)
+    pkgdir_w = mktempdir()
+    _write_pkg_pyfiles(pkgdir_w, "_wintest", exports; _os_kernel=:windows)
+    init_win = read(joinpath(pkgdir_w, "__init__.py"), String)
+    @test occursin("add_dll_directory", init_win)
+    @test occursin("'julia', 'bin'", init_win)   # _os.path.join(_d, 'julia', 'bin')
+    @test occursin("from ._wintest import", init_win)
+    @test !occursin("LD_LIBRARY_PATH", init_win)
+
+    # ── shared __init__.py on :windows uses add_dll_directory + julia/bin ─
+    pkgdir_ws = mktempdir()
+    _write_shared_pkg_pyfiles(pkgdir_ws, "_wintest", exports, "wintest"; _os_kernel=:windows)
+    init_ws = read(joinpath(pkgdir_ws, "__init__.py"), String)
+    @test occursin("add_dll_directory", init_ws)
+    @test occursin("'julia', 'bin'", init_ws)     # _os.path.join(_rt, 'julia', 'bin')
+    @test occursin("parseltongue_runtime", init_ws)
+    @test !occursin("LD_LIBRARY_PATH", init_ws)
+    @test !occursin("julia/lib", init_ws)
+
+    # ── system __init__.py on :windows uses add_dll_directory + _find_julia_bin ─
+    pkgdir_wsy = mktempdir()
+    _write_system_pkg_pyfiles(pkgdir_wsy, "_wintest", exports, "wintest"; _os_kernel=:windows)
+    init_wsy = read(joinpath(pkgdir_wsy, "__init__.py"), String)
+    @test occursin("add_dll_directory", init_wsy)
+    @test occursin("_find_julia_bin", init_wsy)
+    @test occursin("JULIA_BINDIR", init_wsy)
+    @test !occursin("LD_LIBRARY_PATH", init_wsy)
+    @test !occursin("_find_libdirs", init_wsy)
+
+    # ── linux and apple branches still pass their existing checks ──────
+    pkgdir_l = mktempdir()
+    _write_shared_pkg_pyfiles(pkgdir_l, "_wintest", exports, "wintest"; _os_kernel=:linux)
+    init_l = read(joinpath(pkgdir_l, "__init__.py"), String)
+    @test occursin("LD_LIBRARY_PATH", init_l)
+    @test !occursin("add_dll_directory", init_l)
+
+    pkgdir_a = mktempdir()
+    _write_shared_pkg_pyfiles(pkgdir_a, "_wintest", exports, "wintest"; _os_kernel=:apple)
+    init_a = read(joinpath(pkgdir_a, "__init__.py"), String)
+    @test occursin("ctypes", init_a)
+    @test occursin("dylib", init_a)
+
+    # ── _find_cc raises a clear error when no compiler found ──────────
+    # (We can't run _find_cc() normally since cc/gcc/clang are likely present on this CI)
+    @test _find_cc isa Function
+
+    # ── _py_lib_flags returns [] on non-Windows ────────────────────────
+    @test _py_lib_flags("python3") == String[]
+
     clear_exports!()
 end
