@@ -113,6 +113,10 @@ _elt(@nospecialize(C::Type)) = _ELTINFO[C.parameters[1]]      # T from PtArray{T
 _ndims(@nospecialize(C::Type)) = C.parameters[2]::Int         # N from PtArray{T,N}
 _structname(@nospecialize(C::Type)) = string("PtArray_", _elt(C).tag, "_", _ndims(C))
 
+# Optional (PtOpt{C}) — already defined as isopt/_opt_inner_c in boundary.jl.
+# C-level struct name: "PtOpt_double", "PtOpt_int64t", "PtOpt_str", etc.
+_opt_cname(@nospecialize(C::Type)) = string("PtOpt_", _carrier_tag(_opt_inner_c(C)))
+
 # ── Tuple carriers (Python tuple returns) ─────────────────────────────
 istuple(@nospecialize(C::Type)) = C isa DataType && C <: Tuple
 
@@ -124,6 +128,7 @@ function _carrier_tag(@nospecialize(C::Type))
     isarray(C) && return _structname(C)
     isstrarr(C) && return "stra"
     ishandle(C) && return "handle"
+    isopt(C) && return string("opt_", _carrier_tag(_opt_inner_c(C)))
     istuple(C) && return string("T", join((_carrier_tag(S) for S in fieldtypes(C)), ""))
     return "x"
 end
@@ -135,6 +140,9 @@ function _collect_carriers!(set::Set{Type}, @nospecialize(C::Type))
     push!(set, C)
     if istuple(C)
         for S in fieldtypes(C); _collect_carriers!(set, S); end
+    end
+    if isopt(C)
+        _collect_carriers!(set, _opt_inner_c(C))
     end
     return set
 end
@@ -157,6 +165,7 @@ function _c_ctype(@nospecialize(C::Type))
     isarray(C) && return _structname(C)
     isstrarr(C) && return "PtStrArray"
     ishandle(C) && return "PtHandle"
+    isopt(C) && return _opt_cname(C)
     istuple(C) && return _tuple_structname(C)
     error("ParselTongue: no C type for carrier `$C`.")
 end
@@ -310,6 +319,36 @@ function _arg_plan(@nospecialize(C::Type), i::Int; logical::Bool=false, mutable:
             string(tmp, ".ptr = ", ptr, ";"),
         ]
         return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
+    elseif isopt(C)
+        inner_C = _opt_inner_c(C)
+        ocn = _opt_cname(C)
+        obj = string(tmp, "_obj")
+        decls = [
+            string("PyObject *", obj, " = NULL;"),
+            string(ocn, " ", tmp, " = {0};"),
+        ]
+        # Extract the inner value when the Python object is not None.
+        vn = string(tmp, "_v")
+        inner_stmts = String[]
+        if isscalar(inner_C)
+            cs = _CSCALARS[inner_C]
+            push!(inner_stmts, string(cs.tmptype, " ", vn, ";"))
+            push!(inner_stmts, string("if (!PyArg_Parse(", obj, ", \"", cs.fmt, "\", &", vn, ")) return NULL;"))
+            push!(inner_stmts, string(tmp, ".has_value = 1;"))
+            push!(inner_stmts, string(tmp, ".value = (", cs.ctype, ")", vn, ";"))
+        elseif inner_C === Cstring
+            push!(inner_stmts, string("const char *", vn, ";"))
+            push!(inner_stmts, string("if (!PyArg_Parse(", obj, ", \"s\", &", vn, ")) return NULL;"))
+            push!(inner_stmts, string(tmp, ".has_value = 1;"))
+            push!(inner_stmts, string(tmp, ".value = (char *)", vn, ";"))
+        else
+            error("ParselTongue: Optional inner type `$inner_C` is not yet supported as an argument.")
+        end
+        setup = String[]
+        push!(setup, string("if (", obj, " != NULL && ", obj, " != Py_None) {"))
+        for s in inner_stmts; push!(setup, string("    ", s)); end
+        push!(setup, "}")
+        return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
     end
     error("ParselTongue: no argument marshalling for carrier `$C`.")
 end
@@ -344,6 +383,21 @@ function _build_pyobject(@nospecialize(C::Type), val::AbstractString, out::Abstr
         push!(stmts, string("PyObject *", out, " = _pt_wrap_ndarray(", val, ".data, ", nb,
                             ", \"", e.np, "\", ", shp, ", ", n, ", ", val, ".order);"))
         return stmts
+    elseif isopt(C)
+        inner_C = _opt_inner_c(C)
+        if isscalar(inner_C)
+            cs = _CSCALARS[inner_C]
+            inner_build = string(cs.build, "((", cs.cast, ")", val, ".value)")
+        elseif inner_C === Cstring
+            inner_build = string("PyUnicode_FromString(", val, ".value)")
+        else
+            error("ParselTongue: Optional return with inner type `$inner_C` is not yet supported.")
+        end
+        return String[
+            string("PyObject *", out, " = NULL;"),
+            string("if (!", val, ".has_value) { Py_INCREF(Py_None); ", out, " = Py_None; }"),
+            string("else { ", out, " = ", inner_build, "; }"),
+        ]
     end
     error("ParselTongue: no return marshalling for carrier `$C`.")
 end
@@ -489,6 +543,23 @@ function _tuple_structs(exports::AbstractVector{PtExport})
     end
     sort!(out)
     out
+end
+
+# Optional carrier typedefs. Must come after complex/scalar type declarations
+# since the inner type's C name is used here.
+function _opt_structs(exports::AbstractVector{PtExport})
+    out = String[]
+    seen = Set{Type}()
+    for C in _all_carriers(exports)
+        if isopt(C) && C ∉ seen
+            push!(seen, C)
+            inner_C = _opt_inner_c(C)
+            push!(out, string("typedef struct { int32_t has_value; ", _c_ctype(inner_C),
+                              " value; } ", _opt_cname(C), ";"))
+        end
+    end
+    sort!(out)
+    return out
 end
 
 _uses_arrays(exports) = !isempty(_array_structs(exports))
@@ -648,6 +719,12 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport};
         for s in structs; println(io, s); end
         println(io)
         println(io, _WRAP_ARRAY_HELPER)
+    end
+    ostructs = _opt_structs(exports)
+    if !isempty(ostructs)
+        println(io, "/* C-ABI carriers for Optional types (match Julia Union{T,Nothing}) */")
+        for s in ostructs; println(io, s); end
+        println(io)
     end
     tstructs = _tuple_structs(exports)
     if !isempty(tstructs)

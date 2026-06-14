@@ -271,6 +271,50 @@ function to_c(A::AbstractArray{T,N}) where {T<:PtArrayElt,N}
     return PtArray{T,N}(p, size(B), one(Cint))
 end
 
+# ── Optional (Union{T,Nothing}) boundary type ────────────────────────
+# Carrier: PtOpt{C} where C = c_abi_type(inner T).
+# Supported for scalar and String T only (not arrays, handles, or tuples).
+# Only the C shim side calls into Python; from_c/to_c run inside the trimmed lib.
+
+"""
+    PtOpt{C}
+
+C-ABI carrier for `Union{T,Nothing}`: `has_value=1` plus the inner carrier `C`,
+or `has_value=0` (nothing). Maps to a C struct `{int32_t has_value; <C> value;}`.
+"""
+struct PtOpt{C}
+    has_value::Int32
+    value::C
+end
+
+_is_optional(@nospecialize(T::Type)) = T isa Union && (T.a === Nothing || T.b === Nothing)
+_opt_inner(@nospecialize(T::Type))   = T.a === Nothing ? T.b : T.a
+
+# Predicate on the carrier (as used in ccallable_gen.jl and cshim.jl).
+isopt(@nospecialize(C::Type)) = C isa DataType && C.name === PtOpt.body.name
+_opt_inner_c(@nospecialize(C::Type)) = C.parameters[1]  # inner carrier from PtOpt{C}
+
+# c_abi_type for Optional — catch-all that only matches Union types.
+# Specific methods (scalars, String, Array, …) take precedence due to Julia dispatch.
+function c_abi_type(T::Type)
+    _is_optional(T) || error("ParselTongue: c_abi_type not defined for type `$T`")
+    inner = _opt_inner(T)
+    return PtOpt{c_abi_type(inner)}
+end
+
+# from_c for Optional: extract inner T or return nothing. Trim-safe because
+# T and C are static type parameters and both branches are type-stable.
+function from_c(::Type{Union{T,Nothing}}, opt::PtOpt{C}) where {T,C}
+    opt.has_value == zero(Int32) ? nothing : from_c(T, opt.value)
+end
+
+# _to_c_opt: used by emit_ccallable for Optional returns. Takes the carrier
+# type explicitly so the nothing branch can zero-fill the value field.
+function _to_c_opt(::Type{PtOpt{C}}, x::Union{T,Nothing}) where {C,T}
+    x === nothing ? PtOpt{C}(zero(Int32), zero(C)) :
+                    PtOpt{C}(one(Int32),  to_c(x)::C)
+end
+
 # ── Tuple return type ─────────────────────────────────────────────────
 # A function may return a Tuple of boundary types -> a Python tuple. The carrier
 # is a Julia Tuple of the element carriers (an immutable struct returned by value,
@@ -296,12 +340,21 @@ to_c(nt::NamedTuple) = map(to_c, Tuple(nt))  # trim-safe: concrete tuple map is 
 # Which of the three protocol methods are missing for `T`. Order-independent;
 # computes the carrier type only once `c_abi_type` is known to exist.
 function _missing_boundary_methods(T::Type)
+    # Optional delegates validity to the inner type.
+    _is_optional(T) && return _missing_boundary_methods(_opt_inner(T))
     missing = String[]
-    has_cabi = hasmethod(c_abi_type, Tuple{Type{T}})
+    # Use try/call rather than hasmethod: the catch-all c_abi_type(T::Type) makes
+    # hasmethod return true for any type, including unsupported ones like Dict.
+    has_cabi = false
+    local C
+    try
+        C = c_abi_type(T)
+        has_cabi = true
+    catch
+    end
     has_cabi || push!(missing, "c_abi_type(::Type{$T})")
     hasmethod(to_c, Tuple{T}) || push!(missing, "to_c(::$T)")
     if has_cabi
-        C = c_abi_type(T)
         hasmethod(from_c, Tuple{Type{T}, C}) || push!(missing, "from_c(::Type{$T}, ::$C)")
     else
         push!(missing, "from_c(::Type{$T}, ::<carrier>)")
@@ -344,6 +397,12 @@ Validate a **return** type. Returns need only `c_abi_type` + `to_c` (not `from_c
 """
 function assert_ret_boundary(T::Type)
     T === Nothing && return Cvoid
+    if _is_optional(T)
+        inner = _opt_inner(T)
+        isempty(_missing_boundary_methods(inner)) || error(
+            "ParselTongue: Optional return type `$T` — inner type `$inner` is not a boundary type.")
+        return c_abi_type(T)
+    end
     if T <: NamedTuple
         for S in fieldtypes(T)
             assert_ret_boundary(S)

@@ -22,6 +22,10 @@ function _zero_cval(@nospecialize(C::Type))
     C === Cstring && return "Cstring(Ptr{UInt8}(0))"
     C === ParselTongue.PtStrArray && return "ParselTongue.PtStrArray(Ptr{Ptr{UInt8}}(0), Int64(0))"
     C === ParselTongue.PtHandle && return "ParselTongue.PtHandle(Ptr{Cvoid}(0))"
+    if ParselTongue.isopt(C)
+        inner_C = ParselTongue._opt_inner_c(C)
+        return string(_type_src(C), "(Int32(0), ", _zero_cval(inner_C), ")")
+    end
     if isarray(C)
         T = _type_src(C.parameters[1])
         N = C.parameters[2]::Int
@@ -45,6 +49,8 @@ function _type_src(@nospecialize(T::Type))
         return "ParselTongue.PtStrArray"
     elseif T === PtHandle
         return "ParselTongue.PtHandle"
+    elseif T isa DataType && isopt(T)
+        return string("ParselTongue.PtOpt{", _type_src(_opt_inner_c(T)), "}")
     elseif T isa DataType && T <: Tuple
         return string("Tuple{", join((_type_src(S) for S in fieldtypes(T)), ", "), "}")
     end
@@ -135,11 +141,18 @@ function emit_ccallable(e::PtExport)
     end
     ret_src  = _type_src(ret_c)
     zero_src = _zero_cval(ret_c)
+    # Optional returns use _to_c_opt (passing the carrier type explicitly) so that
+    # the `nothing` branch can zero-fill `value` without knowing T at runtime.
+    to_c_expr = if isopt(ret_c)
+        string("ParselTongue._to_c_opt(", ret_src, ", ", call, ")")
+    else
+        string("ParselTongue.to_c(", call, ")")
+    end
     return string(
         sig, "::", ret_src, "\n",
         "    local _result::", ret_src, " = ", zero_src, "\n",
         "    try\n",
-        "        _result = ParselTongue.to_c(", call, ")\n",
+        "        _result = ", to_c_expr, "\n",
         "        unsafe_store!(_pt_err, Int32(0))\n",
         "    catch _e\n",
         catch_stmts,

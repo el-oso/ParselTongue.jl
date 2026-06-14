@@ -7,7 +7,9 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     _julia_version_str, _runtime_wheel_tag, _runtime_metadata,
                     _RUNTIME_INIT_PY, _write_shared_pkg_pyfiles,
                     _readelf_needed, _transitive_needed, _resolve_soname,
-                    _vendor_libs_smart
+                    _vendor_libs_smart,
+                    PtOpt, _is_optional, _opt_inner, isopt, _opt_inner_c,
+                    _to_c_opt
 
 # Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
 struct _TestHandle
@@ -440,4 +442,80 @@ end
     finally
         rm(pkgdir; recursive=true)
     end
+end
+
+@testset "Optional{T} boundary types (item C)" begin
+    # ── boundary.jl helpers ──────────────────────────────────────────────
+    @test _is_optional(Union{Float64, Nothing})
+    @test _is_optional(Union{Nothing, Int32})
+    @test !_is_optional(Float64)
+    @test !_is_optional(String)
+
+    @test _opt_inner(Union{Float64, Nothing}) === Float64
+    @test _opt_inner(Union{Nothing, Int32})  === Int32
+
+    # c_abi_type returns PtOpt{inner_carrier}
+    @test c_abi_type(Union{Float64, Nothing}) === PtOpt{Float64}
+    @test c_abi_type(Union{Int64, Nothing})   === PtOpt{Int64}
+    @test c_abi_type(Union{String, Nothing})  === PtOpt{Cstring}
+
+    # PtOpt is isbitstype for scalar inner types (trim-safe)
+    @test isbitstype(PtOpt{Float64})
+    @test isbitstype(PtOpt{Int64})
+
+    # isopt / _opt_inner_c on carriers
+    @test isopt(PtOpt{Float64})
+    @test !isopt(Float64)
+    @test _opt_inner_c(PtOpt{Float64}) === Float64
+    @test _opt_inner_c(PtOpt{Cstring}) === Cstring
+
+    # from_c: has_value=0 → nothing; has_value=1 → inner value
+    @test from_c(Union{Float64, Nothing}, PtOpt{Float64}(Int32(0), 0.0)) === nothing
+    @test from_c(Union{Float64, Nothing}, PtOpt{Float64}(Int32(1), 3.14)) === 3.14
+    @test from_c(Union{Int64, Nothing},  PtOpt{Int64}(Int32(0), Int64(0))) === nothing
+    @test from_c(Union{Int64, Nothing},  PtOpt{Int64}(Int32(1), Int64(7))) === Int64(7)
+
+    # _to_c_opt: nothing → {0,0}; value → {1, to_c(x)}
+    @test _to_c_opt(PtOpt{Float64}, nothing) === PtOpt{Float64}(Int32(0), 0.0)
+    @test _to_c_opt(PtOpt{Float64}, 3.14)    === PtOpt{Float64}(Int32(1), 3.14)
+    @test _to_c_opt(PtOpt{Int64},   nothing) === PtOpt{Int64}(Int32(0), Int64(0))
+    @test _to_c_opt(PtOpt{Int64},   Int64(5)) === PtOpt{Int64}(Int32(1), Int64(5))
+
+    # is_boundary_type / assert_boundary accept Optional types
+    @test is_boundary_type(Union{Float64, Nothing})
+    @test is_boundary_type(Union{String, Nothing})
+    @test assert_ret_boundary(Union{Float64, Nothing}) === PtOpt{Float64}
+
+    # ── ccallable_gen.jl ─────────────────────────────────────────────────
+    clear_exports!()
+    @pyfunc opt_in(x::Union{Float64,Nothing})::Float64 =
+        x === nothing ? -1.0 : x + 1.0
+    @pyfunc opt_out(x::Float64)::Union{Float64,Nothing} =
+        x < 0 ? nothing : x * 2
+
+    e_in  = _EXPORTS[findfirst(e -> e.export_name == "opt_in",  _EXPORTS)]
+    e_out = _EXPORTS[findfirst(e -> e.export_name == "opt_out", _EXPORTS)]
+
+    src_in = emit_ccallable(e_in)
+    @test occursin("PtOpt{Float64}", src_in)
+    @test occursin("from_c(Union{", src_in)   # Union order varies; just check presence
+
+    src_out = emit_ccallable(e_out)
+    @test occursin("PtOpt{Float64}", src_out)
+    @test occursin("_to_c_opt(", src_out)
+
+    # ── cshim.jl ─────────────────────────────────────────────────────────
+    shim = emit_cshim("optmod", _EXPORTS[end-1:end])
+
+    # Struct typedef emitted
+    @test occursin("PtOpt_double", shim)
+    @test occursin("int32_t has_value", shim)
+
+    # Arg plan: parse with "O", check Py_None, fill struct
+    @test occursin("PyArg_Parse", shim)          # inner extraction
+    @test occursin("Py_None", shim)              # None check
+
+    # Return plan: check has_value, return Py_None or inner
+    @test occursin("Py_INCREF(Py_None)", shim)
+    @test occursin("PyFloat_FromDouble", shim)
 end

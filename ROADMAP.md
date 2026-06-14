@@ -91,6 +91,53 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
 
 ## Phase 2 — broaden distribution + ergonomics
 
+- [ ] **A. Custom exception types** *(ergonomics — gap vs PyO3)* — every Julia `error()`
+  today maps to a generic Python `RuntimeError`; callers cannot `except MyMod.MyError`.
+  Add `@pyerror MyError [<: ParentExcClass]` macro (defaults to `PyException`).
+  - `macros.jl`: new `PtError` struct + `@pyerror` macro records error types in a
+    separate `_ERRORS` registry (cleared/populated alongside `_EXPORTS`).
+  - `cshim.jl`: `emit_cshim` emits `static PyObject *pt_err_<Name> = NULL;` globals;
+    `PyInit_<mod>` calls `PyErr_NewException("mod.Name", parent, NULL)` and
+    `PyModule_AddObject` for each; `_wrapper_fn` try/catch block inspects the caught
+    exception's type name (via `sprint(showerror, …)`) and dispatches to the matching
+    `PyErr_SetObject` or falls back to `PyErr_SetString(PyExc_RuntimeError, …)`.
+  - `ccallable_gen.jl`: `emit_entry` includes error type declarations so the trimmed
+    binary knows the registered types.
+  - Done-when: `@pyerror DomainError; @pyfunc f(x::Float64)::Float64 = x < 0 ?
+    error(DomainError(x)) : sqrt(x)` and Python `try: f(-1) except mod.DomainError: …`
+    catches the specific type. Effort M · Risk L.
+
+- [ ] **B. `Dict{String,V}` + `Vector{UInt8}` boundary types** *(type breadth)*
+  - `Dict{String,V}` (V ∈ scalar boundary types): carrier is `PyObject*`
+    (validated via `PyDict_Check`); `from_c` iterates with `PyDict_Next` + key
+    extraction via `PyUnicode_AsUTF8`; `to_c` builds a new PyDict.
+  - `Vector{UInt8}` / `Bytes`: carrier is `Py_buffer` (`PyBUF_SIMPLE`), same as
+    numeric arrays but no shape check; `from_c` copies bytes to Julia `Vector{UInt8}`;
+    `to_c` allocates a `bytes` object via `PyBytes_FromStringAndSize`.
+  - Files: `boundary.jl` (register types), `cshim.jl` (`_arg_plan` / `_ret_plan`
+    new cases), new example `examples/dictx/dictx.jl`.
+  - Done-when: `@pyfunc f(opts::Dict{String,Float64})::Vector{UInt8}` accepts
+    `{"lr": 0.01}` and returns `b"..."`. Effort M · Risk L.
+
+- [x] **C. `Union{T,Nothing}` nullable arguments** *(type breadth — gap vs PyO3 `Option<T>`)*
+  Shipped v0.10.0. Carrier `PtOpt{C}` struct `{ int32_t has_value; <c_abi_type(T)> value; }`;
+  isbitstype for scalar/Cstring inners. `c_abi_type` catch-all detects `Union{T,Nothing}`;
+  `from_c` → `nothing` when `has_value=0`; `_to_c_opt` for returns takes the carrier type
+  explicitly so the `nothing` branch can zero-fill. Shim parses with `"O"` format, checks
+  `Py_None` pointer equality, fills struct inline. v1 supports scalar and String inner types.
+  Fix: `_missing_boundary_methods` switched from `hasmethod` to try/call to survive the
+  catch-all method. Effort S · Risk L.
+
+- [ ] **D. `*args` / `**kwargs` / positional-only** *(argument ergonomics)*
+  - Positional-only: `@pyfunc f(a, b, /, c)` — the `/` already separates in Julia;
+    shim only needs to set the sentinel in `ml_doc` and stop keyword parsing before `/`.
+  - `*args`: Julia splat `args...::NTuple{N,T}` → Python `*args`; shim extracts the
+    remainder of the positional tuple as a `PyTuple` and converts.
+  - `**kwargs`: trailing `kwargs::Dict{String,Any}` → Python `**kwargs`; shim passes
+    the full `kwds` dict into Julia.
+  - Files: `macros.jl` (detect splat + pos-only), `cshim.jl` (emission logic).
+  - Effort M · Risk L.
+
 - [x] **4. Shared-runtime wheel** *(size)* — tiny extension wheels that depend on a
   generated `parseltongue-runtime` wheel (vendors libjulia once, Python-agnostic tag).
   `build_runtime_wheel()` + `build_wheel(...; runtime=:shared)` — shipped in v0.8.0.
@@ -114,6 +161,27 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   ↔ list[str], and `NamedTuple` ↔ dict return. `boundary.jl` + `cshim.jl`. Effort M each.
 
 ## Phase 3 — performance & polish
+
+- [ ] **E. `@boundary` extensibility protocol** *(ecosystem — gap vs PyO3 derive macros)*
+  - PyO3: `derive(FromPyObject)` / `derive(IntoPyObject)` let any crate add types.
+    ParselTongue: `c_abi_type`/`from_c`/`to_c` exist but require manual impl with no
+    convenience macro and no error guidance.
+  - Add `@boundary T carrier=C from_c=(carrier -> T) to_c=(T -> carrier)` macro that
+    auto-registers all three methods and validates against the `PyBoundary` contract at
+    definition time (not silently at build time).
+  - Files: `macros.jl` (new macro), `boundary.jl` (expose hook).
+  - Done-when: a user package can define Arrow.Table → list-of-dicts without touching
+    ParselTongue source. Effort M · Risk L.
+
+- [ ] **F. Python callables as arguments** *(gap vs PyO3 `Py<PyAny>` / `PyCallable`)*
+  - Spike first in `spike/` — verify `ccall(:PyObject_Call, ...)` from inside a
+    `--trim=safe` binary compiles without dynamic dispatch rejection.
+  - Boundary type `PyCallable`: carrier `Ptr{Cvoid}` (PyObject*); `from_c` just stores
+    the pointer; `to_c` returns it. Julia side wraps in a closure that calls
+    `ccall(:PyObject_Call, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}), fn, args, C_NULL)`
+    and re-acquires the GIL before calling.
+  - Done-when: `@pyfunc minimize(f::PyCallable, x0::Float64)::Float64` accepts a
+    Python lambda and calls it from Julia. Effort L · Risk M (spike first).
 
 - [x] **9. Shrink the bundle** *(size)* — `readelf -d` analysis shows that the
   extension .so only needs 6 Julia libs via DT_NEEDED (`libjulia-internal`, `libstdc++`,
@@ -142,13 +210,9 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
 
 ## Known correctness issues (audit findings — fix opportunistically)
 
-- **`_link_extension` redundant Python query** (`build.jl:170`): calls
-  `_py_include_flags(t.python)` again even though `t.py_includes` already has the
-  result. Replace with `t.py_includes` directly.
-- **`assert_boundary` stale error message** (`boundary.jl:330`): says "Supported in
-  v1: scalars, (later) String / numeric arrays" — all those types ship now. Update.
-- **`_wheel_meta` hardcodes version** (`wheel.jl`): "Generator: ParselTongue (0.1.0)"
-  should reflect actual package version. Read `pkgversion(@__MODULE__)` or Project.toml.
+- ~~**`_link_extension` redundant Python query**~~ — fixed v0.8.0.
+- ~~**`assert_boundary` stale error message**~~ — fixed v0.8.0.
+- ~~**`_wheel_meta` hardcodes version**~~ — fixed v0.8.0 (now uses `pkgversion`).
 - **`PyDict_SetItemString` return unchecked** (`cshim.jl:_ret_plan`): for NamedTuple
   returns, `PyDict_SetItemString` can return -1 on OOM. Should check and propagate.
 - **Multiple array args: buffer leak on late arg failure** (`cshim.jl:_wrapper_fn`):
