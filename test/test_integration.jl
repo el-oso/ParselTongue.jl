@@ -113,7 +113,7 @@ end
         @test occursin("FEATURE_OK", out)
 
         # Measure first-import and first-call latency (informational — no assertion).
-        r = startup_benchmark(so; call_expr="feature.add(1, 2)", n=3)
+        r = startup_benchmark(so; call_expr="mod.add(1, 2)", n=3)
         @info "startup: import $(round(r.import_ms_median; digits=1))ms " *
               "(min=$(round(r.import_ms_min; digits=1)) max=$(round(r.import_ms_max; digits=1))), " *
               "first_call $(round(r.call_ms_median; digits=3))ms"
