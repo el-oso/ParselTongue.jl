@@ -124,14 +124,20 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   Fix: `_missing_boundary_methods` switched from `hasmethod` to try/call to survive the
   catch-all method. Effort S · Risk L.
 
-- [ ] **D. `*args` / `**kwargs` / positional-only** *(argument ergonomics)*
-  - Positional-only: `@pyfunc f(a, b, /, c)` — the `/` already separates in Julia;
-    shim only needs to set the sentinel in `ml_doc` and stop keyword parsing before `/`.
-  - `*args`: Julia splat `args...::NTuple{N,T}` → Python `*args`; shim extracts the
-    remainder of the positional tuple as a `PyTuple` and converts.
-  - `**kwargs`: trailing `kwargs::Dict{String,Any}` → Python `**kwargs`; shim passes
-    the full `kwds` dict into Julia.
-  - Files: `macros.jl` (detect splat + pos-only), `cshim.jl` (emission logic).
+- [x] **D. `*args` — variadic positional arguments** *(argument ergonomics)* — shipped v0.18.0.
+  - `PtVarArgs{T}` (`T <: _PtVarArgElt`, i.e. real numeric scalars) absorbs all remaining
+    positional Python args beyond the fixed-arg count. Declared as the last positional arg:
+    `@pyfunc f(x::Float64, rest::PtVarArgs{Float64})::Float64`. Julia sees a
+    `PtVarArgs{T} <: AbstractVector{T}`, zero-copy from a malloc'd C array.
+  - C shim: `METH_VARARGS`; checks `PyTuple_GET_SIZE(args) >= n_fixed`; extracts fixed
+    args via `PyArg_Parse` on individual tuple items; loops the remainder with
+    `PyTuple_GET_ITEM` + scalar `PyArg_Parse`; builds a `PtArray{T,1}` carrier; calls
+    Julia; `free`s the C array after. Keyword-only args alongside varargs use
+    `METH_VARARGS | METH_KEYWORDS` with an empty positional tuple for `ParseTupleAndKeywords`.
+  - `_type_src` updated for `PtVarArgs{T}` (fully-qualified `ParselTongue.PtVarArgs{T}`).
+  - `_register_export!` validates: last positional, no Mut, no default, single occurrence.
+  - Skipped: `**kwargs` (requires opaque-PyObject infrastructure); positional-only `/` syntax.
+  - Files: `boundary.jl`, `macros.jl`, `ccallable_gen.jl`, `cshim.jl`, `ParselTongue.jl`.
   - Effort M · Risk L.
 
 - [x] **4. Shared-runtime wheel** *(size)* — tiny extension wheels that depend on a

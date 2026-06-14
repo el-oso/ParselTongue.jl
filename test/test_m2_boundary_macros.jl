@@ -13,7 +13,8 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     PtError, _ERRORS, _py_exc_cname, _error_globals, _error_inits,
                     PtDict, isdict, _dict_val_c, _dict_structs, _uses_bytes,
                     _manylinux_plat, _wheel_tag, _wheel_tag_abi3,
-                    _insert_cleanup_before_return
+                    _insert_cleanup_before_return,
+                    PtVarArgs, isvarargs, _varargs_elt, _PtVarArgElt
 
 # Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
 struct _TestHandle
@@ -955,4 +956,142 @@ end
     @test occursin("wheel",   _PtAppTest._USAGE)
     @test occursin("bench",   _PtAppTest._USAGE)
     @test occursin("version", _PtAppTest._USAGE)
+end
+
+# ── Item D: PtVarArgs{T} — Python *args ──────────────────────────────────────
+
+@testset "PtVarArgs boundary type (item D)" begin
+    # ── predicates ──────────────────────────────────────────────────────
+    @test  isvarargs(PtVarArgs{Float64})
+    @test  isvarargs(PtVarArgs{Int32})
+    @test !isvarargs(Float64)
+    @test !isvarargs(Vector{Float64})
+    @test !isvarargs(String)
+
+    @test _varargs_elt(PtVarArgs{Float64}) === Float64
+    @test _varargs_elt(PtVarArgs{Int32})   === Int32
+
+    # ── carrier type ─────────────────────────────────────────────────────
+    @test c_abi_type(PtVarArgs{Float64}) === PtArray{Float64,1}
+    @test c_abi_type(PtVarArgs{Int32})   === PtArray{Int32,1}
+    @test c_abi_type(PtVarArgs{UInt8})   === PtArray{UInt8,1}
+
+    # Unsupported element types are rejected by c_abi_type catch-all.
+    @test_throws ErrorException c_abi_type(PtVarArgs{ComplexF64})
+    @test_throws ErrorException c_abi_type(PtVarArgs{Bool})
+
+    # ── full boundary protocol ────────────────────────────────────────────
+    @test is_boundary_type(PtVarArgs{Float64})
+    @test is_boundary_type(PtVarArgs{Int64})
+    @test assert_boundary(PtVarArgs{Float64}) === PtArray{Float64,1}
+
+    # ── to_c round-trip (delegates to Vector{T}) ─────────────────────────
+    v = PtVarArgs{Float64}([1.0, 2.0, 3.0])
+    c = to_c(v)
+    @test c isa PtArray{Float64,1}
+    @test c.shape == (Int64(3),)
+    # from_c: wrap the carrier back into PtVarArgs
+    v2 = from_c(PtVarArgs{Float64}, c)
+    @test v2 isa PtVarArgs{Float64}
+    @test length(v2) == 3
+    @test v2[1] ≈ 1.0 && v2[2] ≈ 2.0 && v2[3] ≈ 3.0
+
+    # AbstractVector interface
+    @test size(v) == (3,)
+    @test v[2] == 2.0
+
+    # ── @pyfunc validation ────────────────────────────────────────────────
+    clear_exports!()
+    # Basic: varargs as only arg
+    @pyfunc _va_sum(vals::PtVarArgs{Float64})::Float64 = sum(vals)
+    @test length(_EXPORTS) == 1
+    @test _EXPORTS[1].args[1].jl_type === PtVarArgs{Float64}
+
+    # With fixed positional args before
+    @pyfunc _va_dot(x::Float64, vals::PtVarArgs{Float64})::Float64 = x * sum(vals)
+    e = _EXPORTS[2]
+    @test e.args[1].jl_type === Float64
+    @test e.args[2].jl_type === PtVarArgs{Float64}
+
+    # Error: multiple PtVarArgs
+    clear_exports!()
+    err = try
+        @pyfunc _va_bad(a::PtVarArgs{Float64}, b::PtVarArgs{Float64})::Float64 = 0.0
+        nothing
+    catch e; e; end
+    @test err isa ErrorException
+    @test occursin("at most one PtVarArgs", err.msg)
+
+    # Error: non-last positional
+    err2 = try
+        @pyfunc _va_bad2(a::PtVarArgs{Float64}, b::Float64)::Float64 = 0.0
+        nothing
+    catch e; e; end
+    @test err2 isa ErrorException
+    @test occursin("last positional", err2.msg)
+end
+
+@testset "PtVarArgs ccallable generation (item D)" begin
+    clear_exports!()
+    @pyfunc _va_sum(vals::PtVarArgs{Float64})::Float64 = sum(vals)
+    e = _EXPORTS[1]
+    src = emit_ccallable(e)
+
+    # Carrier in the @ccallable signature must be PtArray{Float64,1}, not PtVarArgs.
+    @test occursin("PtArray{Float64, 1}", src) || occursin("PtArray{Float64,1}", src)
+    # from_c must convert to PtVarArgs.
+    @test occursin("ParselTongue.PtVarArgs{Float64}", src)
+    @test occursin("from_c(ParselTongue.PtVarArgs{Float64}", src)
+end
+
+@testset "PtVarArgs cshim generation (item D)" begin
+    clear_exports!()
+    @pyfunc _va_sum(vals::PtVarArgs{Float64})::Float64 = sum(vals)
+    c = emit_cshim("vmod", _EXPORTS)
+
+    # Array struct typedef for PtArray{Float64,1} must be emitted.
+    @test occursin("PtArray_f64_1", c)
+    @test occursin("double *data", c)
+
+    # Varargs wrapper: iterates over args tuple.
+    @test occursin("PyTuple_GET_SIZE", c)
+    @test occursin("PyTuple_GET_ITEM", c)
+    @test occursin("_va_data", c)
+    @test occursin("malloc", c)
+    @test occursin("free(_va_data)", c)
+
+    # Scalar extraction loop uses the Float64 format char "d".
+    @test occursin("PyArg_Parse(_vobj", c)
+    @test occursin("\"d\"", c)
+
+    # No fixed args → no minimum count check.
+    @test !occursin("expected at least", c)
+
+    # METH_VARARGS only (no kw args).
+    @test  occursin("METH_VARARGS", c)
+    @test !occursin("METH_KEYWORDS", c)
+
+    # ── varargs + fixed positional ────────────────────────────────────────
+    clear_exports!()
+    @pyfunc _va_dot(x::Float64, vals::PtVarArgs{Float64})::Float64 = x * sum(vals)
+    c2 = emit_cshim("vmod2", _EXPORTS)
+
+    @test occursin("_nargs < 1", c2)           # minimum count check
+    @test occursin("PyTuple_GET_ITEM(args, 0)", c2)  # fixed arg extraction
+    @test occursin("_nargs - 1", c2)           # nva = nargs - n_fixed
+    @test occursin("1 + _vi", c2)              # varargs start at index 1
+
+    # Integer varargs: format char "i" for Int32
+    clear_exports!()
+    @pyfunc _va_isum(vals::PtVarArgs{Int32})::Int32 = sum(vals)
+    c3 = emit_cshim("vmod3", _EXPORTS)
+    @test occursin("int32_t *data", c3)
+    @test occursin("\"i\"", c3)
+
+    # Void return: varargs function returning Nothing
+    clear_exports!()
+    @pyfunc _va_void(vals::PtVarArgs{Float64})::Nothing = nothing
+    c4 = emit_cshim("vmod4", _EXPORTS)
+    @test occursin("Py_RETURN_NONE", c4)
+    @test occursin("_va_data", c4)
 end

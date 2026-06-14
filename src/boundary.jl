@@ -401,6 +401,42 @@ c_abi_type(::Type{T}) where {T<:NamedTuple} = c_abi_type(Tuple{fieldtypes(T)...}
 
 to_c(nt::NamedTuple) = map(to_c, Tuple(nt))  # trim-safe: concrete tuple map is unrolled
 
+# ── Variadic args (PtVarArgs{T}) ─────────────────────────────────────
+# Mark the last positional argument as variadic: Python callers pass any number
+# of positional values beyond the fixed args; the C shim collects them into a
+# malloc'd scalar array passed as a PtArray{T,1} carrier. Julia sees a
+# PtVarArgs{T} <: AbstractVector{T}, zero-copy from the C buffer.
+# Restriction: T must be a real numeric scalar (Int*/UInt*/Float*). Complex and
+# Bool are excluded because they require non-trivial Python extraction.
+
+struct PtVarArgs{T} <: AbstractVector{T}
+    data::Vector{T}
+end
+Base.size(v::PtVarArgs{T}) where T = size(v.data)
+Base.getindex(v::PtVarArgs{T}, i::Int) where T = v.data[i]
+
+isvarargs(@nospecialize(T::Type)) = false
+isvarargs(::Type{PtVarArgs{T}}) where T = true
+_varargs_elt(::Type{PtVarArgs{T}}) where T = T
+
+# Scalar element types for which PyArg_Parse has a simple one-char format code.
+const _PtVarArgElt = Union{Int8, Int16, Int32, Int64,
+                            UInt8, UInt16, UInt32, UInt64,
+                            Float32, Float64}
+
+function c_abi_type(::Type{PtVarArgs{T}}) where T
+    T <: _PtVarArgElt || error(
+        "ParselTongue: PtVarArgs element type must be a numeric scalar " *
+        "(Int8/16/32/64, UInt8/16/32/64, Float32/Float64); got `$T`.")
+    return PtArray{T,1}
+end
+
+function from_c(::Type{PtVarArgs{T}}, c::PtArray{T,1}) where {T<:_PtVarArgElt}
+    PtVarArgs{T}(from_c(Vector{T}, c))
+end
+
+to_c(v::PtVarArgs{T}) where {T<:_PtVarArgElt} = to_c(v.data)
+
 # ── Boundary validation (build host) ──────────────────────────────────
 
 # Which of the three protocol methods are missing for `T`. Order-independent;

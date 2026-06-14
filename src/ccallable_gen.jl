@@ -49,6 +49,8 @@ function _type_src(@nospecialize(T::Type))
         return "ParselTongue.PtStrArray"
     elseif T === PtHandle
         return "ParselTongue.PtHandle"
+    elseif T isa DataType && T.name === PtVarArgs.body.name
+        return string("ParselTongue.PtVarArgs{", _type_src(T.parameters[1]), "}")
     elseif T isa DataType && isopt(T)
         return string("ParselTongue.PtOpt{", _type_src(_opt_inner_c(T)), "}")
     elseif T isa DataType && T <: Tuple

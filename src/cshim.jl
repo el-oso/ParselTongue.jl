@@ -576,7 +576,171 @@ function _insert_cleanup_before_return(s::String, cleanups::Vector{String})
     return s
 end
 
+function _wrapper_fn_varargs(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=false)
+    va_idx = findfirst(a -> isvarargs(a.jl_type), e.args)::Int
+    T_elt  = _varargs_elt(e.args[va_idx].jl_type)
+    ei     = _ELTINFO[T_elt]
+    cs     = _CSCALARS[T_elt]
+    fixed_args = e.args[1:va_idx-1]
+    kw_args    = e.args[va_idx+1:end]   # all must have is_keyword=true
+    n_fixed    = length(fixed_args)
+    va_name    = string("a", va_idx)
+    has_kw     = !isempty(kw_args)
+
+    wname = string("pyw_", e.export_name)
+    io = IOBuffer()
+    if has_kw
+        println(io, "static PyObject *", wname,
+                "(PyObject *self, PyObject *args, PyObject *kwargs) {")
+    else
+        println(io, "static PyObject *", wname, "(PyObject *self, PyObject *args) {")
+    end
+
+    # Declarations for fixed positional args.
+    fixed_plans = ArgPlan[]
+    for (i, a) in enumerate(fixed_args)
+        logical = a.jl_type <: AbstractArray && !(a.jl_type <: Array)
+        plan = _arg_plan(c_abi_type(a.jl_type), i; logical, mutable=a.mutable,
+                         default=nothing, abi3)
+        push!(fixed_plans, plan)
+        for d in plan.decls; println(io, "    ", d); end
+    end
+
+    # Varargs buffer pointer + carrier struct.
+    println(io, "    ", ei.ctype, " *_va_data = NULL;")
+    sn_va = _structname(PtArray{T_elt,1})
+    println(io, "    ", sn_va, " ", va_name, ";")
+    println(io, "    Py_ssize_t _nargs = PyTuple_GET_SIZE(args);")
+
+    # Declarations for keyword-only args.
+    kw_plans = ArgPlan[]
+    for (i, a) in enumerate(kw_args)
+        logical = a.jl_type <: AbstractArray && !(a.jl_type <: Array)
+        plan = _arg_plan(c_abi_type(a.jl_type), va_idx + i; logical, mutable=a.mutable,
+                         default=a.default, abi3)
+        push!(kw_plans, plan)
+        for d in plan.decls; println(io, "    ", d); end
+    end
+
+    # Minimum positional arg count check.
+    if n_fixed > 0
+        println(io, "    if (_nargs < ", n_fixed, ") {")
+        println(io, "        PyErr_Format(PyExc_TypeError,")
+        println(io, "            \"expected at least ", n_fixed,
+                " positional argument(s), got %zd\", (Py_ssize_t)_nargs);")
+        println(io, "        return NULL;")
+        println(io, "    }")
+    end
+
+    # Extract each fixed positional arg via PyArg_Parse on the individual tuple item.
+    # Track acquired buffer cleanups so failures release previously-acquired resources.
+    fixed_cleanups = String[]
+    for (i, (plan, _)) in enumerate(zip(fixed_plans, fixed_args))
+        parg = string("_parg_", i)
+        println(io, "    PyObject *", parg, " = PyTuple_GET_ITEM(args, ", i - 1, ");")
+        addr_str = isempty(plan.addrs) ? "" : ", " * join(plan.addrs, ", ")
+        println(io, "    if (!PyArg_Parse(", parg, ", \"", plan.fmt, "\"", addr_str, ")) return NULL;")
+        for s in plan.setup
+            println(io, "    ", _insert_cleanup_before_return(s, fixed_cleanups))
+        end
+        append!(fixed_cleanups, plan.cleanup)
+    end
+
+    # Parse keyword-only args using ParseTupleAndKeywords with an empty positional tuple.
+    if has_kw
+        kw_fmt_req = IOBuffer(); kw_fmt_opt = IOBuffer()
+        kw_addrs = String[]; kwnames = String[]
+        for (plan, a) in zip(kw_plans, kw_args)
+            if a.default === nothing
+                print(kw_fmt_req, plan.fmt)
+            else
+                print(kw_fmt_opt, plan.fmt)
+            end
+            append!(kw_addrs, plan.addrs)
+            push!(kwnames, string(a.name))
+        end
+        kw_fmt_str = String(take!(kw_fmt_req)) * "|" * String(take!(kw_fmt_opt))
+        kw_entries = join(("\"$n\"" for n in kwnames), ", ")
+        fc_str = isempty(fixed_cleanups) ? "" : " " * join(fixed_cleanups, " ")
+        println(io, "    { static char *_kwlist[] = {", kw_entries, ", NULL};")
+        println(io, "      PyObject *_empty_args = PyTuple_New(0);")
+        println(io, "      if (!_empty_args) {", fc_str, " return NULL; }")
+        addr_str = isempty(kw_addrs) ? "" : ", " * join(kw_addrs, ", ")
+        println(io, "      int _kw_ok = PyArg_ParseTupleAndKeywords(_empty_args, kwargs,")
+        println(io, "          \"", kw_fmt_str, "\", _kwlist", addr_str, ");")
+        println(io, "      Py_DECREF(_empty_args);")
+        println(io, "      if (!_kw_ok) {", fc_str, " return NULL; }")
+        println(io, "    }")
+        for (plan, _) in zip(kw_plans, kw_args)
+            for s in plan.setup; println(io, "    ", s); end
+        end
+    end
+
+    # Build varargs array: malloc, loop over remaining tuple items, extract scalars.
+    fc_str = isempty(fixed_cleanups) ? "" : join(fixed_cleanups, " ") * " "
+    println(io, "    Py_ssize_t _nva = _nargs - ", n_fixed, ";")
+    println(io, "    _va_data = (", ei.ctype,
+            " *)malloc(_nva > 0 ? (size_t)_nva * sizeof(", ei.ctype, ") : 1);")
+    println(io, "    if (!_va_data) { ", fc_str, "return PyErr_NoMemory(); }")
+    println(io, "    for (Py_ssize_t _vi = 0; _vi < _nva; _vi++) {")
+    println(io, "        PyObject *_vobj = PyTuple_GET_ITEM(args, ", n_fixed, " + _vi);")
+    println(io, "        ", cs.tmptype, " _vtmp;")
+    println(io, "        if (!PyArg_Parse(_vobj, \"", cs.fmt, "\", &_vtmp))")
+    println(io, "            { ", fc_str, "free(_va_data); return NULL; }")
+    println(io, "        _va_data[_vi] = (", cs.ctype, ")_vtmp;")
+    println(io, "    }")
+    println(io, "    ", va_name, ".data = _va_data;")
+    println(io, "    ", va_name, ".shape[0] = (int64_t)_nva;")
+    println(io, "    ", va_name, ".order = 1;")
+
+    # Build callargs: fixed positional, then varargs carrier, then kw args.
+    callargs = String[]
+    for plan in fixed_plans; push!(callargs, plan.callarg); end
+    push!(callargs, va_name)
+    for plan in kw_plans;    push!(callargs, plan.callarg); end
+
+    kw_cleanups  = vcat([plan.cleanup for plan in kw_plans]...)
+    all_cleanups = vcat(fixed_cleanups, kw_cleanups)
+
+    println(io, "    int32_t _pt_err = 0;")
+    println(io, "    char *_pt_errmsg = NULL;")
+    retc = c_abi_type(e.ret)
+    call_expr = string(cabi_symbol(e), "(", join(callargs, ", "), ", &_pt_err, &_pt_errmsg)")
+    if retc === Cvoid
+        println(io, "    Py_BEGIN_ALLOW_THREADS")
+        println(io, "    ", call_expr, ";")
+        println(io, "    Py_END_ALLOW_THREADS")
+    else
+        println(io, "    ", _c_ctype(retc), " r;")
+        println(io, "    Py_BEGIN_ALLOW_THREADS")
+        println(io, "    r = ", call_expr, ";")
+        println(io, "    Py_END_ALLOW_THREADS")
+    end
+    for s in all_cleanups; println(io, "    ", s); end
+    println(io, "    free(_va_data);")
+    println(io, "    if (_pt_err) {")
+    println(io, "        const char *_msg = _pt_errmsg ? _pt_errmsg : \"Julia exception\";")
+    if isempty(errors)
+        println(io, "        PyErr_SetString(PyExc_RuntimeError, _msg);")
+    else
+        for (i, err) in enumerate(errors)
+            kw = i == 1 ? "if" : "else if"
+            println(io, "        $kw (_pt_err == ", i + 1, ")")
+            println(io, "            PyErr_SetString(pt_err_", err.py_name, ", _msg);")
+        end
+        println(io, "        else")
+        println(io, "            PyErr_SetString(PyExc_RuntimeError, _msg);")
+    end
+    println(io, "        free(_pt_errmsg);")
+    println(io, "        return NULL;")
+    println(io, "    }")
+    for s in _ret_plan(retc; jl_type=e.ret).stmts; println(io, "    ", s); end
+    println(io, "}")
+    return String(take!(io)), wname
+end
+
 function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=false)
+    any(a -> isvarargs(a.jl_type), e.args) && return _wrapper_fn_varargs(e; errors, abi3)
     wname = string("pyw_", e.export_name)
     io = IOBuffer()
     has_defaults = any(a -> a.default !== nothing, e.args)
@@ -946,7 +1110,11 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
     end
     println(io, "static PyMethodDef ", mod_name, "_methods[] = {")
     for (e, wname) in zip(exports, wnames)
-        has_kw = any(a -> a.default !== nothing, e.args)
+        has_va = any(a -> isvarargs(a.jl_type), e.args)
+        # For varargs functions: METH_KEYWORDS only when there are keyword-only args.
+        # For normal functions: METH_KEYWORDS when any arg has a default value.
+        has_kw = has_va ? any(a -> a.is_keyword, e.args) :
+                          any(a -> a.default !== nothing, e.args)
         if has_kw
             println(io, "    {\"", e.export_name, "\", (PyCFunction)", wname,
                     ", METH_VARARGS | METH_KEYWORDS, \"", e.export_name, " (Julia)\"},")

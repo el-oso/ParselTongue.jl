@@ -295,6 +295,23 @@ function _register_export!(e::PtExport)
     # Returns are validated in the return direction (only need c_abi_type + to_c),
     # which also admits `Nothing` (void) and `Tuple{…}`.
     assert_ret_boundary(e.ret)
+    # Validate PtVarArgs constraints.
+    va_indices = findall(a -> isvarargs(a.jl_type), e.args)
+    if length(va_indices) > 1
+        error("@pyfunc: at most one PtVarArgs argument is allowed.")
+    end
+    if length(va_indices) == 1
+        vi = va_indices[1]
+        e.args[vi].mutable &&
+            error("@pyfunc: PtVarArgs argument `$(e.args[vi].name)` cannot be Mut.")
+        e.args[vi].default !== nothing &&
+            error("@pyfunc: PtVarArgs argument `$(e.args[vi].name)` cannot have a default value.")
+        for j in vi+1:length(e.args)
+            !e.args[j].is_keyword &&
+                error("@pyfunc: PtVarArgs must be the last positional argument; " *
+                      "`$(e.args[j].name)` follows it.")
+        end
+    end
     # Replace any existing export with the same Python name (last definition wins).
     filter!(x -> x.export_name != e.export_name, _EXPORTS)
     push!(_EXPORTS, e)
