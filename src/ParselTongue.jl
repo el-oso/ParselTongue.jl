@@ -1,11 +1,11 @@
 module ParselTongue
 
 using TypeContracts
+using MLStyle
 
-# NOTE: we deliberately do NOT depend on BaseTypeContracts. Its `__init__`
-# registers Base contracts at runtime, and module `__init__`s are `juliac --trim`
-# entrypoints — pulling it in makes the trimmed extension fail trim verification.
-# ParselTongue's boundary needs only `c_abi_type`/`from_c`/`to_c`, defined here.
+# NOTE: we do NOT depend on BaseTypeContracts — ParselTongue defines its own
+# PyBoundary contract and carrier types here; the Base contracts it provides are
+# not needed. (TypeContracts itself has no __init__, so trim-safety is not a concern.)
 
 # Boundary type system: PyBoundary contract + conversions (Julia <-> C-ABI).
 include("boundary.jl")

@@ -119,10 +119,10 @@ This enables two invocation paths:
   dynamic dispatch). `c_abi_type` and all of `build.jl`/`cshim.jl`/`wheel.jl` run on the build host
   and have no such restriction.
 - **`--trim=safe` rejects any dynamic dispatch reachable from an entrypoint**, and juliac compiles
-  every loaded module's `__init__` as an entrypoint. ParselTongue therefore has **no `__init__`** and
-  deliberately does **not** depend on `BaseTypeContracts` (its `__init__` registered contracts at
-  runtime, which broke trim). Adding a dependency whose `__init__` does dynamic work will break every
-  build. Trim-safety is a *static* property — code is rejected even if the bad path is never executed.
+  every loaded module's `__init__` as an entrypoint. ParselTongue therefore has **no `__init__`**.
+  TypeContracts itself also has no `__init__`, so it is safe. Adding a dependency whose `__init__`
+  does dynamic work will break every build. Trim-safety is a *static* property — code is rejected
+  even if the bad path is never executed.
 - **One ParselTongue extension per Python process.** Each wheel embeds its own `libjulia`; importing
   two such extensions in one process aborts (two Julia runtimes cannot coexist). Co-locate functions
   in one `@pymodule`. (`runtime=:shared` / `:system` extensions share one runtime and are safe to

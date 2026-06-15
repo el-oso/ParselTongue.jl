@@ -127,17 +127,19 @@ istuple(@nospecialize(C::Type)) = C isa DataType && C <: Tuple
 
 # A short, C-identifier-safe tag per carrier, used to name the tuple struct.
 function _carrier_tag(@nospecialize(C::Type))
-    isscalar(C) && return replace(_CSCALARS[C].ctype, r"[^A-Za-z0-9]" => "")
-    iscomplex(C) && return _CCOMPLEX[C].cname
-    C === Cstring && return "str"
-    isarray(C) && return _structname(C)
-    isstrarr(C) && return "stra"
-    ishandle(C) && return "handle"
-    ispycallable(C) && return "pycallable"
-    isopt(C) && return string("opt_", _carrier_tag(_opt_inner_c(C)))
-    isdict(C) && return string("dict_", _carrier_tag(_dict_val_c(C)))
-    istuple(C) && return string("T", join((_carrier_tag(S) for S in fieldtypes(C)), ""))
-    return "x"
+    @match C begin
+        GuardBy(isscalar)     => replace(_CSCALARS[C].ctype, r"[^A-Za-z0-9]" => "")
+        GuardBy(iscomplex)    => _CCOMPLEX[C].cname
+        GuardBy(==(Cstring))  => "str"
+        GuardBy(isarray)      => _structname(C)
+        GuardBy(isstrarr)     => "stra"
+        GuardBy(ishandle)     => "handle"
+        GuardBy(ispycallable) => "pycallable"
+        GuardBy(isopt)        => string("opt_", _carrier_tag(_opt_inner_c(C)))
+        GuardBy(isdict)       => string("dict_", _carrier_tag(_dict_val_c(C)))
+        GuardBy(istuple)      => string("T", join((_carrier_tag(S) for S in fieldtypes(C)), ""))
+        _                     => "x"
+    end
 end
 _tuple_structname(@nospecialize(C::Type)) =
     string("PtTuple_", join((_carrier_tag(S) for S in fieldtypes(C)), "_"))
@@ -165,18 +167,20 @@ end
 # ── Per-carrier C type / arg / return ─────────────────────────────────
 
 function _c_ctype(@nospecialize(C::Type))
-    C === Cvoid && return "void"
-    isscalar(C) && return _CSCALARS[C].ctype
-    iscomplex(C) && return _CCOMPLEX[C].cname
-    C === Cstring && return "char *"
-    isarray(C) && return _structname(C)
-    isstrarr(C) && return "PtStrArray"
-    ishandle(C) && return "PtHandle"
-    ispycallable(C) && return "void *"
-    isopt(C) && return _opt_cname(C)
-    isdict(C) && return _dict_structname(C)
-    istuple(C) && return _tuple_structname(C)
-    error("ParselTongue: no C type for carrier `$C`.")
+    @match C begin
+        GuardBy(==(Cvoid))    => "void"
+        GuardBy(isscalar)     => _CSCALARS[C].ctype
+        GuardBy(iscomplex)    => _CCOMPLEX[C].cname
+        GuardBy(==(Cstring))  => "char *"
+        GuardBy(isarray)      => _structname(C)
+        GuardBy(isstrarr)     => "PtStrArray"
+        GuardBy(ishandle)     => "PtHandle"
+        GuardBy(ispycallable) => "void *"
+        GuardBy(isopt)        => _opt_cname(C)
+        GuardBy(isdict)       => _dict_structname(C)
+        GuardBy(istuple)      => _tuple_structname(C)
+        _                     => error("ParselTongue: no C type for carrier `$C`.")
+    end
 end
 
 # Return a C literal string for a float value (guards against Inf/NaN).
@@ -198,318 +202,377 @@ function _c_scalar_lit(@nospecialize(C::Type), val)
     end
 end
 
+# ── Per-carrier argument plan helpers (_ap_*) ─────────────────────────
+# Each helper encapsulates one branch of the old _arg_plan if/elseif chain.
+
+function _ap_scalar(tmp::String, @nospecialize(C::Type), default)
+    cs = _CSCALARS[C]
+    decl = if default === nothing
+        string(cs.tmptype, " ", tmp, ";")
+    else
+        string(cs.tmptype, " ", tmp, " = (", cs.tmptype, ")", _c_scalar_lit(C, default), ";")
+    end
+    ArgPlan([decl], cs.fmt, [string("&", tmp)], string("(", cs.ctype, ")", tmp))
+end
+
+function _ap_complex(tmp::String, @nospecialize(C::Type), abi3::Bool, default)
+    cc = _CCOMPLEX[C]
+    if abi3
+        # Py_complex is not in the Python 3.11 stable ABI; use PyComplex_*AsDouble instead.
+        obj = string(tmp, "_obj")
+        decls = if default === nothing
+            [string("PyObject *", obj, " = NULL;"), string(cc.cname, " ", tmp, ";")]
+        else
+            v = convert(ComplexF64, default)
+            [string("PyObject *", obj, " = NULL;"),
+             string(cc.cname, " ", tmp, " = {(", cc.celt, ")", _c_float_lit(real(v)),
+                    ", (", cc.celt, ")", _c_float_lit(imag(v)), "};")]
+        end
+        setup = [
+            string("if (", obj, " != NULL) {"),
+            string("    ", tmp, ".re = (", cc.celt, ")PyComplex_RealAsDouble(", obj, ");"),
+            string("    ", tmp, ".im = (", cc.celt, ")PyComplex_ImagAsDouble(", obj, ");"),
+            string("    if (PyErr_Occurred()) return NULL;"),
+            string("}"),
+        ]
+        return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
+    else
+        pc = string(tmp, "_pc")
+        if default === nothing
+            decls = [string("Py_complex ", pc, ";"), string(cc.cname, " ", tmp, ";")]
+        else
+            v = convert(ComplexF64, default)
+            decls = [
+                string("Py_complex ", pc, " = {(double)", _c_float_lit(real(v)),
+                       ", (double)", _c_float_lit(imag(v)), "};"),
+                string(cc.cname, " ", tmp, ";"),
+            ]
+        end
+        setup = [string(tmp, ".re = (", cc.celt, ")", pc, ".real;"),
+                 string(tmp, ".im = (", cc.celt, ")", pc, ".imag;")]
+        return ArgPlan(decls, "D", [string("&", pc)], setup, tmp, String[])
+    end
+end
+
+function _ap_str(tmp::String)
+    ArgPlan([string("const char *", tmp, ";")], "s", [string("&", tmp)],
+            string("(char *)", tmp))
+end
+
+function _ap_stra(tmp::String)
+    obj = string(tmp, "_obj"); ni = string(tmp, "_n"); ii = string(tmp, "_i")
+    itm = string(tmp, "_itm"); szv = string(tmp, "_sz"); sv = string(tmp, "_sv")
+    decls = [string("PyObject *", obj, ";"),
+             string("PtStrArray ", tmp, " = {NULL, 0};")]
+    setup = String[
+        string("if (!PyList_Check(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"expected a list of str\"); return NULL; }"),
+        string("{ Py_ssize_t ", ni, " = PyList_Size(", obj, ");"),
+        string(tmp, ".data = (char **)malloc(", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
+        string("if (!", tmp, ".data) { PyErr_NoMemory(); return NULL; }"),
+        string(tmp, ".len = (int64_t)", ni, ";"),
+        string("memset(", tmp, ".data, 0, (size_t)", ni, " * sizeof(char *));"),
+        string("Py_ssize_t ", ii, "; for (", ii, " = 0; ", ii, " < ", ni, "; ", ii, "++) {"),
+        string("    PyObject *", itm, " = PyList_GetItem(", obj, ", ", ii, ");"),
+        string("    Py_ssize_t ", szv, ";"),
+        string("    const char *", sv, " = PyUnicode_AsUTF8AndSize(", itm, ", &", szv, ");"),
+        string("    if (!", sv, ") { _pt_free_str_array(", tmp, ".data, ", ii, "); return NULL; }"),
+        string("    ", tmp, ".data[", ii, "] = (char *)malloc((size_t)(", szv, " + 1));"),
+        string("    if (!", tmp, ".data[", ii, "]) { _pt_free_str_array(", tmp, ".data, ", ii, "); return PyErr_NoMemory(); }"),
+        string("    memcpy(", tmp, ".data[", ii, "], ", sv, ", (size_t)(", szv, " + 1)); } }"),
+    ]
+    cleanup = [string("_pt_free_str_array(", tmp, ".data, ", tmp, ".len);")]
+    ArgPlan(decls, "O", [string("&", obj)], setup, tmp, cleanup)
+end
+
+function _ap_array(tmp::String, @nospecialize(C::Type), logical::Bool, mutable::Bool)
+    e = _elt(C); sn = _structname(C); n = _ndims(C)
+    obj = string(tmp, "_obj"); buf = string(tmp, "_buf")
+    decls = [string("PyObject *", obj, ";"), string("Py_buffer ", buf, ";"),
+             string(sn, " ", tmp, ";")]
+    bufflags = mutable ? "PyBUF_STRIDES | PyBUF_FORMAT | PyBUF_WRITABLE" :
+                         "PyBUF_STRIDES | PyBUF_FORMAT"
+    setup = String[
+        string("if (PyObject_GetBuffer(", obj, ", &", buf, ", ", bufflags, ") != 0) return NULL;"),
+        string("if (", buf, ".ndim != ", n, " || ", buf,
+               ".itemsize != (Py_ssize_t)sizeof(", e.ctype, ")) {"),
+        string("    PyBuffer_Release(&", buf, ");"),
+        string("    PyErr_SetString(PyExc_TypeError, \"expected a ", n, "-D ", e.np,
+               " array\"); return NULL;"),
+        "}",
+    ]
+    if logical
+        # Logical (AbstractArray) policy: C-contiguous only, order always 0.
+        append!(setup, [
+            string("if (!PyBuffer_IsContiguous(&", buf, ", 'C')) {"),
+            string("    PyBuffer_Release(&", buf, ");"),
+            "    PyErr_SetString(PyExc_TypeError, \"AbstractArray argument requires a C-contiguous array (try np.ascontiguousarray)\"); return NULL;",
+            "}",
+            string(tmp, ".order = 0;"),
+        ])
+    else
+        # Dense (Array) policy: accept C- or F-contiguous, record which.
+        append!(setup, [
+            string("if (PyBuffer_IsContiguous(&", buf, ", 'C')) ", tmp, ".order = 0;"),
+            string("else if (PyBuffer_IsContiguous(&", buf, ", 'F')) ", tmp, ".order = 1;"),
+            "else {",
+            string("    PyBuffer_Release(&", buf, ");"),
+            "    PyErr_SetString(PyExc_TypeError, \"expected a contiguous array\"); return NULL;",
+            "}",
+        ])
+    end
+    append!(setup, [string(tmp, ".data = (", e.ctype, " *)", buf, ".buf;")])
+    for k in 0:n-1
+        push!(setup, string(tmp, ".shape[", k, "] = (int64_t)", buf, ".shape[", k, "];"))
+    end
+    ArgPlan(decls, "O", [string("&", obj)], setup, tmp,
+            [string("PyBuffer_Release(&", buf, ");")])
+end
+
+function _ap_handle(tmp::String)
+    obj = string(tmp, "_obj"); ptr = string(tmp, "_ptr")
+    decls = [
+        string("PyObject *", obj, " = NULL;"),
+        string("void *", ptr, ";"),
+        string("PtHandle ", tmp, ";"),
+    ]
+    setup = [
+        string("if (!PyCapsule_CheckExact(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"expected a PtHandle capsule\"); return NULL; }"),
+        string(ptr, " = PyCapsule_GetPointer(", obj, ", NULL);"),
+        string("if (!", ptr, ") return NULL;"),
+        string(tmp, ".ptr = ", ptr, ";"),
+    ]
+    ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
+end
+
+function _ap_opt(tmp::String, @nospecialize(C::Type), abi3::Bool)
+    inner_C = _opt_inner_c(C)
+    ocn = _opt_cname(C)
+    obj = string(tmp, "_obj")
+    decls = [
+        string("PyObject *", obj, " = NULL;"),
+        string(ocn, " ", tmp, " = {0};"),
+    ]
+    # Extract the inner value when the Python object is not None.
+    vn = string(tmp, "_v")
+    inner_stmts = String[]
+    if isscalar(inner_C)
+        cs = _CSCALARS[inner_C]
+        push!(inner_stmts, string(cs.tmptype, " ", vn, ";"))
+        push!(inner_stmts, string("if (!PyArg_Parse(", obj, ", \"", cs.fmt, "\", &", vn, ")) return NULL;"))
+        push!(inner_stmts, string(tmp, ".has_value = 1;"))
+        push!(inner_stmts, string(tmp, ".value = (", cs.ctype, ")", vn, ";"))
+    elseif inner_C === Cstring
+        push!(inner_stmts, string("const char *", vn, ";"))
+        push!(inner_stmts, string("if (!PyArg_Parse(", obj, ", \"s\", &", vn, ")) return NULL;"))
+        push!(inner_stmts, string(tmp, ".has_value = 1;"))
+        push!(inner_stmts, string(tmp, ".value = (char *)", vn, ";"))
+    else
+        error("ParselTongue: Optional inner type `$inner_C` is not yet supported as an argument.")
+    end
+    setup = String[]
+    push!(setup, string("if (", obj, " != NULL && ", obj, " != Py_None) {"))
+    for s in inner_stmts; push!(setup, string("    ", s)); end
+    push!(setup, "}")
+    ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
+end
+
+function _ap_dict(tmp::String, @nospecialize(C::Type))
+    vc = _dict_val_c(C)
+    cs = _CSCALARS[vc]
+    dcn = _dict_structname(C)
+    obj = string(tmp, "_obj")
+    ni = string(tmp, "_n")
+    kv = string(tmp, "_k"); vv = string(tmp, "_v")
+    pos = string(tmp, "_pos"); ii = string(tmp, "_i")
+    klen = string(tmp, "_klen"); ks = string(tmp, "_ks")
+    decls = [
+        string("PyObject *", obj, " = NULL;"),
+        string(dcn, " ", tmp, " = {NULL, NULL, 0};"),
+    ]
+    vextract = if vc === Bool
+        (string("int _vb_", tmp, " = PyObject_IsTrue(", vv, ");"),
+         string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+         string(tmp, ".vals[", ii, "] = (bool)_vb_", tmp, ";"))
+    elseif cs.ctype in ("float", "double")
+        (string("double _vd_", tmp, " = PyFloat_AsDouble(", vv, ");"),
+         string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+         string(tmp, ".vals[", ii, "] = (", cs.ctype, ")_vd_", tmp, ";"))
+    elseif startswith(cs.ctype, "u")  # unsigned integer
+        (string("unsigned long long _vu_", tmp, " = PyLong_AsUnsignedLongLong(", vv, ");"),
+         string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+         string(tmp, ".vals[", ii, "] = (", cs.ctype, ")_vu_", tmp, ";"))
+    else  # signed integer
+        (string("long long _vs_", tmp, " = PyLong_AsLongLong(", vv, ");"),
+         string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+         string(tmp, ".vals[", ii, "] = (", cs.ctype, ")_vs_", tmp, ";"))
+    end
+    setup = String[
+        string("if (!PyDict_Check(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"expected a dict[str, ...]\"); return NULL; }"),
+        string("Py_ssize_t ", ni, " = PyDict_Size(", obj, ");"),
+        string(tmp, ".keys = (char **)malloc(", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
+        string(tmp, ".vals = (", cs.ctype, " *)malloc(", ni, " > 0 ? (size_t)", ni, " * sizeof(", cs.ctype, ") : 1);"),
+        string("if (!", tmp, ".keys || !", tmp, ".vals) { free(", tmp, ".keys); free(", tmp, ".vals); PyErr_NoMemory(); return NULL; }"),
+        string(tmp, ".len = (int64_t)", ni, ";"),
+        string("memset(", tmp, ".keys, 0, ", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
+        string("{ PyObject *", kv, ", *", vv, "; Py_ssize_t ", pos, " = 0, ", ii, " = 0;"),
+        string("while (PyDict_Next(", obj, ", &", pos, ", &", kv, ", &", vv, ")) {"),
+        string("    Py_ssize_t ", klen, "; const char *", ks, " = PyUnicode_AsUTF8AndSize(", kv, ", &", klen, ");"),
+        string("    if (!", ks, ") { for (Py_ssize_t _fi = 0; _fi < ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+        string("    ", tmp, ".keys[", ii, "] = (char *)malloc((size_t)(", klen, " + 1));"),
+        string("    if (!", tmp, ".keys[", ii, "]) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); PyErr_NoMemory(); return NULL; }"),
+        string("    memcpy(", tmp, ".keys[", ii, "], ", ks, ", (size_t)(", klen, " + 1));"),
+        vextract[1], vextract[2], vextract[3],
+        string("    ", ii, "++;"),
+        "} }",
+    ]
+    # No cleanup needed: Julia's from_c frees keys, vals, and each key string.
+    ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
+end
+
+function _ap_pycallable(tmp::String)
+    obj = string(tmp, "_obj")
+    decls = [
+        string("PyObject *", obj, " = NULL;"),
+        string("void *", tmp, " = NULL;"),
+    ]
+    setup = [
+        string("if (!PyCallable_Check(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"argument must be callable\"); return NULL; }"),
+        string("Py_INCREF(", obj, ");"),
+        string(tmp, " = (void *)", obj, ";"),
+    ]
+    # Py_DECREF after Julia call; also inserted before return NULL in later setup steps.
+    cleanup = [string("Py_DECREF((PyObject *)", tmp, ");")]
+    ArgPlan(decls, "O", [string("&", obj)], setup, tmp, cleanup)
+end
+
 function _arg_plan(@nospecialize(C::Type), i::Int; logical::Bool=false, mutable::Bool=false,
                    default::Union{Nothing,Any}=nothing, abi3::Bool=false)
     tmp = string("a", i)
-    if isscalar(C)
-        cs = _CSCALARS[C]
-        decl = if default === nothing
-            string(cs.tmptype, " ", tmp, ";")
-        else
-            string(cs.tmptype, " ", tmp, " = (", cs.tmptype, ")", _c_scalar_lit(C, default), ";")
-        end
-        return ArgPlan([decl], cs.fmt, [string("&", tmp)], string("(", cs.ctype, ")", tmp))
-    elseif iscomplex(C)
-        cc = _CCOMPLEX[C]
-        if abi3
-            # Py_complex is not in the Python 3.11 stable ABI; use PyComplex_*AsDouble instead.
-            obj = string(tmp, "_obj")
-            decls = if default === nothing
-                [string("PyObject *", obj, " = NULL;"), string(cc.cname, " ", tmp, ";")]
-            else
-                v = convert(ComplexF64, default)
-                [string("PyObject *", obj, " = NULL;"),
-                 string(cc.cname, " ", tmp, " = {(", cc.celt, ")", _c_float_lit(real(v)),
-                        ", (", cc.celt, ")", _c_float_lit(imag(v)), "};")]
-            end
-            setup = [
-                string("if (", obj, " != NULL) {"),
-                string("    ", tmp, ".re = (", cc.celt, ")PyComplex_RealAsDouble(", obj, ");"),
-                string("    ", tmp, ".im = (", cc.celt, ")PyComplex_ImagAsDouble(", obj, ");"),
-                string("    if (PyErr_Occurred()) return NULL;"),
-                string("}"),
-            ]
-            return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
-        else
-            pc = string(tmp, "_pc")
-            if default === nothing
-                decls = [string("Py_complex ", pc, ";"), string(cc.cname, " ", tmp, ";")]
-            else
-                v = convert(ComplexF64, default)
-                decls = [
-                    string("Py_complex ", pc, " = {(double)", _c_float_lit(real(v)),
-                           ", (double)", _c_float_lit(imag(v)), "};"),
-                    string(cc.cname, " ", tmp, ";"),
-                ]
-            end
-            setup = [string(tmp, ".re = (", cc.celt, ")", pc, ".real;"),
-                     string(tmp, ".im = (", cc.celt, ")", pc, ".imag;")]
-            return ArgPlan(decls, "D", [string("&", pc)], setup, tmp, String[])
-        end
-    elseif C === Cstring
-        return ArgPlan([string("const char *", tmp, ";")], "s", [string("&", tmp)],
-                       string("(char *)", tmp))
-    elseif isstrarr(C)
-        obj = string(tmp, "_obj"); ni = string(tmp, "_n"); ii = string(tmp, "_i")
-        itm = string(tmp, "_itm"); szv = string(tmp, "_sz"); sv = string(tmp, "_sv")
-        decls = [string("PyObject *", obj, ";"),
-                 string("PtStrArray ", tmp, " = {NULL, 0};")]
-        setup = String[
-            string("if (!PyList_Check(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"expected a list of str\"); return NULL; }"),
-            string("{ Py_ssize_t ", ni, " = PyList_Size(", obj, ");"),
-            string(tmp, ".data = (char **)malloc(", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
-            string("if (!", tmp, ".data) { PyErr_NoMemory(); return NULL; }"),
-            string(tmp, ".len = (int64_t)", ni, ";"),
-            string("memset(", tmp, ".data, 0, (size_t)", ni, " * sizeof(char *));"),
-            string("Py_ssize_t ", ii, "; for (", ii, " = 0; ", ii, " < ", ni, "; ", ii, "++) {"),
-            string("    PyObject *", itm, " = PyList_GetItem(", obj, ", ", ii, ");"),
-            string("    Py_ssize_t ", szv, ";"),
-            string("    const char *", sv, " = PyUnicode_AsUTF8AndSize(", itm, ", &", szv, ");"),
-            string("    if (!", sv, ") { _pt_free_str_array(", tmp, ".data, ", ii, "); return NULL; }"),
-            string("    ", tmp, ".data[", ii, "] = (char *)malloc((size_t)(", szv, " + 1));"),
-            string("    if (!", tmp, ".data[", ii, "]) { _pt_free_str_array(", tmp, ".data, ", ii, "); return PyErr_NoMemory(); }"),
-            string("    memcpy(", tmp, ".data[", ii, "], ", sv, ", (size_t)(", szv, " + 1)); } }"),
-        ]
-        cleanup = [string("_pt_free_str_array(", tmp, ".data, ", tmp, ".len);")]
-        return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, cleanup)
-    elseif isarray(C)
-        e = _elt(C); sn = _structname(C); n = _ndims(C)
-        obj = string(tmp, "_obj"); buf = string(tmp, "_buf")
-        decls = [string("PyObject *", obj, ";"), string("Py_buffer ", buf, ";"),
-                 string(sn, " ", tmp, ";")]
-        bufflags = mutable ? "PyBUF_STRIDES | PyBUF_FORMAT | PyBUF_WRITABLE" :
-                             "PyBUF_STRIDES | PyBUF_FORMAT"
-        setup = String[
-            string("if (PyObject_GetBuffer(", obj, ", &", buf, ", ", bufflags, ") != 0) return NULL;"),
-            string("if (", buf, ".ndim != ", n, " || ", buf,
-                   ".itemsize != (Py_ssize_t)sizeof(", e.ctype, ")) {"),
-            string("    PyBuffer_Release(&", buf, ");"),
-            string("    PyErr_SetString(PyExc_TypeError, \"expected a ", n, "-D ", e.np,
-                   " array\"); return NULL;"),
-            "}",
-        ]
-        if logical
-            # Logical (AbstractArray) policy: C-contiguous only, order always 0.
-            append!(setup, [
-                string("if (!PyBuffer_IsContiguous(&", buf, ", 'C')) {"),
-                string("    PyBuffer_Release(&", buf, ");"),
-                "    PyErr_SetString(PyExc_TypeError, \"AbstractArray argument requires a C-contiguous array (try np.ascontiguousarray)\"); return NULL;",
-                "}",
-                string(tmp, ".order = 0;"),
-            ])
-        else
-            # Dense (Array) policy: accept C- or F-contiguous, record which.
-            append!(setup, [
-                string("if (PyBuffer_IsContiguous(&", buf, ", 'C')) ", tmp, ".order = 0;"),
-                string("else if (PyBuffer_IsContiguous(&", buf, ", 'F')) ", tmp, ".order = 1;"),
-                "else {",
-                string("    PyBuffer_Release(&", buf, ");"),
-                "    PyErr_SetString(PyExc_TypeError, \"expected a contiguous array\"); return NULL;",
-                "}",
-            ])
-        end
-        append!(setup, [string(tmp, ".data = (", e.ctype, " *)", buf, ".buf;")])
-        for k in 0:n-1
-            push!(setup, string(tmp, ".shape[", k, "] = (int64_t)", buf, ".shape[", k, "];"))
-        end
-        return ArgPlan(decls, "O", [string("&", obj)], setup, tmp,
-                       [string("PyBuffer_Release(&", buf, ");")])
-    elseif ishandle(C)
-        obj = string(tmp, "_obj"); ptr = string(tmp, "_ptr")
-        decls = [
-            string("PyObject *", obj, " = NULL;"),
-            string("void *", ptr, ";"),
-            string("PtHandle ", tmp, ";"),
-        ]
-        setup = [
-            string("if (!PyCapsule_CheckExact(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"expected a PtHandle capsule\"); return NULL; }"),
-            string(ptr, " = PyCapsule_GetPointer(", obj, ", NULL);"),
-            string("if (!", ptr, ") return NULL;"),
-            string(tmp, ".ptr = ", ptr, ";"),
-        ]
-        return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
-    elseif isopt(C)
-        inner_C = _opt_inner_c(C)
-        ocn = _opt_cname(C)
-        obj = string(tmp, "_obj")
-        decls = [
-            string("PyObject *", obj, " = NULL;"),
-            string(ocn, " ", tmp, " = {0};"),
-        ]
-        # Extract the inner value when the Python object is not None.
-        vn = string(tmp, "_v")
-        inner_stmts = String[]
-        if isscalar(inner_C)
-            cs = _CSCALARS[inner_C]
-            push!(inner_stmts, string(cs.tmptype, " ", vn, ";"))
-            push!(inner_stmts, string("if (!PyArg_Parse(", obj, ", \"", cs.fmt, "\", &", vn, ")) return NULL;"))
-            push!(inner_stmts, string(tmp, ".has_value = 1;"))
-            push!(inner_stmts, string(tmp, ".value = (", cs.ctype, ")", vn, ";"))
-        elseif inner_C === Cstring
-            push!(inner_stmts, string("const char *", vn, ";"))
-            push!(inner_stmts, string("if (!PyArg_Parse(", obj, ", \"s\", &", vn, ")) return NULL;"))
-            push!(inner_stmts, string(tmp, ".has_value = 1;"))
-            push!(inner_stmts, string(tmp, ".value = (char *)", vn, ";"))
-        else
-            error("ParselTongue: Optional inner type `$inner_C` is not yet supported as an argument.")
-        end
-        setup = String[]
-        push!(setup, string("if (", obj, " != NULL && ", obj, " != Py_None) {"))
-        for s in inner_stmts; push!(setup, string("    ", s)); end
-        push!(setup, "}")
-        return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
-    elseif isdict(C)
-        vc = _dict_val_c(C)
-        cs = _CSCALARS[vc]
-        dcn = _dict_structname(C)
-        obj = string(tmp, "_obj")
-        ni = string(tmp, "_n")
-        kv = string(tmp, "_k"); vv = string(tmp, "_v")
-        pos = string(tmp, "_pos"); ii = string(tmp, "_i")
-        klen = string(tmp, "_klen"); ks = string(tmp, "_ks")
-        decls = [
-            string("PyObject *", obj, " = NULL;"),
-            string(dcn, " ", tmp, " = {NULL, NULL, 0};"),
-        ]
-        # Determine value extraction based on type
-        vextract = if vc === Bool
-            (string("int _vb_", tmp, " = PyObject_IsTrue(", vv, ");"),
-             string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
-             string(tmp, ".vals[", ii, "] = (bool)_vb_", tmp, ";"))
-        elseif cs.ctype in ("float", "double")
-            (string("double _vd_", tmp, " = PyFloat_AsDouble(", vv, ");"),
-             string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
-             string(tmp, ".vals[", ii, "] = (", cs.ctype, ")_vd_", tmp, ";"))
-        elseif startswith(cs.ctype, "u")  # unsigned integer
-            (string("unsigned long long _vu_", tmp, " = PyLong_AsUnsignedLongLong(", vv, ");"),
-             string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
-             string(tmp, ".vals[", ii, "] = (", cs.ctype, ")_vu_", tmp, ";"))
-        else  # signed integer
-            (string("long long _vs_", tmp, " = PyLong_AsLongLong(", vv, ");"),
-             string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
-             string(tmp, ".vals[", ii, "] = (", cs.ctype, ")_vs_", tmp, ";"))
-        end
-        setup = String[
-            string("if (!PyDict_Check(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"expected a dict[str, ...]\"); return NULL; }"),
-            string("Py_ssize_t ", ni, " = PyDict_Size(", obj, ");"),
-            string(tmp, ".keys = (char **)malloc(", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
-            string(tmp, ".vals = (", cs.ctype, " *)malloc(", ni, " > 0 ? (size_t)", ni, " * sizeof(", cs.ctype, ") : 1);"),
-            string("if (!", tmp, ".keys || !", tmp, ".vals) { free(", tmp, ".keys); free(", tmp, ".vals); PyErr_NoMemory(); return NULL; }"),
-            string(tmp, ".len = (int64_t)", ni, ";"),
-            string("memset(", tmp, ".keys, 0, ", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
-            string("{ PyObject *", kv, ", *", vv, "; Py_ssize_t ", pos, " = 0, ", ii, " = 0;"),
-            string("while (PyDict_Next(", obj, ", &", pos, ", &", kv, ", &", vv, ")) {"),
-            string("    Py_ssize_t ", klen, "; const char *", ks, " = PyUnicode_AsUTF8AndSize(", kv, ", &", klen, ");"),
-            string("    if (!", ks, ") { for (Py_ssize_t _fi = 0; _fi < ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
-            string("    ", tmp, ".keys[", ii, "] = (char *)malloc((size_t)(", klen, " + 1));"),
-            string("    if (!", tmp, ".keys[", ii, "]) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); PyErr_NoMemory(); return NULL; }"),
-            string("    memcpy(", tmp, ".keys[", ii, "], ", ks, ", (size_t)(", klen, " + 1));"),
-            vextract[1], vextract[2], vextract[3],
-            string("    ", ii, "++;"),
-            "} }",
-        ]
-        # No cleanup needed: Julia's from_c frees keys, vals, and each key string.
-        return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
-    elseif ispycallable(C)
-        obj = string(tmp, "_obj")
-        decls = [
-            string("PyObject *", obj, " = NULL;"),
-            string("void *", tmp, " = NULL;"),
-        ]
-        setup = [
-            string("if (!PyCallable_Check(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"argument must be callable\"); return NULL; }"),
-            string("Py_INCREF(", obj, ");"),
-            string(tmp, " = (void *)", obj, ";"),
-        ]
-        # Py_DECREF after Julia call; also inserted before return NULL in later setup steps.
-        cleanup = [string("Py_DECREF((PyObject *)", tmp, ");")]
-        return ArgPlan(decls, "O", [string("&", obj)], setup, tmp, cleanup)
+    @match C begin
+        GuardBy(isscalar)     => _ap_scalar(tmp, C, default)
+        GuardBy(iscomplex)    => _ap_complex(tmp, C, abi3, default)
+        GuardBy(==(Cstring))  => _ap_str(tmp)
+        GuardBy(isstrarr)     => _ap_stra(tmp)
+        GuardBy(isarray)      => _ap_array(tmp, C, logical, mutable)
+        GuardBy(ishandle)     => _ap_handle(tmp)
+        GuardBy(isopt)        => _ap_opt(tmp, C, abi3)
+        GuardBy(isdict)       => _ap_dict(tmp, C)
+        GuardBy(ispycallable) => _ap_pycallable(tmp)
+        _                     => error("ParselTongue: no argument marshalling for carrier `$C`.")
     end
-    error("ParselTongue: no argument marshalling for carrier `$C`.")
 end
 
-# Build a PyObject named `out` from a C value expression `val` of carrier type
-# `C`. Array/string builders free their owned memory here, so this is safe to use
-# both for a function's whole result and for each field of a tuple result.
-function _build_pyobject(@nospecialize(C::Type), val::AbstractString, out::AbstractString)
-    if isscalar(C)
-        cs = _CSCALARS[C]
-        return [string("PyObject *", out, " = ", cs.build, "((", cs.cast, ")", val, ");")]
-    elseif iscomplex(C)
-        return [string("PyObject *", out, " = PyComplex_FromDoubles((double)", val, ".re, (double)", val, ".im);")]
-    elseif C === Cstring
-        return [string("PyObject *", out, " = PyUnicode_FromString(", val, ");"),
-                string("free((void *)", val, ");")]
-    elseif isstrarr(C)
-        return [string("PyObject *", out, " = _pt_strarray_to_list(", val, ".data, ", val, ".len);")]
-    elseif ishandle(C)
-        return [string("PyObject *", out, " = PyCapsule_New(", val, ".ptr, NULL, _pt_capsule_free);")]
-    elseif ispycallable(C)
-        return [string("PyObject *", out, " = (PyObject *)", val, ";"),
-                string("if (", out, ") { Py_INCREF(", out, "); }")]
-    elseif isarray(C)
-        e = _elt(C); n = _ndims(C)
-        # 1-D UInt8 arrays return a Python `bytes` object (the natural Python type for
-        # binary data). All other arrays return a NumPy array via _pt_wrap_ndarray.
-        if e.ctype == "uint8_t" && n == 1
-            nb = string("nbytes_", out)
-            return String[
-                string("Py_ssize_t ", nb, " = (Py_ssize_t)", val, ".shape[0];"),
-                string("PyObject *", out, " = _pt_make_bytes((void *)", val, ".data, ", nb, ");"),
-            ]
-        end
-        ne = string("nelem_", out); shp = string("shp_", out); nb = string("nbytes_", out)
-        stmts = [string("Py_ssize_t ", ne, " = 1;")]
-        for k in 0:n-1
-            push!(stmts, string(ne, " *= (Py_ssize_t)", val, ".shape[", k, "];"))
-        end
-        push!(stmts, string("Py_ssize_t ", shp, "[", n, "] = {",
-                            join(("(Py_ssize_t)$val.shape[$k]" for k in 0:n-1), ", "), "};"))
-        push!(stmts, string("Py_ssize_t ", nb, " = ", ne, " * (Py_ssize_t)sizeof(", e.ctype, ");"))
-        # _pt_wrap_ndarray takes ownership of val.data (frees it on error or via _PtBuf).
-        push!(stmts, string("PyObject *", out, " = _pt_wrap_ndarray(", val, ".data, ", nb,
-                            ", \"", e.np, "\", ", shp, ", ", n, ", ", val, ".order);"))
-        return stmts
-    elseif isopt(C)
-        inner_C = _opt_inner_c(C)
-        if isscalar(inner_C)
-            cs = _CSCALARS[inner_C]
-            inner_build = string(cs.build, "((", cs.cast, ")", val, ".value)")
-        elseif inner_C === Cstring
-            inner_build = string("PyUnicode_FromString(", val, ".value)")
-        else
-            error("ParselTongue: Optional return with inner type `$inner_C` is not yet supported.")
-        end
+# ── Per-carrier return plan helpers (_bp_*) ────────────────────────────
+# Each helper encapsulates one branch of the old _build_pyobject if/elseif chain.
+# Array/string builders free their owned memory; safe for single-result and tuple fields.
+
+function _bp_scalar(@nospecialize(C::Type), val::AbstractString, out::AbstractString)
+    cs = _CSCALARS[C]
+    [string("PyObject *", out, " = ", cs.build, "((", cs.cast, ")", val, ");")]
+end
+
+function _bp_complex(val::AbstractString, out::AbstractString)
+    [string("PyObject *", out, " = PyComplex_FromDoubles((double)", val, ".re, (double)", val, ".im);")]
+end
+
+function _bp_str(val::AbstractString, out::AbstractString)
+    [string("PyObject *", out, " = PyUnicode_FromString(", val, ");"),
+     string("free((void *)", val, ");")]
+end
+
+function _bp_stra(val::AbstractString, out::AbstractString)
+    [string("PyObject *", out, " = _pt_strarray_to_list(", val, ".data, ", val, ".len);")]
+end
+
+function _bp_handle(val::AbstractString, out::AbstractString)
+    [string("PyObject *", out, " = PyCapsule_New(", val, ".ptr, NULL, _pt_capsule_free);")]
+end
+
+function _bp_pycallable(val::AbstractString, out::AbstractString)
+    [string("PyObject *", out, " = (PyObject *)", val, ";"),
+     string("if (", out, ") { Py_INCREF(", out, "); }")]
+end
+
+function _bp_array(@nospecialize(C::Type), val::AbstractString, out::AbstractString)
+    e = _elt(C); n = _ndims(C)
+    # 1-D UInt8 arrays return a Python `bytes` object (the natural Python type for
+    # binary data). All other arrays return a NumPy array via _pt_wrap_ndarray.
+    if e.ctype == "uint8_t" && n == 1
+        nb = string("nbytes_", out)
         return String[
-            string("PyObject *", out, " = NULL;"),
-            string("if (!", val, ".has_value) { Py_INCREF(Py_None); ", out, " = Py_None; }"),
-            string("else { ", out, " = ", inner_build, "; }"),
+            string("Py_ssize_t ", nb, " = (Py_ssize_t)", val, ".shape[0];"),
+            string("PyObject *", out, " = _pt_make_bytes((void *)", val, ".data, ", nb, ");"),
         ]
-    elseif isdict(C)
-        vc = _dict_val_c(C)
-        cs = _CSCALARS[vc]
-        ii = string("_di_", out); vobj = string("_dv_", out)
-        vbuild = if vc === Bool
-            string("PyBool_FromLong((long)", val, ".vals[", ii, "])")
-        elseif cs.ctype in ("float", "double")
-            string("PyFloat_FromDouble((double)", val, ".vals[", ii, "])")
-        else
-            string("PyLong_FromLongLong((long long)", val, ".vals[", ii, "])")
-        end
-        stmts = String[
-            string("PyObject *", out, " = PyDict_New();"),
-            string("for (int64_t ", ii, " = 0; ", ii, " < ", val, ".len; ", ii, "++) {"),
-            string("    PyObject *", vobj, " = ", vbuild, ";"),
-            string("    if (!", vobj, " || PyDict_SetItemString(", out, ", ", val, ".keys[", ii, "], ", vobj, ") < 0) {"),
-            string("        Py_XDECREF(", vobj, "); Py_DECREF(", out, "); ", out, " = NULL; break;"),
-            "    }",
-            string("    Py_DECREF(", vobj, "); free(", val, ".keys[", ii, "]);"),
-            "}",
-            string("free(", val, ".keys); free(", val, ".vals);"),
-        ]
-        return stmts
     end
-    error("ParselTongue: no return marshalling for carrier `$C`.")
+    ne = string("nelem_", out); shp = string("shp_", out); nb = string("nbytes_", out)
+    stmts = [string("Py_ssize_t ", ne, " = 1;")]
+    for k in 0:n-1
+        push!(stmts, string(ne, " *= (Py_ssize_t)", val, ".shape[", k, "];"))
+    end
+    push!(stmts, string("Py_ssize_t ", shp, "[", n, "] = {",
+                        join(("(Py_ssize_t)$val.shape[$k]" for k in 0:n-1), ", "), "};"))
+    push!(stmts, string("Py_ssize_t ", nb, " = ", ne, " * (Py_ssize_t)sizeof(", e.ctype, ");"))
+    # _pt_wrap_ndarray takes ownership of val.data (frees it on error or via _PtBuf).
+    push!(stmts, string("PyObject *", out, " = _pt_wrap_ndarray(", val, ".data, ", nb,
+                        ", \"", e.np, "\", ", shp, ", ", n, ", ", val, ".order);"))
+    stmts
+end
+
+function _bp_opt(@nospecialize(C::Type), val::AbstractString, out::AbstractString)
+    inner_C = _opt_inner_c(C)
+    if isscalar(inner_C)
+        cs = _CSCALARS[inner_C]
+        inner_build = string(cs.build, "((", cs.cast, ")", val, ".value)")
+    elseif inner_C === Cstring
+        inner_build = string("PyUnicode_FromString(", val, ".value)")
+    else
+        error("ParselTongue: Optional return with inner type `$inner_C` is not yet supported.")
+    end
+    String[
+        string("PyObject *", out, " = NULL;"),
+        string("if (!", val, ".has_value) { Py_INCREF(Py_None); ", out, " = Py_None; }"),
+        string("else { ", out, " = ", inner_build, "; }"),
+    ]
+end
+
+function _bp_dict(@nospecialize(C::Type), val::AbstractString, out::AbstractString)
+    vc = _dict_val_c(C)
+    cs = _CSCALARS[vc]
+    ii = string("_di_", out); vobj = string("_dv_", out)
+    vbuild = if vc === Bool
+        string("PyBool_FromLong((long)", val, ".vals[", ii, "])")
+    elseif cs.ctype in ("float", "double")
+        string("PyFloat_FromDouble((double)", val, ".vals[", ii, "])")
+    else
+        string("PyLong_FromLongLong((long long)", val, ".vals[", ii, "])")
+    end
+    String[
+        string("PyObject *", out, " = PyDict_New();"),
+        string("for (int64_t ", ii, " = 0; ", ii, " < ", val, ".len; ", ii, "++) {"),
+        string("    PyObject *", vobj, " = ", vbuild, ";"),
+        string("    if (!", vobj, " || PyDict_SetItemString(", out, ", ", val, ".keys[", ii, "], ", vobj, ") < 0) {"),
+        string("        Py_XDECREF(", vobj, "); Py_DECREF(", out, "); ", out, " = NULL; break;"),
+        "    }",
+        string("    Py_DECREF(", vobj, "); free(", val, ".keys[", ii, "]);"),
+        "}",
+        string("free(", val, ".keys); free(", val, ".vals);"),
+    ]
+end
+
+# Build a PyObject named `out` from a C value expression `val` of carrier type `C`.
+function _build_pyobject(@nospecialize(C::Type), val::AbstractString, out::AbstractString)
+    @match C begin
+        GuardBy(isscalar)     => _bp_scalar(C, val, out)
+        GuardBy(iscomplex)    => _bp_complex(val, out)
+        GuardBy(==(Cstring))  => _bp_str(val, out)
+        GuardBy(isstrarr)     => _bp_stra(val, out)
+        GuardBy(ishandle)     => _bp_handle(val, out)
+        GuardBy(ispycallable) => _bp_pycallable(val, out)
+        GuardBy(isarray)      => _bp_array(C, val, out)
+        GuardBy(isopt)        => _bp_opt(C, val, out)
+        GuardBy(isdict)       => _bp_dict(C, val, out)
+        _                     => error("ParselTongue: no return marshalling for carrier `$C`.")
+    end
 end
 
 function _ret_plan(@nospecialize(C::Type); @nospecialize(jl_type::Type=Any))
