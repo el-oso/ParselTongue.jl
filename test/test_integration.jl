@@ -205,6 +205,13 @@ end
         assert p_l >= p_s,   "__ge__ (Python reflection of __le__)"
         assert not (p_l < p_s), "__lt__ false"
         del p_s, p_l
+        # Item O5: constructor syntax via __new__.
+        p_c = feature.Pt2D(3.0, 4.0)
+        assert isinstance(p_c, feature.Pt2D), "Pt2D(x,y) returns Pt2D instance"
+        assert feature.point_x(p_c) == 3.0, "constructor x"
+        assert feature.point_y(p_c) == 4.0, "constructor y"
+        assert repr(p_c) == "<Pt2D: x=3.0, y=4.0>", "constructor repr"
+        del p_c
         # Python callables as arguments (item F)
         assert feature.apply(lambda x: x * 2.0, 3.0) == 6.0,    "apply: identity"
         assert feature.apply(abs, -5.0) == 5.0,                  "apply: builtin"

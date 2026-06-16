@@ -1054,18 +1054,66 @@ const _PTHANDLE_TYPEDEF = """
 typedef struct { void *ptr; } PtHandle;
 """
 
+# Emit the `tp_new` C slot for one @pyhandle type that has a `@pymethod __new__`.
+# Reuses _arg_plan for argument parsing (same machinery as _wrapper_fn).
+function _emit_tp_new_slot(io::IO, tname::String, n::PtNew; abi3::Bool=false)
+    sym  = cabi_symbol(n)
+    args = n.args
+    plans = [_arg_plan(c_abi_type(a.jl_type), i; abi3) for (i, a) in enumerate(args)]
+    # extern declaration for the Julia ccallable
+    arg_ctypes = [_c_ctype(c_abi_type(a.jl_type)) for a in args]
+    all_params = join([arg_ctypes..., "int32_t *", "char **"], ", ")
+    println(io, "extern PtHandle $(sym)($(all_params));")
+    # tp_new slot function
+    println(io, "static PyObject *_pt_new_$(tname)(PyTypeObject *type, PyObject *args, PyObject *kw) {")
+    println(io, "    (void)kw;")
+    for plan in plans
+        for d in plan.decls; println(io, "    ", d); end
+    end
+    fmt = join([p.fmt for p in plans])
+    addrs_list = vcat([p.addrs for p in plans]...)
+    if isempty(args)
+        println(io, "    if (!PyArg_ParseTuple(args, \"\")) return NULL;")
+    else
+        println(io, "    if (!PyArg_ParseTuple(args, \"$(fmt)\", ",
+                join(addrs_list, ", "), ")) return NULL;")
+    end
+    for plan in plans
+        for s in plan.setup; println(io, "    ", s); end
+    end
+    callargs = join([p.callarg for p in plans], ", ")
+    err_sep  = isempty(args) ? "" : ", "
+    println(io, "    int32_t _pt_err = 0; char *_pt_errmsg = NULL;")
+    println(io, "    PtHandle h = $(sym)($(callargs)$(err_sep)&_pt_err, &_pt_errmsg);")
+    for plan in plans
+        for s in plan.cleanup; println(io, "    ", s); end
+    end
+    println(io, "    if (_pt_err) {")
+    println(io, "        PyErr_SetString(PyExc_RuntimeError,")
+    println(io, "            _pt_errmsg ? _pt_errmsg : \"error in constructor\");")
+    println(io, "        free(_pt_errmsg);")
+    println(io, "        return NULL;")
+    println(io, "    }")
+    println(io, "    return _pt_make_obj_$(tname)(h);")
+    println(io, "}")
+end
+
 # Emit per-type C structs, destructors, PyType_Spec, make-object helpers.
 # Each @pyhandle T gets a proper PyTypeObject so Python sees `mod.T` as a real class.
 # `methods` is the full list of PtMethod registrations; dunders for T are injected
 # as custom slots (overriding the generated defaults where applicable).
+# `news` is the list of PtNew registrations; a matching entry adds a tp_new slot.
 function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                                 handle_types::AbstractVector{<:Type},
-                                methods::AbstractVector{PtMethod}=PtMethod[])
+                                methods::AbstractVector{PtMethod}=PtMethod[],
+                                news::AbstractVector{PtNew}=PtNew[])
     isempty(handle_types) && return
     println(io, "/* @pyhandle types: each becomes a real Python class (isinstance, repr, etc.) */")
     for T in handle_types
         tname  = string(T.name.name)
         tmeths = filter(m -> m.handle_type === T, methods)
+        tnew_i = findfirst(n -> n.handle_type === T, news)
+        tnew   = tnew_i === nothing ? nothing : news[tnew_i]
 
         println(io, "typedef struct { PyObject_HEAD void *_data; } _PtObj_$tname;")
         println(io, "static void _pt_dealloc_$tname(PyObject *self) {")
@@ -1245,10 +1293,18 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             println(io, "}")
         end
 
+        # tp_new slot: emitted before the slot array (needs the extern declaration).
+        if tnew !== nothing
+            _emit_tp_new_slot(io, tname, tnew)
+        end
+
         # Slots array: always dealloc + repr (user or default), then all other
         # @pymethod dunders in registration order, then auto field-access getattro.
         println(io, "static PyType_Slot _pt_slots_$tname[] = {")
         println(io, "    {Py_tp_dealloc, (void *)_pt_dealloc_$tname},")
+        if tnew !== nothing
+            println(io, "    {Py_tp_new,     (void *)_pt_new_$(tname)},")
+        end
         if has_repr
             println(io, "    {Py_tp_repr,    (void *)_pt_slot_$(tname)_repr},")
         else
@@ -1382,7 +1438,8 @@ stable-ABI calls. The resulting `.abi3.so` is compatible with any CPython ≥ 3.
 function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
                     errors::Vector{PtError}=PtError[],
                     handle_types::Vector{<:Type}=Type[],
-                    methods::Vector{PtMethod}=PtMethod[];
+                    methods::Vector{PtMethod}=PtMethod[],
+                    news::Vector{PtNew}=PtNew[];
                     doc::AbstractString="", abi3::Bool=false)
     isempty(doc) && (doc = "ParselTongue extension (Julia via juliac --trim)")
     io = IOBuffer()
@@ -1419,7 +1476,7 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
     if _uses_handles(exports) || !isempty(handle_types) || !isempty(methods)
         print(io, _PTHANDLE_TYPEDEF)
     end
-    _emit_handle_type_defs(io, mod_name, handle_types, methods)
+    _emit_handle_type_defs(io, mod_name, handle_types, methods, news)
     structs = _array_structs(exports)
     if !isempty(structs)
         println(io, "/* C-ABI carriers for N-D arrays (match Julia PtArray{T,N}) */")

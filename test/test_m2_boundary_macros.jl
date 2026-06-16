@@ -22,7 +22,9 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     PyCallable, ispycallable,
                     _c_ctype, _arg_plan, _build_pyobject, _wrapper_fn, _extern_decl,
                     _py_lib_flags, _find_cc,
-                    ishandle, _handle_julia_name, _HANDLE_TYPES
+                    ishandle, _handle_julia_name, _HANDLE_TYPES,
+                    PtMethod, _METHODS, emit_ccallable_method,
+                    PtNew, _NEWS, emit_ccallable_new
 
 # Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
 struct _TestHandle
@@ -664,6 +666,80 @@ end
 
     err_type = try; @eval @pymethod __gt__ th_bad_gt(h::_TestHandle, o::Int64)::Bool = false; catch e; e; end
     @test (err_type isa LoadError ? err_type.error : err_type) isa ErrorException
+
+    clear_exports!()
+end
+
+@testset "@pymethod __new__ constructor syntax (item O5)" begin
+    clear_exports!()
+
+    # _TestHandle is registered; __new__ must return that type.
+    @pymethod __new__ th_new(x::Float64)::_TestHandle = _TestHandle(x, 0)
+
+    # Registered in _NEWS (not _METHODS).
+    @test length(ParselTongue._NEWS) == 1
+    @test isempty(ParselTongue._METHODS)
+    n = ParselTongue._NEWS[1]
+    @test n.handle_type === _TestHandle
+    @test n.jl_func === :th_new
+    @test length(n.args) == 1
+    @test n.args[1].name === :x
+    @test n.args[1].jl_type === Float64
+
+    # The Julia function is still callable directly.
+    @test th_new(3.14) === _TestHandle(3.14, 0)
+
+    # cabi_symbol encodes the handle type name.
+    @test ParselTongue.cabi_symbol(n) == "pt_new__TestHandle"
+
+    # clear_exports! resets _NEWS.
+    clear_exports!()
+    @test isempty(ParselTongue._NEWS)
+
+    # Re-register for code-gen tests.
+    @pymethod __new__ th_new2(x::Float64)::_TestHandle = _TestHandle(x, 0)
+    n2 = ParselTongue._NEWS[1]
+
+    # emit_ccallable_new generates parseable Julia with the right ccallable name.
+    src = ParselTongue.emit_ccallable_new(n2)
+    @test occursin("pt_new__TestHandle", src)
+    @test occursin("Base.@ccallable", src)
+    @test occursin("_pt_err", src)
+    @test Meta.parse(src) isa Expr
+
+    # emit_entry includes the __new__ wrapper.
+    entry = ParselTongue.emit_entry(_EXPORTS, tempname(); news=[n2])
+    @test occursin("pt_new__TestHandle", entry)
+
+    # emit_cshim with a PtNew: tp_new slot + extern decl + wrapper function present.
+    clear_exports!()
+    @pymethod __new__ th2_new(x::Float64)::_TestHandle = _TestHandle(x, 0)
+    n3 = ParselTongue._NEWS[1]
+    c = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
+                   PtMethod[], [n3])
+    @test occursin("Py_tp_new", c)
+    @test occursin("_pt_new__TestHandle", c)
+    @test occursin("extern PtHandle pt_new__TestHandle", c)
+    @test occursin("PyArg_ParseTuple", c)
+    @test occursin("_pt_make_obj__TestHandle", c)
+
+    # Registering __new__ again for same type replaces (not duplicates) the entry.
+    @pymethod __new__ th_new_dup(x::Float64)::_TestHandle = _TestHandle(x * 2.0, 0)
+    @test length(ParselTongue._NEWS) == 1
+    @test ParselTongue._NEWS[1].jl_func === :th_new_dup
+
+    # Validation: __new__ for an unregistered type is rejected.
+    struct _UnhandledNew; v::Float64 end
+    err_unreg = try
+        @eval @pymethod __new__ bad_new(v::Float64)::_UnhandledNew = _UnhandledNew(v)
+    catch e; e end
+    @test (err_unreg isa LoadError ? err_unreg.error : err_unreg) isa ErrorException
+
+    # Validation: __new__ with a non-handle return type is rejected.
+    err_ret = try
+        @eval @pymethod __new__ bad_new2(x::Float64)::Float64 = x
+    catch e; e end
+    @test (err_ret isa LoadError ? err_ret.error : err_ret) isa ErrorException
 
     clear_exports!()
 end

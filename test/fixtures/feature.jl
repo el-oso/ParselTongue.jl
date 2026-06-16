@@ -28,6 +28,9 @@ end
 @pymethod __lt__ pt2d_lt(p::Pt2D, other::Pt2D)::Bool = (p.x^2 + p.y^2) < (other.x^2 + other.y^2)
 @pymethod __le__ pt2d_le(p::Pt2D, other::Pt2D)::Bool = (p.x^2 + p.y^2) <= (other.x^2 + other.y^2)
 
+# __new__ (item O5): constructor syntax Pt2D(x, y) instead of make_point(x, y).
+@pymethod __new__ pt2d_new(x::Float64, y::Float64)::Pt2D = Pt2D(x, y)
+
 # Exercises every v1.x boundary kind in one extension: scalars, strings, complex,
 # 1-D and N-D arrays (both policies), in-place mutation + void, tuple returns,
 # and opaque handles.

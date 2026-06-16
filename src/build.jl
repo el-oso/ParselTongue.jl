@@ -87,10 +87,10 @@ function build_extension(user_path::AbstractString;
                          # Internal: extra source files to `include` in the juliac entry
                          # (multi-module wheels aggregate several sources into one image).
                          _extra_includes::Vector{String}=String[],
-                         # Internal: pass (exports, errors, handle_types, methods) from
+                         # Internal: pass (exports, errors, handle_types, methods, news) from
                          # build_wheel to skip the second include of the user source (the
                          # first is in build_wheel).
-                         _preloaded::Union{Nothing,Tuple{Vector{PtExport},Vector{PtError},Vector{<:Type},Vector{PtMethod}}}=nothing)
+                         _preloaded::Union{Nothing,Tuple{Vector{PtExport},Vector{PtError},Vector{<:Type},Vector{PtMethod},Vector{PtNew}}}=nothing)
     user_path = abspath(user_path)
     isfile(user_path) || error("ParselTongue: source file not found: $user_path")
     trim in (:safe, :unsafe, :unsafe_warn) ||
@@ -99,14 +99,14 @@ function build_extension(user_path::AbstractString;
     # 1. Populate the export registry by including the user source in a sandbox.
     #    When called from build_wheel, the caller already included the file and passes
     #    pre-populated exports/errors to avoid a redundant second include.
-    exports, errors, handle_types, methods = if _preloaded !== nothing
+    exports, errors, handle_types, methods, news_list = if _preloaded !== nothing
         _preloaded
     else
         clear_exports!()
         sandbox = Module(:ParselTongueUserSandbox)
         Core.eval(sandbox, :(using ParselTongue))
         Base.include(sandbox, user_path)
-        copy(_EXPORTS), copy(_ERRORS), copy(_HANDLE_TYPES), copy(_METHODS)
+        copy(_EXPORTS), copy(_ERRORS), copy(_HANDLE_TYPES), copy(_METHODS), copy(_NEWS)
     end
     isempty(exports) && error(
         "ParselTongue: no @pyfunc exports found in $user_path. " *
@@ -128,7 +128,7 @@ function build_extension(user_path::AbstractString;
     # so c_abi_type dispatch inside the codegen must use the current latest world.
     entry_path = joinpath(builddir, "_pt_entry.jl")
     write(entry_path, Base.invokelatest(emit_entry, exports, user_path; errors, methods,
-                                        extra_includes=_extra_includes))
+                                        news=news_list, extra_includes=_extra_includes))
 
     # 3. Run juliac --trim to produce the trimmed object archive.
     img = joinpath(builddir, "img.a")
@@ -136,7 +136,7 @@ function build_extension(user_path::AbstractString;
 
     # 4. Generate the C PyInit shim.
     cpath = joinpath(builddir, string("_", mod, "module.c"))
-    write(cpath, Base.invokelatest(emit_cshim, mod, exports, errors, handle_types, methods; abi3))
+    write(cpath, Base.invokelatest(emit_cshim, mod, exports, errors, handle_types, methods, news_list; abi3))
 
     # 5. Link the shim + archive into the extension module.
     so_path = joinpath(outdir, string(mod, ext_suffix))

@@ -135,7 +135,7 @@ function build_wheel(user_path::AbstractString;
           _MODULE_NAME[] !== nothing ? _MODULE_NAME[] :
           _default_mod_name(user_path)
     _is_valid_modname(mod) || error("ParselTongue: invalid module name '$mod'.")
-    preloaded    = (copy(_EXPORTS), copy(_ERRORS), copy(_HANDLE_TYPES), copy(_METHODS))
+    preloaded    = (copy(_EXPORTS), copy(_ERRORS), copy(_HANDLE_TYPES), copy(_METHODS), copy(_NEWS))
     exports      = preloaded[1]
     handle_types = preloaded[3]
 
@@ -302,7 +302,7 @@ function build_multi_wheel(sources::AbstractVector{<:AbstractString},
     # Include each source in isolation; its top-level @pymodule name becomes a
     # submodule of `mod_name`, and its exports are re-tagged with that submodule.
     all_exports = PtExport[]; all_errors = PtError[]
-    all_handles = Type[];     all_methods = PtMethod[]
+    all_handles = Type[];     all_methods = PtMethod[]; all_news = PtNew[]
     seen_names = Dict{String,String}()   # export_name → submodule (for collision report)
     for p in paths
         clear_exports!(); _MODULE_NAME[] = nothing
@@ -331,6 +331,7 @@ function build_multi_wheel(sources::AbstractVector{<:AbstractString},
         append!(all_errors, _ERRORS)
         for T in _HANDLE_TYPES; T in all_handles || push!(all_handles, T); end
         append!(all_methods, _METHODS)
+        append!(all_news, _NEWS)
     end
 
     mkpath(outdir)
@@ -341,7 +342,7 @@ function build_multi_wheel(sources::AbstractVector{<:AbstractString},
     origin = Sys.isapple() ? "@loader_path" : "\$ORIGIN"
     rpaths = (runtime === :bundled && !Sys.iswindows()) ?
         ["$origin/julia/lib", "$origin/julia/lib/julia"] : String[]
-    preloaded = (all_exports, all_errors, all_handles, all_methods)
+    preloaded = (all_exports, all_errors, all_handles, all_methods, all_news)
     # One extension from all sources: the first is user_path, the rest extra_includes.
     so = build_extension(paths[1];
                          mod_name=ext_name, outdir=pkgdir, trim, python, abi3,

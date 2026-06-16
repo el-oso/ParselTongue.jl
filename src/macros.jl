@@ -114,6 +114,32 @@ cabi_symbol(m::PtMethod) = string("pt_meth_", m.handle_type.name.name, "_",
 # Build-host registry for @pymethod registrations.
 const _METHODS = PtMethod[]
 
+"""
+    PtNew(handle_type, jl_func, args)
+
+Constructor registered via `@pymethod __new__`. When Python calls `T(args...)`,
+the C `tp_new` slot invokes `jl_func(args...)` and wraps the result as a `T` object.
+"""
+struct PtNew
+    handle_type::Type
+    jl_func::Symbol
+    args::Vector{PtArg}
+end
+
+cabi_symbol(n::PtNew) = string("pt_new_", n.handle_type.name.name)
+
+const _NEWS = PtNew[]
+
+function _register_new!(n::PtNew)
+    T = n.handle_type
+    ishandle(c_abi_type(T)) ||
+        error("@pymethod __new__: type `$T` is not registered with @pyhandle.")
+    T in _HANDLE_TYPES || push!(_HANDLE_TYPES, T)
+    filter!(x -> x.handle_type !== T, _NEWS)
+    push!(_NEWS, n)
+    return n
+end
+
 function _register_method!(m::PtMethod)
     T = m.handle_type
     # Use c_abi_type dispatch (registered by @pyhandle, persists across clear_exports!)
@@ -164,7 +190,7 @@ const _EXPORTS = PtExport[]
 
 Reset the export registry. Called at the start of each `build_extension`.
 """
-clear_exports!() = (empty!(_EXPORTS); empty!(_ERRORS); empty!(_HANDLE_TYPES); empty!(_METHODS); _MODULE_NAME[] = nothing; _CURRENT_SUBMODULE[] = ""; nothing)
+clear_exports!() = (empty!(_EXPORTS); empty!(_ERRORS); empty!(_HANDLE_TYPES); empty!(_METHODS); empty!(_NEWS); _MODULE_NAME[] = nothing; _CURRENT_SUBMODULE[] = ""; nothing)
 
 # Distinct, ordered submodule names among `exports` (excluding the "" top level).
 function submodule_names(exports::AbstractVector{PtExport})
@@ -474,6 +500,7 @@ end
     @pymethod __le__   fname(p::T, other::T)::Bool = ...
     @pymethod __gt__   fname(p::T, other::T)::Bool = ...
     @pymethod __ge__   fname(p::T, other::T)::Bool = ...
+    @pymethod __new__  fname(a::A, b::B)::T = T(a, b)
 
 Attach a Python dunder method to the `@pyhandle` type `T`. The macro:
   1. Defines the Julia function normally (it remains callable from Julia).
@@ -496,6 +523,7 @@ Attach a Python dunder method to the `@pyhandle` type `T`. The macro:
 | `__le__`      | `Py_tp_richcompare` | `(self::T, other::T)` | `Bool`      | `obj <= other` |
 | `__gt__`      | `Py_tp_richcompare` | `(self::T, other::T)` | `Bool`      | `obj > other` |
 | `__ge__`      | `Py_tp_richcompare` | `(self::T, other::T)` | `Bool`      | `obj >= other` |
+| `__new__`     | `Py_tp_new`    | `(a::A, b::B)::T` (no self) | `T` (handle type) | `T(a, b)` constructor |
 
 `__getitem__` only handles integer indices (via `Py_sq_item`); slice notation
 (`obj[a:b]`) requires `Py_mp_subscript` and is not yet supported.
@@ -512,6 +540,28 @@ a type unhashable when `__eq__` is defined without `__hash__`; register
 macro pymethod(dunder, fundef)
     dunder isa Symbol || error(
         "@pymethod: first argument must be a dunder symbol (e.g. __repr__), got: $dunder")
+
+    # __new__ is a class-level factory (no self); handled separately via PtNew.
+    if dunder === :__new__
+        fname, rawargs, ret_expr = _parse_fundef(fundef)
+        fname_sym = QuoteNode(fname)
+        arg_exprs = [:(ParselTongue.PtArg($(QuoteNode(n)), $(esc(t)), $mut, $(esc(d)), $kw))
+                     for (n, t, mut, d, kw) in rawargs]
+        return quote
+            $(esc(fundef))
+            let _ret = $(esc(ret_expr))
+                ParselTongue.ishandle(ParselTongue.c_abi_type(_ret)) ||
+                    error(string("@pymethod __new__: return type must be a @pyhandle type, got `", _ret, "`."))
+                _args = ParselTongue.PtArg[$(arg_exprs...)]
+                for _a in _args
+                    ParselTongue.assert_boundary(_a.jl_type)
+                end
+                ParselTongue._register_new!(ParselTongue.PtNew(_ret, $fname_sym, _args))
+            end
+            nothing
+        end
+    end
+
     if !haskey(_PYMETHOD_SLOTS, dunder)
         supported = join(sort!(collect(string.(keys(_PYMETHOD_SLOTS)))), ", ")
         error("@pymethod: unsupported dunder `$dunder`. Supported: $supported.")
