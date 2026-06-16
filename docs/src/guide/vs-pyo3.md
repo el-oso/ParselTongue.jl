@@ -12,7 +12,7 @@ the Python object graph you can reach from native code.
 |---|---|---|
 | Implementation language | Julia | Rust |
 | Annotation | `@pyfunc` / `@pymodule` | `#[pyfunction]` / `#[pymodule]` |
-| Build command | `build_wheel("file.jl")` | `maturin build` |
+| Build CLI | `pt wheel file.jl` (or `build_wheel("file.jl")`) | `maturin build` |
 | Type mapping | Explicit boundary contract | Derive macros + `FromPyObject` / `IntoPyObject` |
 | Classes | `@pyhandle` (isbits structs → real Python types; `isinstance`, auto field access, `@pymethod __repr__`/`__str__`) | `#[pyclass]` (full object protocol) |
 | Custom exceptions | `@pyerror MyError <: ValueError` | `create_exception!` |
@@ -20,7 +20,7 @@ the Python object graph you can reach from native code.
 | GIL release during call | Yes (automatic) | Yes (opt-in with `py.allow_threads`) |
 | Stable-ABI wheel (abi3) | Yes (`abi3=true`, floor CPython 3.11) | Yes (`--features abi3`) |
 | manylinux tagging | Yes (auto or pinned) | Yes (via `maturin`) |
-| Wheel size | ~100 MB (bundled Julia runtime) | ~1–5 MB |
+| Emitted wheel size | ~1 MB with a shared/system runtime (Julia installed once); ~100 MB fully self-contained | ~1–5 MB (self-contained) |
 | macOS support | Yes (`-dynamiclib`, `@loader_path`) | Yes |
 | Windows support | Yes (MinGW-w64) | Yes |
 | Async | No | Yes |
@@ -224,6 +224,16 @@ declare other signatures:
                 a::Int64, b::Int64)::Int64 = f(a, b)
 ```
 
+From Python, you pass any callable — a `lambda`, a `def`, or a builtin — and it is
+invoked back inside the Julia function:
+
+```python
+import mymod
+mymod.apply(lambda x: x * 2.0, 3.0)        # 6.0
+mymod.apply(abs, -5.0)                      # 5.0
+mymod.combine(lambda a, b: a + b, 3, 4)     # 7
+```
+
 Internally, `f(a, b, …)` re-acquires the GIL and calls `PyObject_Call` through a
 chain of `ccall`s emitted by a `@generated` method — one straight-line, trim-safe
 body per concrete signature. Supported argument/return scalar types: `Int8`–`Int64`,
@@ -232,22 +242,39 @@ returns to/from the callback are not yet supported.
 
 ## Distribution
 
+Both ship a CLI: ParselTongue's `pt` is the analog of maturin. `pt build` /
+`pt wheel` / `pt bench` compile, package, and benchmark without writing any Julia
+(see [The pt CLI](/guide/cli)); the same operations are also available as the
+`build_extension` / `build_wheel` functions.
+
+```bash
+pt wheel mymod.jl --runtime=system    # ParselTongue   (vs.  maturin build)
+```
+
 | | ParselTongue | PyO3 (via maturin) |
 |---|---|---|
-| Self-contained wheel | Yes — bundles `libjulia` | Yes — bundles Rust stdlib statically |
-| Wheel size | ~100 MB (full Julia runtime) | ~1–5 MB |
-| Slim mode | `slim=true` (trims to needed libs, ~38 MB) | N/A |
-| Shared runtime | `runtime=:shared` (separate `parseltongue-runtime`) | N/A |
+| Build CLI | `pt wheel mymod.jl` | `maturin build` |
+| Emitted wheel size | **~1 MB** (`runtime=:shared`/`:system`) — comparable to PyO3 | ~1–5 MB |
+| Runtime requirement | Julia runtime installed **once** (a `parseltongue-runtime` wheel, or system Julia ≥ 1.12), shared by every extension | none — Rust stdlib is linked statically |
+| Self-contained option | `runtime=:bundled` (default): ~100 MB, vendors `libjulia`; `slim=true` → ~38 MB | the wheel is already self-contained |
 | abi3 | `abi3=true` (CPython ≥ 3.11) | `abi3` feature (CPython ≥ 3.8) |
 | manylinux | Auto-detected or `manylinux="2.17"` | Handled by `maturin` |
 | macOS | `.dylib` + `@loader_path` rpaths | `.dylib` + `@rpath` |
 | Windows | `.pyd`, `os.add_dll_directory` | Yes |
 
-The dominant wheel-size difference comes from the Julia runtime. The trimmed
-extension code is small; the Julia stdlib's `__init__` functions fatally
-`dlopen` their native backends (OpenBLAS, SuiteSparse, …) at startup even when
-unused, so they must all be bundled. Use `slim=true` when your code does not
-`using LinearAlgebra` or other stdlib JLLs to drop from ~100 MB to ~38 MB.
+The emitted **wheel** is small — about 1 MB, like a PyO3 wheel — when you use
+`runtime=:shared` or `runtime=:system`. The trade-off is that the Julia runtime
+lives outside the wheel and is installed **once**: either as a separate
+`parseltongue-runtime` wheel (`:shared`, vendors `libjulia` + its backends) or as a
+system Julia ≥ 1.12 (`:system`). One runtime is then shared by all your extension
+wheels.
+
+`runtime=:bundled` (the default) instead vendors the whole Julia runtime into each
+wheel (~100 MB) so it imports with nothing else installed. That size comes from the
+Julia stdlib's `__init__`s, which fatally `dlopen` their native backends (OpenBLAS,
+SuiteSparse, …) at startup even when unused; `slim=true` drops it to ~38 MB when
+your code does not `using LinearAlgebra` or other stdlib JLLs. PyO3 has only the
+one self-contained shape (its Rust stdlib is linked statically).
 
 ## Compile times
 
@@ -278,8 +305,10 @@ build can take minutes.
 - You need to expose **mutable Python objects** (`#[pyclass]`), rich Python
   protocols (`__iter__`, `__len__`, properties), or Python inheritance.
 - You need **free-threading** CPython.
-- Wheel size matters: a 2 MB PyO3 wheel vs a 100 MB ParselTongue wheel is a
-  real deployment difference.
+- You need a fully self-contained wheel with **nothing installed once**: a PyO3
+  wheel carries its whole runtime, whereas a ~1 MB ParselTongue wheel still needs a
+  Julia runtime present (shared/system), and the self-contained `:bundled` wheel is
+  ~100 MB.
 - You need to call Python callbacks with **non-scalar argument types** (arrays,
   strings, objects); ParselTongue's `PyCallable{Args,Ret}` is limited to scalars.
 - Your project already has Rust tooling in the CI pipeline.
