@@ -182,7 +182,7 @@ end
         outdir  = mktempdir()
         so = build_extension(fixture; outdir=outdir, abi3=true)
         @test isfile(so)
-        @test occursin("abi3", basename(so))
+        # Windows does not tag extension files with "abi3" in the filename.
         @info "Windows: abi3 build succeeded (Python import skipped — use build_wheel)"
     else
         fixture = joinpath(@__DIR__, "fixtures", "feature.jl")
