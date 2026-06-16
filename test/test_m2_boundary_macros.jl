@@ -1494,8 +1494,14 @@ end
     # (We can't run _find_cc() normally since cc/gcc/clang are likely present on this CI)
     @test _find_cc isa Function
 
-    # ── _py_lib_flags returns [] on non-Windows ────────────────────────
-    @test _py_lib_flags("python3") == String[]
+    # ── _py_lib_flags returns [] on non-Windows; non-empty on Windows ──
+    if Sys.iswindows()
+        flags = _py_lib_flags("python3")
+        @test any(startswith(f, "-L") for f in flags)
+        @test any(startswith(f, "-l") for f in flags)
+    else
+        @test _py_lib_flags("python3") == String[]
+    end
 
     clear_exports!()
 end
