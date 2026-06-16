@@ -96,6 +96,7 @@ and `to_c(x::T)` (native → carrier). Built-in boundary types:
 | `Union{T,Nothing}` | T or None | `PtOpt{C}` |
 | `PtVarArgs{T}` | *args (variadic) | `PtArray{T,1}` |
 | `@pyhandle T` (isbits struct) | real Python class (`isinstance`, auto fields, dunders) | `PtHandle{T}` |
+| `@pymutable T` (mutable struct, heap fields ok) | mutable Python class via GC registry; live mutation + `__next__` | `PtHandle{T}` (id packed in ptr) |
 | `PyCallable` | callable (Float64→Float64) | `Ptr{Cvoid}` |
 | User type via `@boundary T carrier=C` | depends on carrier | any existing carrier |
 
@@ -129,7 +130,21 @@ The C carrier is `PtHandle { void *ptr; }`. `from_c(T, h)` = `unsafe_load(Ptr{T}
 | `__hash__` | `Py_tp_hash` | — | `int64_t` → `Py_hash_t` | |
 | `__bool__` | `Py_nb_bool` | — | `int8_t` → `int` | |
 | `__getitem__` | `Py_sq_item` | `Int64` index (`Py_ssize_t` → `int64_t`) | any boundary → `PyObject*` | Integer indices only; slices need `Py_mp_subscript` |
+| `__setitem__` | `Py_sq_ass_item` | `Int64` index + value | `void` (write-back via `unsafe_store!`) | Returns new `T`; ccallable stores it back |
+| `__contains__` | `Py_sq_contains` | one boundary value | `int8_t` → `int` | `PyArg_Parse` unbox |
+| `__call__` | `Py_tp_call` | any boundary args (tuple) | any boundary → `PyObject*` | `PyArg_ParseTuple` |
+| `__iter__` | `Py_tp_iter` | — | self | Pure C `Py_INCREF(self); return self` (no Julia call) |
+| `__next__` | `Py_tp_iternext` | — | `PtOpt` (`Union{V,Nothing}`) | `has_value==0` → `PyErr_SetNone(StopIteration)`; advance state in place (`@pymutable`) |
+| `__enter__`, `__exit__` | `Py_tp_methods` (PyMethodDef) | — | self / `int8_t` | NOT type slots — go in the method table |
+| `__add__`,`__sub__`,`__mul__`,`__truediv__`,`__floordiv__`,`__mod__`,`__pow__`,`__matmul__` | `Py_nb_*` (binary) | same handle type → `PtHandle{T}` | any boundary → `PyObject*` | Type-guards both operands; returns `NotImplemented` for mixed types (Python tries reflected op). `__pow__` is ternaryfunc (modulo ignored) |
+| `__neg__`,`__pos__`,`__abs__`,`__invert__` | `Py_nb_*` (unary) | — | any boundary → `PyObject*` | |
 | `__eq__`, `__ne__`, `__lt__`, `__le__`, `__gt__`, `__ge__` | `Py_tp_richcompare` (shared) | same handle type → `PtHandle{T}` | `int8_t` → `PyBool_FromLong` | Single `_pt_richcmp_T`; `__eq__`↔`__ne__` auto-derived (negation); ordering ops return `NotImplemented` when not registered (Python handles reflection) |
+
+`@pymethod` is dunder-only; `is_numeric_binary`/`is_numeric_unary` (`macros.jl`) classify the
+number-protocol slots. The C-ABI carrier struct typedefs (array/opt/dict/tuple) are emitted by
+`emit_cshim` **before** `_emit_handle_type_defs`, because method slot wrappers (e.g. `__next__`'s
+`PtOpt`, `__getitem__`'s return) reference them; the carrier set is collected from exports **and**
+method/`__new__`/property signatures via `_carrier_set`.
 
 ### How `cshim.jl` generates richcmp
 
@@ -148,6 +163,36 @@ covers all four comparison directions for same-type objects.
 **Hash/eq interaction**: defining `__eq__` without `__hash__` makes the type unhashable
 (CPython's `type_ready` sets `tp_hash = PyObject_HashNotImplemented` when `tp_richcompare`
 is set but `tp_hash` is not). Register `@pymethod __hash__` alongside `__eq__` to retain hashability.
+
+## `@pymutable` — mutable classes via a GC registry (`boundary.jl`)
+
+`@pymutable T` registers a **`mutable struct`** (heap fields like `String`/`Vector` allowed) as a
+real, mutable Python class. It reuses the `PtHandle{T}` carrier but packs a registry **id** (Int64)
+into the pointer slot instead of a malloc'd struct pointer. The macro (in the user file, so it has
+lexical access to the registry) emits, at file/global scope:
+
+- `const _PtRegistry_T = Dict{Int64,T}()` + `const _PtIdSeq_T = Ref{Int64}(0)` — the GC root.
+- `to_c(obj)::PtHandle{T}` → increments the seq, stores `obj`, packs the id. `from_c(T, h)` →
+  `_PtRegistry_T[id]` (the **live** object, not a copy — mutations persist).
+- `Base.@ccallable _pt_dealloc_T_jl(h)::Cvoid` → `delete!(_PtRegistry_T, id)` (called from
+  C `tp_dealloc`, releasing the reference for Julia GC).
+
+All ops are concrete-typed, so they stay trim-safe. A `@pymutable` type is registered in **both**
+`_HANDLE_TYPES` (it needs a `PyTypeObject`) and `_MUTABLE_STRUCT_TYPES` (marks the registry-backed
+codegen path). In `_emit_handle_type_defs`, `is_mut_struct = T in mutable_struct_types` branches:
+the dealloc calls the Julia ccallable (not `free`), and scalar/`String` fields are exposed
+read/write via per-field getter/setter `@ccallable`s (`pt_field_get_T_f` / `pt_field_set_T_f`,
+emitted by `emit_ccallable_field_accessors`) routed through `Py_tp_getattro`/`Py_tp_setattro` —
+**not** raw memory reads, since fields may be non-isbits.
+
+Because `__new__`, `@pymethod`s, and `@pyfunc` args/returns all go through the shared `PtHandle`
+plumbing, only `to_c`/`from_c`/dealloc/field-access differ from `@pyhandle`. **Bound named methods
+are not supported**: write mutating methods as module-level `@pyfunc f(c::T, …)` (which mutate the
+live registry object, persisting), invoked as `mod.f(c)`. Stateful iterators are the canonical use:
+`@pymethod __iter__ (self-return)` + `@pymethod __next__ (::Union{V,Nothing})`.
+
+Registries (`_MUTABLE_STRUCT_TYPES`) thread through the 8-tuple `_preloaded`
+(`build.jl`/`wheel.jl`) and into `emit_entry`/`emit_cshim` as `mutable_struct_types`.
 
 ## The CLI (`app/pt.jl`, `src/cli.jl`)
 

@@ -46,8 +46,10 @@ Full guide, boundary-type reference, and worked examples:
 |------------------|---------|
 | `@pyfunc f(a::T)::R = …` | Mark a function for export (emits it normally + records its signature). An optional leading string sets the Python name: `@pyfunc "py_name" f(…) = …`. |
 | `@pymodule name begin … end` | Group `@pyfunc` definitions and name the Python module. |
-| `@pyhandle T` | Expose an isbits struct `T` as a real Python class; scalar fields become read-only attributes. |
-| `@pymethod __repr__ f(p::T)::String = …` | Attach a Python dunder (`__repr__`/`__str__`, `__len__`/`__hash__`/`__bool__`, `__getitem__`, `__eq__`/`__ne__`/`__lt__`/`__le__`/`__gt__`/`__ge__`) to a `@pyhandle` type. |
+| `@pyhandle T` | Expose an isbits struct `T` as a real Python class; scalar fields become attributes (read-only, or read/write with `mutable=true`). |
+| `@pymutable T` | Expose a **`mutable struct`** (heap fields like `String`/`Vector` allowed) as a mutable Python class backed by a Julia GC registry; methods mutate the live object in place. |
+| `@pymethod <dunder> f(p::T)… = …` | Attach a Python dunder to a `@pyhandle`/`@pymutable` type: `__new__` (constructor), `__repr__`/`__str__`, `__len__`/`__hash__`/`__bool__`, `__getitem__`/`__setitem__`, `__contains__`, `__call__`, `__iter__`/`__next__`, `__enter__`/`__exit__`, comparisons (`__eq__`…`__ge__`), and numeric ops (`__add__`/`__sub__`/`__mul__`/`__neg__`/`__abs__`/…). |
+| `@pyproperty T name::V (p -> …)` | Attach a computed read-only property to a handle type. |
 | `build_extension(path; mod_name, outdir, trim, python, verbose)` | Build just the importable extension `.so` (the surrounding env must provide libjulia). |
 | `build_wheel(path; version, mod_name, outdir, python, trim, runtime, slim, abi3, emit_pyproject, verbose)` | Build a self-contained, pip-installable wheel that bundles the Julia runtime. |
 | `build_multi_wheel(sources, mod_name; …)` | Aggregate several `@pymodule` files into one wheel (one shared runtime) exposing each as a submodule, so they co-import in one process. |
@@ -129,12 +131,14 @@ metadata. The boundary type system reuses
 
 ## Status
 
-v0.20 — full build pipeline shipping: scalars, strings, N-D numeric arrays,
+v0.24 — full build pipeline shipping: scalars, strings, N-D numeric arrays,
 `ComplexF64`, `Vector{String}`, `Dict{String,V}`, `Vector{UInt8}` (bytes),
 `Union{T,Nothing}` (Optional), `NamedTuple`, `Tuple`, real-Python-class opaque
-handles (`@pyhandle` — `isinstance`, auto read-only field access, and
-`@pymethod __repr__`/`__str__`/`__len__`/`__hash__`/`__bool__`/`__getitem__`/`__eq__`/`__ne__`/`__lt__`/`__le__`/`__gt__`/`__ge__`), custom Python exception
-types (`@pyerror`), keyword/default
+handles (`@pyhandle` — `isinstance`, auto field access with optional `mutable=true`,
+constructor/repr/len/hash/bool/getitem/setitem/contains/call/iter/next/enter/exit,
+comparison + numeric dunders, `@pyproperty`), mutable classes with heap fields and
+stateful iterators (`@pymutable` — GC-registry-backed, in-place mutation, `__next__`),
+custom Python exception types (`@pyerror`), keyword/default
 arguments, arbitrary-signature `PyCallable{Args,Ret}` callbacks, manylinux
 tagging, abi3 stable-ABI wheels, shared-runtime wheels, slim bundling,
 multi-module wheels (`build_multi_wheel`), `pyproject.toml` generation,

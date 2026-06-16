@@ -14,7 +14,7 @@ the Python object graph you can reach from native code.
 | Annotation | `@pyfunc` / `@pymodule` | `#[pyfunction]` / `#[pymodule]` |
 | Build CLI | `pt wheel file.jl` (or `build_wheel("file.jl")`) | `maturin build` |
 | Type mapping | Explicit boundary contract | Derive macros + `FromPyObject` / `IntoPyObject` |
-| Classes | `@pyhandle` (isbits structs; `isinstance`, auto/mutable fields, 15+ dunders, `@pyproperty`, context managers) | `#[pyclass]` (full object protocol; arbitrary struct fields) |
+| Classes | `@pyhandle` (isbits) + `@pymutable` (heap fields, GC registry); `isinstance`, mutable fields, ~25 dunders incl. numeric + iterator (`__next__`), `@pyproperty`, context managers | `#[pyclass]` (full object protocol; arbitrary struct fields) |
 | Custom exceptions | `@pyerror MyError <: ValueError` | `create_exception!` |
 | Python callables | `PyCallable{Args,Ret}` (any scalar signature) | `Py<PyAny>` / `PyCallable` (any signature) |
 | GIL release during call | Yes (automatic) | Yes (opt-in with `py.allow_threads`) |
@@ -155,17 +155,45 @@ For context managers, `__enter__` / `__exit__` go in the `Py_tp_methods` table
 @pymethod __exit__  cm_exit(c::Conn)::Bool  = (close!(c); false)
 ```
 
-For callable handles, `__call__` uses `PyArg_ParseTuple`:
+Callable handles (`__call__`), numeric operators (`__add__`, `__mul__`, `__neg__`,
+`__abs__`, …, mapped to the `Py_nb_*` slots), and comparisons round out the
+protocol.
+
+`@pyhandle` itself is limited to `isbitstype` structs (no `String`/`Vector`
+fields). For mutable objects with heap fields, use **`@pymutable`**, which backs
+each instance with a per-type Julia GC registry (`Dict{Int64, T}`) — the Python
+object holds only an id, and `from_c` returns the *live* Julia object so methods
+mutate it in place:
 
 ```julia
-@pymethod __call__ model_fwd(m::Model, x::Float64)::Float64 = m.w * x + m.b
+mutable struct Counter
+    count::Int64
+    name::String        # heap field — not allowed in @pyhandle
+end
+@pymutable Counter
+
+@pymethod __new__ counter_new(name::String)::Counter = Counter(0, name)
+# A module-level @pyfunc mutates the live object; the change persists.
+@pyfunc bump(c::Counter)::Int64 = (c.count += 1; c.count)
 ```
 
-The restriction to `isbitstype` structs remains: `@pyhandle` does not support
-fields of type `String`, `Vector`, or other heap-allocated Julia values.
-For those, `@pymutable` (planned) will use a GC-rooted ID registry. Python
-inheritance is not supported. The `__next__` slot (stateful iteration) requires
-mutable state and is deferred to `@pymutable`.
+Stateful iterators are the canonical use: `@pymethod __next__` returns
+`Union{V, Nothing}` (`nothing` → `StopIteration`) and advances state in place, so
+`for`, `list`, `sum`, and comprehensions all work:
+
+```julia
+mutable struct CountUp; cur::Int64; stop::Int64; end
+@pymutable CountUp
+@pymethod __iter__ cu_iter(c::CountUp)::CountUp = c
+@pymethod __next__ cu_next(c::CountUp)::Union{Int64,Nothing} =
+    c.cur >= c.stop ? nothing : (c.cur += 1; c.cur - 1)
+```
+
+The registry is a concretely-typed global, so `to_c`/`from_c`/dealloc stay
+trim-safe. The remaining gaps vs `#[pyclass]` are **Python inheritance** and
+**bound named methods** (today, methods on a `@pymutable` are written as
+module-level `@pyfunc`s taking the object, e.g. `mod.bump(c)` rather than
+`c.bump()`).
 
 ## Error handling
 
@@ -317,10 +345,10 @@ build can take minutes.
 
 - Your performance-critical code is in Rust, or you want Rust's memory-safety
   guarantees in the extension layer.
-- You need handle types with **heap-allocated fields** (`String`, `Vec`, nested
-  structs): `@pyhandle` is restricted to `isbitstype` structs; `@pymutable` (planned)
-  covers the general case.
-- You need **stateful iteration** (`__next__`) or **Python inheritance**.
+- You need **Python inheritance**, or **bound named methods** on a class
+  (ParselTongue exposes class methods as module-level functions, not `obj.method()`).
+- You need **mixed-type operator overloading** (e.g. `vec * float`); ParselTongue's
+  numeric dunders require both operands to be the same handle type.
 - You need **free-threading** CPython.
 - You need a fully self-contained wheel with **nothing installed once**: a PyO3
   wheel carries its whole runtime, whereas a ~1 MB ParselTongue wheel still needs a
