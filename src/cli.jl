@@ -35,6 +35,7 @@ Options (wheel):
                           shared:  ~1 MB + parseltongue-runtime dependency
                           system:  ~1 MB, requires Julia on target machine
   --slim                  Exclude large optional runtime libs (bundled only)
+  --emit-pyproject        Also write a pyproject.toml next to the wheel
   --verbose               Print commands
 
 Options (bench):
@@ -99,7 +100,7 @@ function _cmd_wheel(args::AbstractVector{<:AbstractString})::Cint
         println("usage: pt wheel FILE.jl [--outdir=dist] [--version=0.1.0] ",
                 "[--mod-name=NAME] [--trim=safe|unsafe] ",
                 "[--manylinux=2.17|false] [--runtime=bundled|shared|system] ",
-                "[--slim] [--verbose]")
+                "[--slim] [--emit-pyproject] [--verbose]")
         return isempty(pos) ? 1 : 0
     end
     file      = pos[1]
@@ -111,8 +112,10 @@ function _cmd_wheel(args::AbstractVector{<:AbstractString})::Cint
     manylinux = ml_raw == "false" ? false : ml_raw == "true" ? true : ml_raw
     runtime   = Symbol(get(flags, "runtime", "bundled"))
     slim      = _bool_flag(flags, "slim")
+    emit_pp   = _bool_flag(flags, "emit-pyproject")
     verbose   = _bool_flag(flags, "verbose")
-    whl = build_wheel(file; outdir, version, mod_name=mod, trim, manylinux, runtime, slim, verbose)
+    whl = build_wheel(file; outdir, version, mod_name=mod, trim, manylinux, runtime, slim,
+                      emit_pyproject=emit_pp, verbose)
     println("Built: ", whl)
     return 0
 end

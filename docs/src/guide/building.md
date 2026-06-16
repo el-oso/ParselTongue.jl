@@ -44,7 +44,27 @@ Both functions accept:
 | `python` | `"python3"` | the Python interpreter to target |
 | `verbose` | `false` | print the juliac and link commands |
 
-`build_wheel` additionally takes `version` (default `"0.1.0"`).
+`build_wheel` additionally takes `version` (default `"0.1.0"`), `runtime`
+(`:bundled` / `:shared` / `:system`), `slim`, `manylinux`, `abi3`, and
+`emit_pyproject`.
+
+### `emit_pyproject` — a publishable project layout
+
+Pass `emit_pyproject=true` to write a minimal PEP 621 `pyproject.toml` next to
+the wheel, turning the output directory into a project layout ready for
+`twine upload` / PyPI:
+
+```julia
+build_wheel("mymod.jl"; version="1.0.0", outdir="dist", emit_pyproject=true)
+# dist/mymod-1.0.0-…-linux_x86_64.whl
+# dist/pyproject.toml   ← name, version, requires-python, numpy extra
+```
+
+`requires-python` is `>=3.11` for `abi3=true` wheels (which run on any CPython ≥
+3.11), otherwise the build interpreter's version. A `runtime=:shared` build adds
+the `parseltongue-runtime` dependency. The wheel itself is still produced by
+juliac — the `pyproject.toml` documents project metadata for publishing tools.
+On the CLI: `pt wheel mymod.jl --emit-pyproject`.
 
 ### Trim modes
 

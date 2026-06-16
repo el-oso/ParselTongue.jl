@@ -209,3 +209,37 @@ end
         @test occursin("ABI3_OK", out)
     end
 end
+
+# Exercise the build_wheel pipeline (distinct from build_extension). Uses
+# runtime=:system so no ~100 MB runtime is vendored — fast, and it still drives
+# the full include → juliac → shim → __init__.py → zip path plus _preloaded
+# threading. This guards against regressions in the wheel-only code path, which
+# build_extension tests do not cover.
+@testset "integration: build_wheel (system runtime + pyproject)" begin
+    if !_have_tools()
+        @info "skipping build_wheel integration test (need python3, a C compiler, and juliac)"
+        @test_skip true
+    else
+        fixture = joinpath(@__DIR__, "fixtures", "feature.jl")
+        outdir  = mktempdir()
+        whl = build_wheel(fixture; runtime=:system, outdir=outdir,
+                          version="0.1.0", emit_pyproject=true)
+        @test isfile(whl)
+        @test endswith(whl, ".whl")
+        # pyproject.toml emitted alongside the wheel (item M).
+        pyproj = joinpath(outdir, "pyproject.toml")
+        @test isfile(pyproj)
+        s = read(pyproj, String)
+        @test occursin("[project]", s)
+        @test occursin("name = \"feature\"", s)
+        @test occursin("version = \"0.1.0\"", s)
+        # The wheel is a valid zip containing the package __init__.py.
+        names = _py_run("""
+        import zipfile
+        with zipfile.ZipFile($(repr(whl))) as z:
+            print("\\n".join(z.namelist()))
+        """)
+        @test occursin("feature/__init__.py", names)
+        @test occursin(r"feature/_feature\..*\.so", names)
+    end
+end

@@ -5,7 +5,7 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     PtExport, PtArray, emit_ccallable, emit_entry, emit_cshim,
                     _EXPORTS, clear_exports!, _default_py_name, submodule_names,
                     _julia_version_str, _runtime_wheel_tag, _runtime_metadata,
-                    _RUNTIME_INIT_PY, _write_pkg_pyfiles,
+                    _RUNTIME_INIT_PY, _write_pkg_pyfiles, _write_pyproject,
                     _write_shared_pkg_pyfiles, _write_system_pkg_pyfiles,
                     _current_os_kernel,
                     _readelf_needed, _transitive_needed, _resolve_soname,
@@ -583,6 +583,39 @@ end
     @test :system in (:bundled, :shared, :system)
     # The error message for slim+system contains ":system".
     @test occursin(":system", "slim=true is not meaningful with runtime=:system (no libs are vendored)")
+end
+
+@testset "pyproject.toml generation (item M)" begin
+    dir = mktempdir()
+    try
+        path = joinpath(dir, "pyproject.toml")
+        _write_pyproject(path, "mymod", "1.2.3"; requires_python=">=3.11")
+        s = read(path, String)
+        # PEP 518/621 sections.
+        @test occursin("[build-system]", s)
+        @test occursin("build-backend", s)
+        @test occursin("[project]", s)
+        @test occursin("name = \"mymod\"", s)
+        @test occursin("version = \"1.2.3\"", s)
+        @test occursin("requires-python = \">=3.11\"", s)
+        # No runtime dep → empty dependencies list.
+        @test occursin("dependencies = []", s)
+        # numpy optional extra always present.
+        @test occursin("[project.optional-dependencies]", s)
+        @test occursin("numpy", s)
+
+        # With a shared-runtime requirement, it lands in dependencies.
+        path2 = joinpath(dir, "pyproject2.toml")
+        _write_pyproject(path2, "mymod", "0.1.0";
+                         requires_python=">=3.12",
+                         runtime_req="parseltongue-runtime ~= 1.12.0")
+        s2 = read(path2, String)
+        @test occursin("requires-python = \">=3.12\"", s2)
+        @test occursin("parseltongue-runtime ~= 1.12.0", s2)
+        @test occursin("dependencies = [\"parseltongue-runtime ~= 1.12.0\"]", s2)
+    finally
+        rm(dir; recursive=true)
+    end
 end
 
 @testset "Optional{T} boundary types (item C)" begin

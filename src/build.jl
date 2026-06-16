@@ -84,9 +84,10 @@ function build_extension(user_path::AbstractString;
                          strip_abs_rpath::Bool=false,
                          keep_build::Bool=false,
                          verbose::Bool=false,
-                         # Internal: pass (exports, errors, handle_types) from build_wheel to skip
-                         # the second include of the user source (the first is in build_wheel).
-                         _preloaded::Union{Nothing,Tuple{Vector{PtExport},Vector{PtError},Vector{<:Type}}}=nothing)
+                         # Internal: pass (exports, errors, handle_types, methods) from
+                         # build_wheel to skip the second include of the user source (the
+                         # first is in build_wheel).
+                         _preloaded::Union{Nothing,Tuple{Vector{PtExport},Vector{PtError},Vector{<:Type},Vector{PtMethod}}}=nothing)
     user_path = abspath(user_path)
     isfile(user_path) || error("ParselTongue: source file not found: $user_path")
     trim in (:safe, :unsafe, :unsafe_warn) ||

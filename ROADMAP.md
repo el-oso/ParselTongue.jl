@@ -317,12 +317,13 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   `src/ccallable_gen.jl` (`_type_src` PyCallable case). **Done v0.11.0.** Non-scalar
   callback args/returns remain future work.
 
-- [ ] **M. `pyproject.toml` generation** — `build_wheel` optionally emits a `pyproject.toml`
-  (and `setup.cfg` / `METADATA`) alongside the `.whl` so the output directory is a
-  pip-publishable source layout. Useful for `twine upload` / PyPI publishing workflows.
-  Minimal: `[build-system]` stub + `[project]` with name/version/requires-python. Gate
-  behind `build_wheel(...; emit_pyproject=true)`. Files: `src/wheel.jl`.
-  Effort S · Risk L.
+- [x] **M. `pyproject.toml` generation** — `build_wheel(...; emit_pyproject=true)` writes a
+  minimal PEP 621 `pyproject.toml` next to the `.whl`: `[build-system]` stub +
+  `[project]` with name/version/description, `requires-python` (`>=3.11` for abi3, else the
+  build interpreter version), a `parseltongue-runtime` dependency for `runtime=:shared`, and
+  the `numpy` optional extra. Makes the output directory a publishable layout for
+  `twine upload` / PyPI. Also exposed as `pt wheel … --emit-pyproject`.
+  Files: `src/wheel.jl` (`_write_pyproject`), `src/cli.jl`. **Done v0.12.0.**
 
 - [ ] **N. Multi-module wheels** — package several `@pymodule` source files into one wheel so
   they share a single Julia runtime image and can be imported together in one Python process.
