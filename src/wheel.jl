@@ -195,6 +195,8 @@ function build_wheel(user_path::AbstractString;
     end
 
     # 4. dist-info metadata.
+    # ~= X.Y.0 is derived from VERSION string; pre-release Julia (e.g. 1.13.0-DEV)
+    # will produce a pin that pip cannot match against a dev parseltongue-runtime.
     julia_major_minor = join(split(_julia_version_str(), '.')[1:2], '.')
     runtime_req = runtime === :shared ?
         "parseltongue-runtime ~= $(julia_major_minor).0" : nothing

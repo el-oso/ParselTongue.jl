@@ -108,11 +108,12 @@ c_abi_type(::Type{Nothing}) = Cvoid
 
 c_abi_type(::Type{String}) = Cstring
 
-from_c(::Type{String}, c::Cstring) = unsafe_string(c)
+from_c(::Type{String}, c::Cstring) = (@assert c != C_NULL; unsafe_string(c))
 
 function to_c(s::String)::Cstring
     n = sizeof(s)
     p = Ptr{UInt8}(Libc.malloc(n + 1))
+    @assert p != C_NULL
     GC.@preserve s unsafe_copyto!(p, pointer(s), n)
     unsafe_store!(p, 0x00, n + 1)   # NUL terminator
     return Cstring(p)
@@ -169,6 +170,7 @@ macro pyhandle(T_expr)
         ParselTongue.c_abi_type(::Type{$T}) = ParselTongue.PtHandle{$T}
         function ParselTongue.to_c(obj::$T)::ParselTongue.PtHandle{$T}
             p = Ptr{$T}(Libc.malloc(sizeof($T)))
+            @assert p != C_NULL
             unsafe_store!(p, obj)
             ParselTongue.PtHandle{$T}(Ptr{Cvoid}(p))
         end
@@ -461,7 +463,10 @@ struct PtOpt{C}
 end
 
 _is_optional(@nospecialize(T::Type)) = T isa Union && (T.a === Nothing || T.b === Nothing)
-_opt_inner(@nospecialize(T::Type))   = T.a === Nothing ? T.b : T.a
+function _opt_inner(@nospecialize(T::Type))
+    @assert !(T.a isa Union) && !(T.b isa Union) "ParselTongue: Union{A,B,Nothing} is not a supported Optional type"
+    T.a === Nothing ? T.b : T.a
+end
 
 # Predicate on the carrier (as used in ccallable_gen.jl and cshim.jl).
 isopt(@nospecialize(C::Type)) = C isa DataType && C.name === PtOpt.body.name
@@ -611,6 +616,11 @@ function (f::PyCallable)(x::Float64)::Float64
     end
     r = ccall(:PyFloat_AsDouble, Float64, (Ptr{Cvoid},), result)
     ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), result)
+    if ccall(:PyErr_Occurred, Ptr{Cvoid}, ()) != C_NULL
+        ccall(:PyErr_Clear, Cvoid, ())
+        ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
+        error("PyCallable: Python callable returned a non-float value")
+    end
     ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
     return r
 end

@@ -82,6 +82,7 @@ function _cmd_build(args::AbstractVector{<:AbstractString})::Cint
         return isempty(pos) ? 1 : 0
     end
     file    = pos[1]
+    length(pos) > 1 && @warn "pt build: extra arguments ignored" extra=pos[2:end]
     outdir  = get(flags, "outdir", dirname(abspath(file)))
     mod     = get(flags, "mod-name", nothing)
     trim    = Symbol(get(flags, "trim", "safe"))

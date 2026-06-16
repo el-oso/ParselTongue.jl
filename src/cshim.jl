@@ -11,6 +11,9 @@
 # numpy is importable at runtime (else a memoryview) — numpy is never a
 # build-time dependency.
 
+# Escape a Julia string for safe embedding in a C string literal.
+_c_escape(s::AbstractString) = replace(replace(s, "\\" => "\\\\"), "\"" => "\\\"")
+
 # How to receive one Python argument of a given carrier.
 struct ArgPlan
     decls::Vector{String}    # C declarations of temporaries
@@ -271,7 +274,7 @@ function _ap_stra(tmp::String)
         string(tmp, ".data = (char **)malloc(", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
         string("if (!", tmp, ".data) { PyErr_NoMemory(); return NULL; }"),
         string(tmp, ".len = (int64_t)", ni, ";"),
-        string("memset(", tmp, ".data, 0, (size_t)", ni, " * sizeof(char *));"),
+        string("memset(", tmp, ".data, 0, ", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
         string("Py_ssize_t ", ii, "; for (", ii, " = 0; ", ii, " < ", ni, "; ", ii, "++) {"),
         string("    PyObject *", itm, " = PyList_GetItem(", obj, ", ", ii, ");"),
         string("    Py_ssize_t ", szv, ";"),
@@ -396,7 +399,7 @@ function _ap_dict(tmp::String, @nospecialize(C::Type))
         (string("double _vd_", tmp, " = PyFloat_AsDouble(", vv, ");"),
          string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
          string(tmp, ".vals[", ii, "] = (", cs.ctype, ")_vd_", tmp, ";"))
-    elseif startswith(cs.ctype, "u")  # unsigned integer
+    elseif vc in (UInt8, UInt16, UInt32, UInt64)  # unsigned integer
         (string("unsigned long long _vu_", tmp, " = PyLong_AsUnsignedLongLong(", vv, ");"),
          string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
          string(tmp, ".vals[", ii, "] = (", cs.ctype, ")_vu_", tmp, ";"))
@@ -524,7 +527,7 @@ function _bp_opt(@nospecialize(C::Type), val::AbstractString, out::AbstractStrin
         cs = _CSCALARS[inner_C]
         inner_build = string(cs.build, "((", cs.cast, ")", val, ".value)")
     elseif inner_C === Cstring
-        inner_build = string("PyUnicode_FromString(", val, ".value)")
+        inner_build = string("PyUnicode_FromString(", val, ".value); free((void *)", val, ".value)")
     else
         error("ParselTongue: Optional return with inner type `$inner_C` is not yet supported.")
     end
@@ -551,7 +554,9 @@ function _bp_dict(@nospecialize(C::Type), val::AbstractString, out::AbstractStri
         string("for (int64_t ", ii, " = 0; ", ii, " < ", val, ".len; ", ii, "++) {"),
         string("    PyObject *", vobj, " = ", vbuild, ";"),
         string("    if (!", vobj, " || PyDict_SetItemString(", out, ", ", val, ".keys[", ii, "], ", vobj, ") < 0) {"),
-        string("        Py_XDECREF(", vobj, "); Py_DECREF(", out, "); ", out, " = NULL; break;"),
+        string("        Py_XDECREF(", vobj, ");"),
+        string("        for (int64_t _fj = ", ii, " + 1; _fj < ", val, ".len; _fj++) free(", val, ".keys[_fj]);"),
+        string("        Py_DECREF(", out, "); ", out, " = NULL; break;"),
         "    }",
         string("    Py_DECREF(", vobj, "); free(", val, ".keys[", ii, "]);"),
         "}",
@@ -660,7 +665,7 @@ function _insert_cleanup_before_return(s::String, cleanups::Vector{String})
 end
 
 function _wrapper_fn_varargs(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=false)
-    va_idx = findfirst(a -> isvarargs(a.jl_type), e.args)::Int
+    va_idx = something(findfirst(a -> isvarargs(a.jl_type), e.args))
     T_elt  = _varargs_elt(e.args[va_idx].jl_type)
     ei     = _ELTINFO[T_elt]
     cs     = _CSCALARS[T_elt]
@@ -826,8 +831,8 @@ function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=
     any(a -> isvarargs(a.jl_type), e.args) && return _wrapper_fn_varargs(e; errors, abi3)
     wname = string("pyw_", e.export_name)
     io = IOBuffer()
-    has_defaults = any(a -> a.default !== nothing, e.args)
-    if has_defaults
+    has_kw = any(a -> a.default !== nothing || a.is_keyword, e.args)
+    if has_kw
         println(io, "static PyObject *", wname,
                 "(PyObject *self, PyObject *args, PyObject *kwargs) {")
     else
@@ -856,9 +861,9 @@ function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=
         push!(kwnames, string(a.name))
     end
 
-    fmt_str = String(take!(fmt_req)) * (has_defaults ? "|" * String(take!(fmt_opt)) : "")
+    fmt_str = String(take!(fmt_req)) * (has_kw ? "|" * String(take!(fmt_opt)) : "")
 
-    if has_defaults
+    if has_kw
         # kwlist: all arg names in order, NULL-terminated, declared static.
         kw_entries = join(("\"$n\"" for n in kwnames), ", ")
         println(io, "    static char *_kwlist[] = {", kw_entries, ", NULL};")
@@ -981,17 +986,28 @@ function _dict_structs(exports::AbstractVector{PtExport})
 end
 
 _uses_arrays(exports) = !isempty(_array_structs(exports))
-_uses_bytes(exports) = any(e -> c_abi_type(e.ret) === PtArray{UInt8,1} ||
-                                (istuple(c_abi_type(e.ret)) &&
-                                 any(S -> S === PtArray{UInt8,1}, fieldtypes(c_abi_type(e.ret)))),
-                           exports)
+function _carrier_is_bytes(@nospecialize(C::Type))
+    C === PtArray{UInt8,1} ||
+    (isopt(C) && _opt_inner_c(C) === PtArray{UInt8,1}) ||
+    (istuple(C) && any(S -> S === PtArray{UInt8,1}, fieldtypes(C)))
+end
+_uses_bytes(exports) = any(e -> _carrier_is_bytes(c_abi_type(e.ret)), exports)
+
+function _carrier_is_strarr(@nospecialize(C::Type))
+    isstrarr(C) ||
+    (isopt(C) && isstrarr(_opt_inner_c(C))) ||
+    (istuple(C) && any(isstrarr, fieldtypes(C)))
+end
 _uses_strarr(exports) = any(e -> any(a -> isstrarr(c_abi_type(a.jl_type)), e.args) ||
-                                  isstrarr(c_abi_type(e.ret)) ||
-                                  (istuple(c_abi_type(e.ret)) && any(isstrarr, fieldtypes(c_abi_type(e.ret)))),
-                            exports)
-_uses_handles(exports) = any(e -> ishandle(c_abi_type(e.ret)) ||
-                                   any(a -> ishandle(c_abi_type(a.jl_type)), e.args) ||
-                                   (istuple(c_abi_type(e.ret)) && any(ishandle, fieldtypes(c_abi_type(e.ret)))),
+                                  _carrier_is_strarr(c_abi_type(e.ret)), exports)
+
+function _carrier_is_handle(@nospecialize(C::Type))
+    ishandle(C) ||
+    (isopt(C) && ishandle(_opt_inner_c(C))) ||
+    (istuple(C) && any(ishandle, fieldtypes(C)))
+end
+_uses_handles(exports) = any(e -> _carrier_is_handle(c_abi_type(e.ret)) ||
+                                   any(a -> ishandle(c_abi_type(a.jl_type)), e.args),
                              exports)
 
 const _WRAP_BYTES_HELPER = """
@@ -1133,13 +1149,18 @@ static PyObject *_pt_wrap_ndarray(void *data, Py_ssize_t nbytes, const char *dty
         return mv;
     }
     PyObject *flat = PyObject_CallMethod(np, "frombuffer", "Os", buf, dtype);
-    Py_DECREF(buf);   /* numpy holds ref to buf via flat.base */
+    /* buf ownership: numpy takes a ref via flat.base on success; on failure buf was
+       already DECREF'd by frombuffer, so we must not touch it after this point. */
+    Py_DECREF(buf);
     Py_DECREF(np);
     if (!flat) return NULL;
     PyObject *sh = PyTuple_New(ndim);
     if (!sh) { Py_DECREF(flat); return NULL; }
-    for (int i = 0; i < ndim; i++)
-        PyTuple_SetItem(sh, i, PyLong_FromSsize_t(shape[i]));
+    for (int i = 0; i < ndim; i++) {
+        PyObject *_sh_item = PyLong_FromSsize_t(shape[i]);
+        if (!_sh_item) { Py_DECREF(sh); Py_DECREF(flat); return NULL; }
+        PyTuple_SetItem(sh, i, _sh_item);
+    }
     PyObject *kw = Py_BuildValue("{s:s}", "order", order == 1 ? "F" : "C");
     PyObject *args = PyTuple_Pack(1, sh);
     PyObject *reshape = PyObject_GetAttrString(flat, "reshape");
@@ -1241,10 +1262,9 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
     println(io, "static PyMethodDef ", mod_name, "_methods[] = {")
     for (e, wname) in zip(exports, wnames)
         has_va = any(a -> isvarargs(a.jl_type), e.args)
-        # For varargs functions: METH_KEYWORDS only when there are keyword-only args.
-        # For normal functions: METH_KEYWORDS when any arg has a default value.
-        has_kw = has_va ? any(a -> a.is_keyword, e.args) :
-                          any(a -> a.default !== nothing, e.args)
+        has_kw = any(a -> a.default !== nothing || a.is_keyword, e.args)
+        # export_name is validated as a Python identifier by _is_py_ident, so it
+        # is always safe to embed in a C string literal (no " or \ possible).
         if has_kw
             println(io, "    {\"", e.export_name, "\", (PyCFunction)", wname,
                     ", METH_VARARGS | METH_KEYWORDS, \"", e.export_name, " (Julia)\"},")
@@ -1257,7 +1277,7 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
     println(io, "};")
     println(io)
     println(io, "static struct PyModuleDef ", mod_name, "_module = {")
-    println(io, "    PyModuleDef_HEAD_INIT, \"", mod_name, "\", \"", doc, "\", -1, ", mod_name, "_methods")
+    println(io, "    PyModuleDef_HEAD_INIT, \"", mod_name, "\", \"", _c_escape(doc), "\", -1, ", mod_name, "_methods")
     println(io, "};")
     println(io)
     println(io, "PyMODINIT_FUNC PyInit_", mod_name, "(void) {")

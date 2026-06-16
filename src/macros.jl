@@ -294,6 +294,7 @@ function _register_export!(e::PtExport)
     end
     # Returns are validated in the return direction (only need c_abi_type + to_c),
     # which also admits `Nothing` (void) and `Tuple{…}`.
+    isvarargs(e.ret) && error("@pyfunc: `PtVarArgs` cannot be used as a return type.")
     assert_ret_boundary(e.ret)
     # Validate PtVarArgs constraints.
     va_indices = findall(a -> isvarargs(a.jl_type), e.args)
@@ -311,6 +312,13 @@ function _register_export!(e::PtExport)
                 error("@pyfunc: PtVarArgs must be the last positional argument; " *
                       "`$(e.args[j].name)` follows it.")
         end
+    end
+    # Keyword-only args without a default are unreachable by name (METH_VARARGS has
+    # no kwargs dict). Reject early rather than silently treating them as positional.
+    for a in e.args
+        a.is_keyword && a.default === nothing &&
+            error("@pyfunc: keyword argument `$(a.name)` must have a default value " *
+                  "(keyword-only args without defaults are unreachable from Python).")
     end
     # Replace any existing export with the same Python name (last definition wins).
     filter!(x -> x.export_name != e.export_name, _EXPORTS)

@@ -99,7 +99,6 @@ function build_extension(user_path::AbstractString;
         _preloaded
     else
         clear_exports!()
-        _MODULE_NAME[] = nothing
         sandbox = Module(:ParselTongueUserSandbox)
         Core.eval(sandbox, :(using ParselTongue))
         Base.include(sandbox, user_path)
