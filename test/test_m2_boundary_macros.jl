@@ -438,12 +438,12 @@ end
     # Must be a valid Python docstring (triple double-quotes).
     @test startswith(strip(_RUNTIME_INIT_PY), "\"\"\"")
 
-    # _write_shared_pkg_pyfiles generates __init__.py with LD_LIBRARY_PATH logic.
+    # _write_shared_pkg_pyfiles generates __init__.py with LD_LIBRARY_PATH logic (Linux).
     clear_exports!()
     @pyfunc _test_shared_add(a::Float64, b::Float64)::Float64 = a + b
     pkgdir = mktempdir()
     try
-        _write_shared_pkg_pyfiles(pkgdir, "_mymod", _EXPORTS, "mymod")
+        _write_shared_pkg_pyfiles(pkgdir, "_mymod", _EXPORTS, "mymod"; _os_kernel=:linux)
         init = read(joinpath(pkgdir, "__init__.py"), String)
         @test occursin("parseltongue_runtime", init)
         @test occursin("LD_LIBRARY_PATH", init)

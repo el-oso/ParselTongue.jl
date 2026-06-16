@@ -48,7 +48,7 @@ jobs:
 
       - name: Install Python extras (macOS)
         if: runner.os == 'macOS'
-        run: pip3 install numpy
+        run: pip3 install numpy --break-system-packages
 
       - name: Install Python extras (Windows)
         if: runner.os == 'Windows'
