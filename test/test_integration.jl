@@ -174,6 +174,27 @@ end
         # Arbitrary callable signatures (item L): (Int64, Int64) -> Int64
         assert feature.combine(lambda a, b: a + b, 3, 4) == 7,   "combine: add"
         assert feature.combine(lambda a, b: a * b, 6, 7) == 42,  "combine: mul"
+        # Refcount-leak gate: calling a wrapper must not leak references to its
+        # arguments (e.g. an INCREF without a matching DECREF on the arg buffer or
+        # callable) nor leak Python objects per call. Catches the Python-side half
+        # of the bug class; the C-malloc half is gated by the ASan job.
+        import gc as _gc
+        def _no_refleak(fn, *args, n=2000):
+            fn(*args)                                   # warm up (interning, caches)
+            base = [sys.getrefcount(a) for a in args]
+            _gc.collect(); _n0 = len(_gc.get_objects())
+            for _ in range(n):
+                _r = fn(*args); del _r
+            _gc.collect()
+            after = [sys.getrefcount(a) for a in args]
+            assert after == base, f"arg refcount leak in {fn}: {base} -> {after}"
+            grew = len(_gc.get_objects()) - _n0
+            assert grew < 100, f"object leak in {fn}: +{grew} objects over {n} calls"
+        _no_refleak(feature.greet, "World")             # String arg + return
+        _no_refleak(feature.sum_f64, array.array("d", [1.0, 2.0, 3.0]))  # buffer arg
+        _no_refleak(feature.join_words, ["a", "b", "c"])                 # list[str] arg
+        _no_refleak(feature.words, "alpha beta gamma")                   # list[str] return
+        _no_refleak(feature.apply, (lambda x: x * 2.0), 4.0)             # PyCallable INCREF/DECREF
         print("FEATURE_OK")
         """
         out = _py_run(script)

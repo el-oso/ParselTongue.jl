@@ -344,10 +344,27 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   Also fixed in passing: the `:system`/`:shared` runtime `__init__.py` preload body was
   emitted via a triple-quoted literal that Julia *dedents*, unindenting the 2nd+ lines out
   of the `_preload()` function (a `NameError`/`IndentationError` at import). Now built from
-  explicit `\n`-joined line literals. (Note: setting `LD_LIBRARY_PATH` from inside
-  `__init__.py` does not affect glibc's already-initialised loader on Linux — a separate
-  known limitation of `runtime=:system`/`:shared`; `runtime=:bundled` uses baked rpaths and
-  is unaffected.)
+  explicit `\n`-joined line literals.
+
+- [x] **Linux `:system`/`:shared` import via ctypes preload.** Setting
+  `LD_LIBRARY_PATH` from inside `__init__.py` does not affect glibc's
+  already-initialised loader, so the extension's `dlopen` of `libjulia` failed on
+  Linux. Fixed by `ctypes.CDLL(path, RTLD_GLOBAL)`-preloading the Julia libs to a
+  fixpoint (mirrors the macOS branch) in both `_write_shared_pkg_pyfiles` and
+  `_write_system_pkg_pyfiles`; Linux still sets `LD_LIBRARY_PATH` for child
+  processes. Integration tests now import `:system`/multi wheels with only
+  `JULIA_BINDIR` set. `:bundled` was always fine (baked rpaths). **Done v0.14.0.**
+
+- [x] **C-glue memory-safety CI gate.** Assessed (and declined) a Rust/PyO3 port —
+  the glue is *generated*, the Julia-FFI half stays `unsafe`, and a Rust toolchain
+  would replace the "Julia + cc" simplicity for a partial win. Instead added a CI
+  gate targeting the exact bug class (A1/A2/A6/A15): (1) a refcount-leak harness in
+  the integration script (`sys.getrefcount` + `gc` deltas over a call loop);
+  (2) an ASan/LSan job (`test/asan/`) that `#include`s the generated shim with the
+  `pt_*` Julia symbols **stubbed** (no Julia runtime → no noise), exercises every
+  heap-owning carrier through CPython, and scoped-leak-checks each call. Validated:
+  reverting A2 turns the gate red, pinpointing `pt_opt_some`/`pyw_opt_some`.
+  **Done v0.14.0.**
 
 ## Audit findings — 2026-06-16 (open)
 
