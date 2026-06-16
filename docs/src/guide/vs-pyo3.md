@@ -14,7 +14,7 @@ the Python object graph you can reach from native code.
 | Annotation | `@pyfunc` / `@pymodule` | `#[pyfunction]` / `#[pymodule]` |
 | Build CLI | `pt wheel file.jl` (or `build_wheel("file.jl")`) | `maturin build` |
 | Type mapping | Explicit boundary contract | Derive macros + `FromPyObject` / `IntoPyObject` |
-| Classes | `@pyhandle` (isbits structs → real Python types; `isinstance`, auto field access, `@pymethod __repr__`/`__str__`/`__len__`/`__hash__`/`__bool__`/`__getitem__`/`__eq__`/`__ne__`/`__lt__`/`__le__`/`__gt__`/`__ge__`) | `#[pyclass]` (full object protocol) |
+| Classes | `@pyhandle` (isbits structs; `isinstance`, auto/mutable fields, 15+ dunders, `@pyproperty`, context managers) | `#[pyclass]` (full object protocol; arbitrary struct fields) |
 | Custom exceptions | `@pyerror MyError <: ValueError` | `create_exception!` |
 | Python callables | `PyCallable{Args,Ret}` (any scalar signature) | `Py<PyAny>` / `PyCallable` (any signature) |
 | GIL release during call | Yes (automatic) | Yes (opt-in with `py.allow_threads`) |
@@ -110,47 +110,62 @@ impl Counter {
 }
 ```
 
-**ParselTongue** has `@pyhandle`, which is deliberately more restricted:
-only `isbitstype` structs (no heap-allocated fields, no Julia GC interaction).
-Each handle type becomes a real Python class via `PyType_FromSpec`, so
-`isinstance`, `repr`, and tab-completion all work. Julia "methods" are ordinary
-`@pyfunc`s that receive and return handles. Mutation is **functional** (return a
-new handle); `tp_dealloc` frees the C-heap allocation automatically:
+**ParselTongue** has `@pyhandle` for `isbitstype` structs (all-scalar fields, no
+heap allocation, no Julia GC interaction). Each handle type becomes a real Python
+class via `PyType_FromSpec`; `isinstance`, `repr`, and tab-completion all work.
+`tp_dealloc` frees the C-heap copy automatically. The supported dunder surface is
+broad:
 
 ```julia
 struct Point; x::Float64; y::Float64; end
-@pyhandle Point
+@pyhandle Point mutable=true          # mutable=true enables p.x = ... in Python
 
-@pyfunc make_point(x::Float64, y::Float64)::Point = Point(x, y)
-@pyfunc move_x(p::Point, dx::Float64)::Point = Point(p.x + dx, p.y)
-@pyfunc norm(p::Point)::Float64 = sqrt(p.x^2 + p.y^2)
-```
+@pymethod __new__      pt_new(x::Float64, y::Float64)::Point = Point(x, y)
+@pymethod __repr__     pt_repr(p::Point)::String = "Point($(p.x), $(p.y))"
+@pymethod __len__      pt_len(p::Point)::Int64   = 2
+@pymethod __getitem__  pt_get(p::Point, i::Int64)::Float64 = i == 0 ? p.x : p.y
+@pymethod __setitem__  pt_set(p::Point, i::Int64, v::Float64)::Point =
+    i == 0 ? Point(v, p.y) : Point(p.x, v)   # write-back via unsafe_store!
+@pymethod __contains__ pt_has(p::Point, v::Float64)::Bool = p.x == v || p.y == v
+@pymethod __iter__     pt_iter(p::Point)::Point  = p   # Py_INCREF; return self
+@pymethod __eq__       pt_eq(p::Point, q::Point)::Bool = p.x == q.x && p.y == q.y
+@pymethod __lt__       pt_lt(p::Point, q::Point)::Bool =
+    p.x^2 + p.y^2 < q.x^2 + q.y^2
 
-Each scalar field is automatically exposed as a **read-only Python attribute**
-(no annotation needed), and you can override `__repr__` / `__str__` with
-`@pymethod`:
-
-```julia
-@pymethod __repr__ point_repr(p::Point)::String = "Point($(p.x), $(p.y))"
+@pyproperty Point norm::Float64 (p -> sqrt(p.x^2 + p.y^2))
 ```
 
 ```python
 import mymod
-p = mymod.make_point(3.0, 4.0)
+p = mymod.Point(3.0, 4.0)
 isinstance(p, mymod.Point)   # True
 p.x, p.y                     # (3.0, 4.0)   ← auto field access
-repr(p)                      # 'Point(3.0, 4.0)'   ← @pymethod __repr__
+p.norm                       # 5.0           ← @pyproperty
+p.x = 0.0                    # ← mutable=true
+p[1] = 9.0                   # ← __setitem__ write-back
+3.0 in p                     # ← __contains__
+p < mymod.Point(10.0, 0.0)   # ← __lt__  (__gt__ via Python reflection)
 ```
 
-A `@pymethod` takes exactly one argument — the `self` value of the handle type —
-and its return type must match the slot (`String` for `__repr__`/`__str__`). The
-underlying Julia function stays callable from Julia. Field access is read-only:
-handles are immutable value types, so "mutation" returns a new handle.
+For context managers, `__enter__` / `__exit__` go in the `Py_tp_methods` table
+(not a type slot):
 
-The `@pyhandle` restriction exists because GC rooting and arbitrary dunder
-protocols require dynamic dispatch that `--trim=safe` would reject. Beyond
-`__repr__`/`__str__` and auto field access, general user-defined dunders and
-Python inheritance are not supported.
+```julia
+@pymethod __enter__ cm_enter(c::Conn)::Conn = c
+@pymethod __exit__  cm_exit(c::Conn)::Bool  = (close!(c); false)
+```
+
+For callable handles, `__call__` uses `PyArg_ParseTuple`:
+
+```julia
+@pymethod __call__ model_fwd(m::Model, x::Float64)::Float64 = m.w * x + m.b
+```
+
+The restriction to `isbitstype` structs remains: `@pyhandle` does not support
+fields of type `String`, `Vector`, or other heap-allocated Julia values.
+For those, `@pymutable` (planned) will use a GC-rooted ID registry. Python
+inheritance is not supported. The `__next__` slot (stateful iteration) requires
+mutable state and is deferred to `@pymutable`.
 
 ## Error handling
 
@@ -302,8 +317,10 @@ build can take minutes.
 
 - Your performance-critical code is in Rust, or you want Rust's memory-safety
   guarantees in the extension layer.
-- You need to expose **mutable Python objects** (`#[pyclass]`), rich Python
-  protocols (`__iter__`, `__len__`, properties), or Python inheritance.
+- You need handle types with **heap-allocated fields** (`String`, `Vec`, nested
+  structs): `@pyhandle` is restricted to `isbitstype` structs; `@pymutable` (planned)
+  covers the general case.
+- You need **stateful iteration** (`__next__`) or **Python inheritance**.
 - You need **free-threading** CPython.
 - You need a fully self-contained wheel with **nothing installed once**: a PyO3
   wheel carries its whole runtime, whereas a ~1 MB ParselTongue wheel still needs a
