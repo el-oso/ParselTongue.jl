@@ -278,6 +278,54 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   isbitstype. `PtHandle{T}` parameterized carrier encodes the Julia type through the
   pipeline. No user-facing syntax change. Effort L · Risk M.
 
+## Phase 5 — handle ergonomics + distribution
+
+- [ ] **J. User-defined dunders on handles (`@pymethod`)** — allow annotating Julia functions
+  as Python special methods on a `@pyhandle` type, e.g.:
+  ```julia
+  @pymethod __repr__ (p::Point2D)::String = "<Point2D x=$(p.x) y=$(p.y)>"
+  @pymethod __eq__   (a::Point2D, b::Point2D)::Bool = a.x == b.x && a.y == b.y
+  ```
+  The `PyType_Slot` machinery from item 12 is already in place; `@pymethod` injects
+  additional slots into the per-type `_pt_slots_<T>[]` array before `PyType_FromSpec`.
+  Each method becomes a `Base.@ccallable` wrapper in the juliac entry, exactly like a
+  `@pyfunc`. Trim-safe by construction. Start with `__repr__`, `__eq__`, `__hash__`,
+  `__len__`. Files: `src/macros.jl` (new `PtMethod` struct + `@pymethod`),
+  `src/ccallable_gen.jl` (emit wrapper), `src/cshim.jl` (slot injection).
+  Effort M · Risk L (slot mechanism proven by item 12).
+
+- [ ] **K. Read-only field access via `__getattr__`** — for `@pyhandle T`, auto-generate a
+  `__getattr__` slot that exposes `fieldnames(T)` as Python attributes. No user annotation
+  required; fields are discovered at build time. Accessor returns the field value converted
+  via the existing `to_c` → C shim path. Conflicts with Python attribute lookup conventions
+  (shadowed by instance dict / type attrs) — use `Py_tp_getattro` pattern.
+  Files: `src/cshim.jl` (emit `_pt_getattr_<T>` + slot). Effort S · Risk L.
+
+- [ ] **L. `PyCallable` with arbitrary signatures** — today `PyCallable` is hardcoded to
+  `Float64 → Float64`. Generalize to `PyCallable{Tuple{A...}, R}` so users can accept any
+  trim-safe callback type, e.g. `PyCallable{Tuple{Float64, Int64}, Bool}`. The C shim
+  already builds the argument list via `PyObject_CallFunctionObjArgs`; the wrapper just
+  needs to marshall typed args/returns using the existing carrier machinery.
+  Files: `src/boundary.jl` (parameterize `PyCallable`), `src/cshim.jl` (`_ap_callable`,
+  `_call_py_callable` emit per signature). Effort M · Risk M (trim-safety of the marshalling
+  path needs a spike). Done-when: `@pyfunc apply(f::PyCallable{Tuple{String},Int64}, s::String)::Int64`
+  builds and calls a Python lambda.
+
+- [ ] **M. `pyproject.toml` generation** — `build_wheel` optionally emits a `pyproject.toml`
+  (and `setup.cfg` / `METADATA`) alongside the `.whl` so the output directory is a
+  pip-publishable source layout. Useful for `twine upload` / PyPI publishing workflows.
+  Minimal: `[build-system]` stub + `[project]` with name/version/requires-python. Gate
+  behind `build_wheel(...; emit_pyproject=true)`. Files: `src/wheel.jl`.
+  Effort S · Risk L.
+
+- [ ] **N. Multi-module wheels** — package several `@pymodule` source files into one wheel so
+  they share a single Julia runtime image and can be imported together in one Python process.
+  Avoids the one-extension-per-process limitation for same-runtime extensions. Approach:
+  one `juliac --trim` invocation per module (or a single combined entry file); one
+  `_<mod>.<ext>.so` per module; a top-level `__init__.py` that loads them all. Significant
+  rpath / runtime-vendoring complexity — spike first.
+  Files: `src/build.jl`, `src/wheel.jl`. Effort L · Risk M.
+
 ## Known correctness issues (audit findings — fix opportunistically)
 
 - ~~**`_link_extension` redundant Python query**~~ — fixed v0.8.0.
