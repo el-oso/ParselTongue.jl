@@ -205,7 +205,8 @@ function emit_ccallable_method(m::PtMethod; errors::Vector{PtError}=PtError[])
     T_src = _type_src(T)
     extra_params = if m.dunder === :__getitem__
         ", _idx::Int64"
-    elseif m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__)
+    elseif m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__) ||
+           is_numeric_binary(m.dunder)
         ", _other::$self_c"
     elseif m.dunder === :__setitem__
         # idx::Int64 + val carrier (extra_args[1]=Int64, extra_args[2]=val type)
@@ -220,7 +221,8 @@ function emit_ccallable_method(m::PtMethod; errors::Vector{PtError}=PtError[])
     end
     extra_call = if m.dunder === :__getitem__
         ", _idx"
-    elseif m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__)
+    elseif m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__) ||
+           is_numeric_binary(m.dunder)
         string(", ParselTongue.from_c(", T_src, ", _other)")
     elseif m.dunder === :__setitem__
         val_T_src = _type_src(m.extra_args[2].jl_type)

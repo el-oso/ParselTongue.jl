@@ -81,13 +81,40 @@ const _PYMETHOD_SLOTS = Dict{Symbol,NamedTuple}(
     # Context managers: registered via Py_tp_methods (PyMethodDef), not type slots.
     :__enter__    => (slot="Py_tp_methods",   ret_type=:same_handle_type),
     :__exit__     => (slot="Py_tp_methods",   ret_type=Bool),
+    # Stateful iteration: ret = Union{V,Nothing} (None → StopIteration). For
+    # @pymutable types the body advances state in-place; for @pyhandle the new
+    # state is written back via unsafe_store! (handled like __setitem__ write-back).
+    :__next__     => (slot="Py_tp_iternext",  ret_type=nothing),
     :__eq__       => (slot="Py_tp_richcompare", ret_type=Bool),
     :__ne__       => (slot="Py_tp_richcompare", ret_type=Bool),
     :__lt__       => (slot="Py_tp_richcompare", ret_type=Bool),
     :__le__       => (slot="Py_tp_richcompare", ret_type=Bool),
     :__gt__       => (slot="Py_tp_richcompare", ret_type=Bool),
     :__ge__       => (slot="Py_tp_richcompare", ret_type=Bool),
+    # Numeric protocol — binary ops take a same-handle `other`; unary ops take
+    # only self. Return is any boundary type (usually the handle type itself).
+    :__add__      => (slot="Py_nb_add",             ret_type=nothing),
+    :__sub__      => (slot="Py_nb_subtract",        ret_type=nothing),
+    :__mul__      => (slot="Py_nb_multiply",        ret_type=nothing),
+    :__truediv__  => (slot="Py_nb_true_divide",     ret_type=nothing),
+    :__floordiv__ => (slot="Py_nb_floor_divide",    ret_type=nothing),
+    :__mod__      => (slot="Py_nb_remainder",       ret_type=nothing),
+    :__pow__      => (slot="Py_nb_power",           ret_type=nothing),
+    :__matmul__   => (slot="Py_nb_matrix_multiply", ret_type=nothing),
+    :__neg__      => (slot="Py_nb_negative",        ret_type=nothing),
+    :__pos__      => (slot="Py_nb_positive",        ret_type=nothing),
+    :__abs__      => (slot="Py_nb_absolute",        ret_type=nothing),
+    :__invert__   => (slot="Py_nb_invert",          ret_type=nothing),
 )
+
+# Numeric dunders: binary (self, other::same handle) and unary (self only).
+# `__pow__` is the only ternaryfunc slot (modulo arg ignored).
+const _NUMERIC_BINARY_DUNDERS =
+    (:__add__, :__sub__, :__mul__, :__truediv__, :__floordiv__,
+     :__mod__, :__pow__, :__matmul__)
+const _NUMERIC_UNARY_DUNDERS = (:__neg__, :__pos__, :__abs__, :__invert__)
+is_numeric_binary(d::Symbol) = d in _NUMERIC_BINARY_DUNDERS
+is_numeric_unary(d::Symbol)  = d in _NUMERIC_UNARY_DUNDERS
 
 # Extra positional argument types (after self) for dunders that take more than self.
 # :same_handle    — second arg must be the same @pyhandle type as self (comparisons).
@@ -105,6 +132,15 @@ const _PYMETHOD_EXTRA_ARGS = Dict{Symbol,Any}(
     :__le__       => :same_handle,
     :__gt__       => :same_handle,
     :__ge__       => :same_handle,
+    # Binary numeric ops: second operand must be the same handle type.
+    :__add__      => :same_handle,
+    :__sub__      => :same_handle,
+    :__mul__      => :same_handle,
+    :__truediv__  => :same_handle,
+    :__floordiv__ => :same_handle,
+    :__mod__      => :same_handle,
+    :__pow__      => :same_handle,
+    :__matmul__   => :same_handle,
 )
 
 """

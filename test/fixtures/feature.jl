@@ -43,6 +43,13 @@ end
 # @pyproperty (O10): computed read-only property.
 @pyproperty Pt2D norm::Float64 (p -> sqrt(p.x^2 + p.y^2))
 
+# Numeric dunders: binary ops (same-handle other) + unary ops.
+@pymethod __add__ pt2d_add(p::Pt2D, q::Pt2D)::Pt2D = Pt2D(p.x + q.x, p.y + q.y)
+@pymethod __sub__ pt2d_sub(p::Pt2D, q::Pt2D)::Pt2D = Pt2D(p.x - q.x, p.y - q.y)
+@pymethod __mul__ pt2d_dot(p::Pt2D, q::Pt2D)::Float64 = p.x * q.x + p.y * q.y  # dot product
+@pymethod __neg__ pt2d_neg(p::Pt2D)::Pt2D = Pt2D(-p.x, -p.y)
+@pymethod __abs__ pt2d_abs(p::Pt2D)::Float64 = sqrt(p.x^2 + p.y^2)
+
 # LinearModel: callable handle (O8a __call__) + context manager (O9).
 struct LinearModel
     w::Float64

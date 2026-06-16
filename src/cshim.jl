@@ -1259,6 +1259,58 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                 println(io, "    return self;")
                 println(io, "}")
 
+            elseif is_numeric_binary(m.dunder)
+                # Binary number slot: binaryfunc (or ternaryfunc for __pow__). Both
+                # operands must be this handle type, else return NotImplemented so
+                # Python can try the reflected op. Result is boxed via the declared
+                # return carrier (usually the handle type itself).
+                ret_c = c_abi_type(m.ret)
+                c_ret_type = _c_ctype(ret_c)
+                box_stmts  = _build_pyobject(ret_c, "r", "_result")
+                self_c     = _type_src(c_abi_type(T))
+                println(io, "extern $c_ret_type $(sym)(PtHandle, PtHandle, int32_t *, char **);")
+                if m.dunder === :__pow__
+                    println(io, "static PyObject *_pt_slot_$(tname)_$(clean)(PyObject *self, PyObject *other, PyObject *_mod) {")
+                    println(io, "    (void)_mod;")
+                else
+                    println(io, "static PyObject *_pt_slot_$(tname)_$(clean)(PyObject *self, PyObject *other) {")
+                end
+                println(io, "    if (Py_TYPE(self) != (PyTypeObject *)_PtType_$tname ||")
+                println(io, "        Py_TYPE(other) != (PyTypeObject *)_PtType_$tname) Py_RETURN_NOTIMPLEMENTED;")
+                println(io, "    PtHandle h_s = { ((_PtObj_$tname *)self)->_data };")
+                println(io, "    PtHandle h_o = { ((_PtObj_$tname *)other)->_data };")
+                println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+                println(io, "    $c_ret_type r = $(sym)(h_s, h_o, &_err, &_errmsg);")
+                println(io, "    if (_err) {")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError,")
+                println(io, "            _errmsg ? _errmsg : \"error in $dname\");")
+                println(io, "        free(_errmsg);")
+                println(io, "        return NULL;")
+                println(io, "    }")
+                for s in box_stmts; println(io, "    ", s); end
+                println(io, "    return _result;")
+                println(io, "}")
+
+            elseif is_numeric_unary(m.dunder)
+                # Unary number slot: unaryfunc PyObject* (*)(PyObject*).
+                ret_c = c_abi_type(m.ret)
+                c_ret_type = _c_ctype(ret_c)
+                box_stmts  = _build_pyobject(ret_c, "r", "_result")
+                println(io, "extern $c_ret_type $(sym)(PtHandle, int32_t *, char **);")
+                println(io, "static PyObject *_pt_slot_$(tname)_$(clean)(PyObject *self) {")
+                println(io, "    PtHandle h = { ((_PtObj_$tname *)self)->_data };")
+                println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+                println(io, "    $c_ret_type r = $(sym)(h, &_err, &_errmsg);")
+                println(io, "    if (_err) {")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError,")
+                println(io, "            _errmsg ? _errmsg : \"error in $dname\");")
+                println(io, "        free(_errmsg);")
+                println(io, "        return NULL;")
+                println(io, "    }")
+                for s in box_stmts; println(io, "    ", s); end
+                println(io, "    return _result;")
+                println(io, "}")
+
             elseif m.ret === String
                 # String return (repr/str pattern): char* → PyUnicode_FromString.
                 println(io, "extern char *$(sym)(PtHandle, int32_t *, char **);")

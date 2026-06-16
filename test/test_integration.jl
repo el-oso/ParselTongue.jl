@@ -259,6 +259,23 @@ end
         assert abs(p_prop.norm - 5.0) < 1e-10, f"@pyproperty norm 3-4-5: {p_prop.norm}"
         assert feature.Pt2D(0.0, 0.0).norm == 0.0, "@pyproperty norm zero"
         del p_prop
+        # Numeric dunders: __add__/__sub__/__mul__ (binary) + __neg__/__abs__ (unary).
+        na, nb = feature.Pt2D(1.0, 2.0), feature.Pt2D(3.0, 4.0)
+        s = na + nb
+        assert isinstance(s, feature.Pt2D) and s.x == 4.0 and s.y == 6.0, "__add__"
+        d = nb - na
+        assert d.x == 2.0 and d.y == 2.0, "__sub__"
+        assert (na * nb) == 11.0, f"__mul__ dot: {na * nb}"   # 1*3 + 2*4
+        ng = -na
+        assert ng.x == -1.0 and ng.y == -2.0, "__neg__"
+        assert abs(nb) == 5.0, f"__abs__: {abs(nb)}"          # 3-4-5
+        # Binary op with a non-Pt2D operand returns NotImplemented → TypeError.
+        try:
+            _ = na + 5
+            assert False, "Pt2D + int should raise TypeError"
+        except TypeError:
+            pass
+        del na, nb, s, d, ng
         # Python callables as arguments (item F)
         assert feature.apply(lambda x: x * 2.0, 3.0) == 6.0,    "apply: identity"
         assert feature.apply(abs, -5.0) == 5.0,                  "apply: builtin"

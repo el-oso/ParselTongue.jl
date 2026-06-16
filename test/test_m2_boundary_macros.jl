@@ -904,6 +904,53 @@ end
     clear_exports!()
 end
 
+# ── Numeric dunders (__add__, __neg__, …) ────────────────────────────────────
+
+@testset "@pymethod numeric dunders (binary + unary)" begin
+    clear_exports!()
+    @pyhandle _TestHandle
+    @pyfunc make_thn(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
+    @pymethod __add__ thn_add(p::_TestHandle, q::_TestHandle)::_TestHandle =
+        _TestHandle(p.x + q.x, p.n + q.n)
+    @pymethod __mul__ thn_dot(p::_TestHandle, q::_TestHandle)::Float64 =
+        p.x * q.x + Float64(p.n * q.n)
+    @pymethod __neg__ thn_neg(p::_TestHandle)::_TestHandle = _TestHandle(-p.x, -p.n)
+    @pymethod __abs__ thn_abs(p::_TestHandle)::Float64 = sqrt(p.x^2 + Float64(p.n)^2)
+
+    dunders = [m.dunder for m in _METHODS]
+    @test :__add__ in dunders && :__mul__ in dunders
+    @test :__neg__ in dunders && :__abs__ in dunders
+
+    # Binary op: ccallable takes a second PtHandle (same handle type) and
+    # returns the declared carrier (handle for __add__, scalar for __mul__).
+    m_add = _METHODS[findfirst(m -> m.dunder === :__add__, _METHODS)]
+    @test length(m_add.extra_args) == 1
+    @test m_add.extra_args[1].jl_type === _TestHandle
+    code_add = emit_ccallable_method(m_add)
+    @test occursin("_other::ParselTongue.PtHandle{_TestHandle}", code_add)
+    @test occursin("from_c(_TestHandle, _other)", code_add) ||
+          occursin("from_c(Main._TestHandle, _other)", code_add)
+
+    # Unary op: ccallable takes only self.
+    m_neg = _METHODS[findfirst(m -> m.dunder === :__neg__, _METHODS)]
+    @test isempty(m_neg.extra_args)
+    code_neg = emit_ccallable_method(m_neg)
+    @test !occursin("_other", code_neg)
+
+    # C shim: number-protocol slots + NotImplemented type guard for binary ops.
+    c = emit_cshim("num_demo", _EXPORTS, PtError[], [_TestHandle], _METHODS)
+    @test occursin("Py_nb_add", c)
+    @test occursin("Py_nb_multiply", c)
+    @test occursin("Py_nb_negative", c)
+    @test occursin("Py_nb_absolute", c)
+    @test occursin("Py_RETURN_NOTIMPLEMENTED", c)   # binary type guard
+    # Binary slot signature is binaryfunc; unary is unaryfunc.
+    @test occursin("_pt_slot__TestHandle_add(PyObject *self, PyObject *other)", c)
+    @test occursin("_pt_slot__TestHandle_neg(PyObject *self)", c)
+
+    clear_exports!()
+end
+
 # ── O10: @pyproperty ─────────────────────────────────────────────────────────
 
 @testset "@pyproperty read-only property (item O10)" begin
