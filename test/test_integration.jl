@@ -276,6 +276,36 @@ end
         except TypeError:
             pass
         del na, nb, s, d, ng
+        # Item O7: @pymutable — mutable struct with a String field, backed by a GC registry.
+        acc = feature.Accumulator("temps")
+        assert isinstance(acc, feature.Accumulator), "Accumulator instance"
+        assert acc.label == "temps", f"String field read: {acc.label}"
+        assert acc.total == 0.0, f"initial total: {acc.total}"
+        assert feature.acc_add(acc, 1.5) == 1.5, "acc_add 1"
+        assert feature.acc_add(acc, 2.5) == 4.0, "acc_add 2 (mutation persists)"
+        assert acc.total == 4.0, f"field reflects mutation: {acc.total}"
+        assert feature.acc_total(acc) == 4.0, "acc_total"
+        acc.total = 100.0          # field write
+        assert acc.total == 100.0 and feature.acc_total(acc) == 100.0, "field write"
+        acc.label = "renamed"
+        assert acc.label == "renamed", f"String field write: {acc.label}"
+        acc2 = feature.Accumulator("other")   # independent instance
+        feature.acc_add(acc2, 7.0)
+        assert acc2.total == 7.0 and acc.total == 100.0, "instances independent"
+        del acc, acc2
+        import gc as _gc2; _gc2.collect()      # dealloc drops registry refs (no crash)
+        # Item O8b: @pymutable + __next__ stateful iterator.
+        assert list(feature.CountUp(5)) == [0, 1, 2, 3, 4], "iterator list()"
+        assert sum(feature.CountUp(4)) == 6, "iterator sum()"
+        assert [x * x for x in feature.CountUp(3)] == [0, 1, 4], "iterator comprehension"
+        assert list(feature.CountUp(0)) == [], "empty iterator"
+        it = feature.CountUp(2)
+        assert next(it) == 0 and next(it) == 1, "manual next()"
+        try:
+            next(it); assert False, "expected StopIteration"
+        except StopIteration:
+            pass
+        del it
         # Python callables as arguments (item F)
         assert feature.apply(lambda x: x * 2.0, 3.0) == 6.0,    "apply: identity"
         assert feature.apply(abs, -5.0) == 5.0,                  "apply: builtin"

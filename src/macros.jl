@@ -205,6 +205,13 @@ end
 const _MUTABLE_HANDLE_TYPES = Type[]
 const _PROPERTIES = PtProperty[]
 
+# Build-host registry for @pymutable types: non-isbits `mutable struct`s backed by
+# a per-type Julia GC registry (Dict{Int64,T}). Distinct from _MUTABLE_HANDLE_TYPES,
+# which marks isbits @pyhandle types that gained in-place setattr via O6. A @pymutable
+# type also appears in _HANDLE_TYPES (it still needs a PyTypeObject), but its dealloc
+# and field access route through Julia (registry lookup) rather than raw C memory.
+const _MUTABLE_STRUCT_TYPES = Type[]
+
 function _register_new!(n::PtNew)
     T = n.handle_type
     ishandle(c_abi_type(T)) ||
@@ -243,6 +250,13 @@ function _register_method!(m::PtMethod)
         # Fixed return type (__repr__ → String, __len__ → Int64, etc.).
         m.ret === spec.ret_type ||
             error("@pymethod $(m.dunder): return type must be `$(spec.ret_type)`, got `$(m.ret)`.")
+    end
+
+    # __next__ must return Union{V,Nothing} (None → StopIteration).
+    if m.dunder === :__next__
+        isopt(c_abi_type(m.ret)) ||
+            error("@pymethod __next__: return type must be `Union{V, Nothing}` " *
+                  "(return `nothing` to stop iteration), got `$(m.ret)`.")
     end
 
     # Validate extra args based on dunder.
@@ -297,7 +311,7 @@ const _EXPORTS = PtExport[]
 
 Reset the export registry. Called at the start of each `build_extension`.
 """
-clear_exports!() = (empty!(_EXPORTS); empty!(_ERRORS); empty!(_HANDLE_TYPES); empty!(_METHODS); empty!(_NEWS); empty!(_MUTABLE_HANDLE_TYPES); empty!(_PROPERTIES); _MODULE_NAME[] = nothing; _CURRENT_SUBMODULE[] = ""; nothing)
+clear_exports!() = (empty!(_EXPORTS); empty!(_ERRORS); empty!(_HANDLE_TYPES); empty!(_METHODS); empty!(_NEWS); empty!(_MUTABLE_HANDLE_TYPES); empty!(_PROPERTIES); empty!(_MUTABLE_STRUCT_TYPES); _MODULE_NAME[] = nothing; _CURRENT_SUBMODULE[] = ""; nothing)
 
 # Distinct, ordered submodule names among `exports` (excluding the "" top level).
 function submodule_names(exports::AbstractVector{PtExport})

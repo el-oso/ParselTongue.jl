@@ -25,7 +25,8 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     ishandle, _handle_julia_name, _HANDLE_TYPES,
                     PtMethod, _METHODS, emit_ccallable_method,
                     PtNew, _NEWS, emit_ccallable_new,
-                    PtProperty, _PROPERTIES, _MUTABLE_HANDLE_TYPES, emit_ccallable_property
+                    PtProperty, _PROPERTIES, _MUTABLE_HANDLE_TYPES, emit_ccallable_property,
+                    _MUTABLE_STRUCT_TYPES, emit_ccallable_field_accessors
 
 # Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
 struct _TestHandle
@@ -33,6 +34,15 @@ struct _TestHandle
     n::Int64
 end
 @pyhandle _TestHandle
+
+# @pymutable defines registry `const`s + a dealloc @ccallable, so it must be applied
+# at file (global) scope, once. Testsets re-register it in the build-host registries
+# (the macro's method/const side effects are permanent module globals).
+mutable struct _TestMutable
+    count::Int64
+    label::String
+end
+@pymutable _TestMutable
 
 @testset "boundary scalar impls" begin
     @test c_abi_type(Int64) === Int64
@@ -951,6 +961,90 @@ end
     clear_exports!()
 end
 
+# ── O7: @pymutable (GC registry for mutable structs) ─────────────────────────
+
+@testset "@pymutable registration + carrier" begin
+    clear_exports!()
+    push!(_MUTABLE_STRUCT_TYPES, _TestMutable)
+    push!(_HANDLE_TYPES, _TestMutable)
+
+    # Carrier reuses PtHandle (the id is packed into the pointer slot).
+    @test c_abi_type(_TestMutable) === PtHandle{_TestMutable}
+
+    # to_c registers in the GC registry; from_c returns the SAME live object.
+    obj = _TestMutable(7, "hi")
+    h = to_c(obj)
+    @test h isa PtHandle{_TestMutable}
+    got = from_c(_TestMutable, h)
+    @test got.count == 7 && got.label == "hi"
+    got.count = 99                 # mutate via the reference
+    @test from_c(_TestMutable, h).count == 99   # persists (same object)
+
+    # @pymutable rejects immutable / non-struct types.
+    err = try; @eval @pymutable _TestHandle; catch e; e; end
+    @test (err isa LoadError ? err.error : err) isa ErrorException
+
+    clear_exports!()
+end
+
+@testset "@pymutable field accessors + cshim" begin
+    clear_exports!()
+    push!(_MUTABLE_STRUCT_TYPES, _TestMutable)
+    push!(_HANDLE_TYPES, _TestMutable)
+
+    # Per-field getter/setter ccallables (scalar + String fields).
+    acc = emit_ccallable_field_accessors(_TestMutable)
+    @test occursin("pt_field_get__TestMutable_count", acc)
+    @test occursin("pt_field_set__TestMutable_count", acc)
+    @test occursin("pt_field_get__TestMutable_label", acc)
+    @test occursin("pt_field_set__TestMutable_label", acc)
+    @test occursin("::Cstring", acc)    # String field carrier
+
+    # emit_entry threads mutable_struct_types into the field accessors.
+    entry = emit_entry(_EXPORTS, "dummy.jl"; mutable_struct_types=[_TestMutable])
+    @test occursin("pt_field_get__TestMutable_count", entry)
+
+    # C shim: registry dealloc (calls Julia), Julia-routed getattro/setattro.
+    c = emit_cshim("mut", _EXPORTS, PtError[], [_TestMutable], PtMethod[], PtNew[];
+                   mutable_struct_types=[_TestMutable])
+    @test occursin("_pt_dealloc__TestMutable_jl", c)   # registry-delete entry point
+    @test occursin("Py_tp_getattro", c)
+    @test occursin("Py_tp_setattro", c)
+    @test occursin("pt_field_get__TestMutable_count", c)
+    @test occursin("PyArg_Parse(value, \"s\"", c)      # String field set
+    @test !occursin("free(((_PtObj__TestMutable *)self)->_data)", c)  # no raw free
+
+    clear_exports!()
+end
+
+@testset "@pymethod __next__ stateful iteration (item O8b)" begin
+    clear_exports!()
+    push!(_MUTABLE_STRUCT_TYPES, _TestMutable)
+    push!(_HANDLE_TYPES, _TestMutable)
+    @pymethod __iter__ tm_iter(m::_TestMutable)::_TestMutable = m
+    @pymethod __next__ tm_next(m::_TestMutable)::Union{Int64,Nothing} =
+        m.count >= 3 ? nothing : (m.count += 1; m.count)
+
+    nx = _METHODS[findfirst(x -> x.dunder === :__next__, _METHODS)]
+    @test isopt(c_abi_type(nx.ret))    # Union{Int64,Nothing} → PtOpt carrier
+
+    c = emit_cshim("nx", _EXPORTS, PtError[], [_TestMutable], _METHODS, PtNew[];
+                   mutable_struct_types=[_TestMutable])
+    @test occursin("Py_tp_iternext", c)
+    @test occursin("Py_tp_iter", c)
+    @test occursin("StopIteration", c)
+    @test occursin("has_value", c)     # None → StopIteration branch
+
+    # __next__ must return Union{V,Nothing}; a plain scalar return is rejected.
+    err = try
+        @eval @pymethod __next__ bad_next(m::_TestMutable)::Int64 = 1
+        nothing
+    catch e; e; end
+    @test (err isa LoadError ? err.error : err) isa ErrorException
+
+    clear_exports!()
+end
+
 # ── O10: @pyproperty ─────────────────────────────────────────────────────────
 
 @testset "@pyproperty read-only property (item O10)" begin
@@ -1424,7 +1518,7 @@ end
 
     # dict struct typedef emitted
     @test occursin("PtDict_double", c)
-    dstructs = _dict_structs(_EXPORTS)
+    dstructs = _dict_structs(ParselTongue._all_carriers(_EXPORTS))
     @test any(s -> occursin("PtDict_double", s), dstructs)
     @test any(s -> occursin("char **keys", s), dstructs)
 

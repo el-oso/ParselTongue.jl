@@ -206,6 +206,79 @@ macro pyhandle(T_expr, opts...)
 end
 
 """
+    @pymutable T
+
+Register a `mutable struct` `T` as a **real, mutable Python class**. Unlike
+[`@pyhandle`](@ref) (which requires an `isbitstype` and treats handles as immutable
+value types), `@pymutable` supports arbitrary field types — including `String`,
+`Vector`, and nested structs — and lets `@pymethod`s mutate the object in place.
+
+The mechanism is a per-type Julia GC registry: each instance is stored in a
+`Dict{Int64, T}` keyed by a monotically increasing id. The Python object holds only
+the id; `from_c` returns the *live Julia object* (not a copy), so field assignments
+inside a `@pymethod` persist. When Python garbage-collects the object, `tp_dealloc`
+removes it from the registry, releasing the Julia reference.
+
+```julia
+mutable struct Counter
+    count::Int64
+    name::String
+end
+@pymutable Counter
+
+@pymethod __new__ counter_new(name::String)::Counter = Counter(0, name)
+@pymethod increment! incr(c::Counter)::Int64 = (c.count += 1; c.count)
+```
+
+Scalar and `String` fields are exposed as read/write Python attributes. Because the
+registry is a concretely-typed global, all of `to_c`/`from_c`/dealloc remain
+trim-safe. `@pymutable` is the recommended base for stateful iterators
+(`@pymethod __next__`).
+"""
+macro pymutable(T_expr)
+    T = Core.eval(__module__, T_expr)
+    (T isa DataType && Base.ismutabletype(T)) || error(
+        "@pymutable: `$T` must be a `mutable struct` (got an immutable or non-struct type). " *
+        "Use @pyhandle for immutable isbits structs.")
+    tname   = string(T.name.name)
+    reg_sym = esc(Symbol("_PtRegistry_", tname))
+    seq_sym = esc(Symbol("_PtIdSeq_", tname))
+    Tq      = esc(T_expr)
+    quote
+        # Per-type GC registry: a concretely-typed Dict keeps registered objects
+        # alive (it is a GC root) and all operations dispatch on concrete types,
+        # so to_c/from_c stay trim-safe inside the trimmed library.
+        const $reg_sym = Base.Dict{Int64, $Tq}()
+        const $seq_sym = Base.Ref{Int64}(0)
+        ParselTongue.c_abi_type(::Type{$Tq}) = ParselTongue.PtHandle{$Tq}
+        # to_c: register and pack the id into the handle's pointer slot.
+        function ParselTongue.to_c(obj::$Tq)::ParselTongue.PtHandle{$Tq}
+            local _id::Int64 = $seq_sym[] + Int64(1)
+            $seq_sym[] = _id
+            $reg_sym[_id] = obj
+            ParselTongue.PtHandle{$Tq}(Ptr{Cvoid}(_id))
+        end
+        # from_c: return the LIVE object (mutations persist), not a copy.
+        function ParselTongue.from_c(::Type{$Tq}, h::ParselTongue.PtHandle{$Tq})::$Tq
+            $reg_sym[Int64(h.ptr)]
+        end
+        # Dealloc entry point: drop the registry reference so Julia can collect it.
+        Base.@ccallable function $(esc(Symbol("_pt_dealloc_", tname, "_jl")))(h::ParselTongue.PtHandle{$Tq})::Cvoid
+            Base.delete!($reg_sym, Int64(h.ptr))
+            return nothing
+        end
+        TypeContracts.check_trim_compat($Tq)
+        # Runtime registration (survives clear_exports! between macro expansion and
+        # the point where the registries are read).
+        $Tq in ParselTongue._MUTABLE_STRUCT_TYPES ||
+            push!(ParselTongue._MUTABLE_STRUCT_TYPES, $Tq)
+        $Tq in ParselTongue._HANDLE_TYPES ||
+            push!(ParselTongue._HANDLE_TYPES, $Tq)
+        nothing
+    end
+end
+
+"""
     @boundary T carrier=C begin
         from_c(c) = ...
         to_c(x) = ...

@@ -61,6 +61,26 @@ end
 @pymethod __enter__ lm_enter(m::LinearModel)::LinearModel = m
 @pymethod __exit__  lm_exit(m::LinearModel)::Bool = false
 
+# O7 @pymutable: a mutable struct with a heap (String) field, backed by a Julia GC
+# registry. Mutation via a module-level @pyfunc persists on the live object.
+mutable struct Accumulator
+    total::Float64
+    label::String
+end
+@pymutable Accumulator
+@pymethod __new__ acc_new(label::String)::Accumulator = Accumulator(0.0, label)
+
+# O8b stateful iterator: @pymutable + __next__ advancing state in place.
+mutable struct CountUp
+    cur::Int64
+    stop::Int64
+end
+@pymutable CountUp
+@pymethod __new__  countup_new(stop::Int64)::CountUp = CountUp(0, stop)
+@pymethod __iter__ countup_iter(c::CountUp)::CountUp = c
+@pymethod __next__ countup_next(c::CountUp)::Union{Int64,Nothing} =
+    c.cur >= c.stop ? nothing : (c.cur += 1; c.cur - 1)
+
 # Exercises every v1.x boundary kind in one extension: scalars, strings, complex,
 # 1-D and N-D arrays (both policies), in-place mutation + void, tuple returns,
 # and opaque handles.
@@ -112,4 +132,8 @@ end
 
     # Arbitrary callable signatures (item L): two Int64 args → Int64.
     @pyfunc combine(f::PyCallable{Tuple{Int64,Int64},Int64}, a::Int64, b::Int64)::Int64 = f(a, b)
+
+    # O7 @pymutable: mutate the live registry object; the change persists across calls.
+    @pyfunc acc_add(a::Accumulator, x::Float64)::Float64 = (a.total += x; a.total)
+    @pyfunc acc_total(a::Accumulator)::Float64 = a.total
 end

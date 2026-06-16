@@ -72,11 +72,11 @@ const _CCOMPLEX = Dict{Type,CComplex}(
 
 iscomplex(@nospecialize(C::Type)) = haskey(_CCOMPLEX, C)
 
-# Emit the complex struct typedefs that `exports` actually use (as scalar carriers
-# or as array element types). Must precede array structs, which reference them.
-function _complex_structs(exports::AbstractVector{PtExport})
+# Emit the complex struct typedefs used by `carriers` (as scalar carriers or as
+# array element types). Must precede array structs, which reference them.
+function _complex_structs(carriers)
     used = Set{Type}()
-    for C in _all_carriers(exports)
+    for C in carriers
         iscomplex(C) && push!(used, C)
         isarray(C) && C.parameters[1] in (ComplexF32, ComplexF64) && push!(used, C.parameters[1])
     end
@@ -164,6 +164,28 @@ function _all_carriers(exports::AbstractVector{PtExport})
     for e in exports
         _collect_carriers!(set, c_abi_type(e.ret))
         for a in e.args; _collect_carriers!(set, c_abi_type(a.jl_type)); end
+    end
+    return set
+end
+
+# Full carrier set, including the carriers used by @pymethod returns/extra-args,
+# @pymethod __new__ constructor args, and @pyproperty value types. Method wrappers
+# (emitted inside the handle-type defs) reference these, so their C struct typedefs
+# must be emitted before the handle defs.
+function _carrier_set(exports::AbstractVector{PtExport},
+                      methods::AbstractVector{PtMethod},
+                      news::AbstractVector{PtNew},
+                      properties::AbstractVector{PtProperty})
+    set = _all_carriers(exports)
+    for m in methods
+        _collect_carriers!(set, c_abi_type(m.ret))
+        for a in m.extra_args; _collect_carriers!(set, c_abi_type(a.jl_type)); end
+    end
+    for n in news
+        for a in n.args; _collect_carriers!(set, c_abi_type(a.jl_type)); end
+    end
+    for p in properties
+        _collect_carriers!(set, c_abi_type(p.val_type))
     end
     return set
 end
@@ -924,9 +946,9 @@ function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=
 end
 
 # C struct typedefs for every PtArray{T,N} carrier appearing in `exports`.
-function _array_structs(exports::AbstractVector{PtExport})
+function _array_structs(carriers)
     out = String[]
-    for C in _all_carriers(exports)
+    for C in carriers
         if isarray(C)
             ei = _elt(C); n = _ndims(C)
             push!(out, string("typedef struct { ", ei.ctype, " *data; int64_t shape[", n,
@@ -939,9 +961,9 @@ end
 
 # Tuple carrier typedefs (Python tuple returns). Emitted after array/complex
 # structs, which their fields reference.
-function _tuple_structs(exports::AbstractVector{PtExport})
+function _tuple_structs(carriers)
     out = String[]
-    for C in _all_carriers(exports)
+    for C in carriers
         if istuple(C)
             fields = join((string(_c_ctype(S), " f", i, ";")
                            for (i, S) in enumerate(fieldtypes(C))), " ")
@@ -954,10 +976,10 @@ end
 
 # Optional carrier typedefs. Must come after complex/scalar type declarations
 # since the inner type's C name is used here.
-function _opt_structs(exports::AbstractVector{PtExport})
+function _opt_structs(carriers)
     out = String[]
     seen = Set{Type}()
-    for C in _all_carriers(exports)
+    for C in carriers
         if isopt(C) && C ∉ seen
             push!(seen, C)
             inner_C = _opt_inner_c(C)
@@ -970,10 +992,10 @@ function _opt_structs(exports::AbstractVector{PtExport})
 end
 
 # Dict carrier typedefs.
-function _dict_structs(exports::AbstractVector{PtExport})
+function _dict_structs(carriers)
     out = String[]
     seen = Set{Type}()
-    for C in _all_carriers(exports)
+    for C in carriers
         if isdict(C) && C ∉ seen
             push!(seen, C)
             vc = _dict_val_c(C)
@@ -985,7 +1007,7 @@ function _dict_structs(exports::AbstractVector{PtExport})
     return out
 end
 
-_uses_arrays(exports) = !isempty(_array_structs(exports))
+_uses_arrays(carriers) = any(isarray, carriers)
 function _carrier_is_bytes(@nospecialize(C::Type))
     C === PtArray{UInt8,1} ||
     (isopt(C) && _opt_inner_c(C) === PtArray{UInt8,1}) ||
@@ -1108,6 +1130,7 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                                 methods::AbstractVector{PtMethod}=PtMethod[],
                                 news::AbstractVector{PtNew}=PtNew[];
                                 mutable_types::AbstractVector{<:Type}=Type[],
+                                mutable_struct_types::AbstractVector{<:Type}=Type[],
                                 properties::AbstractVector{PtProperty}=PtProperty[])
     isempty(handle_types) && return
     println(io, "/* @pyhandle types: each becomes a real Python class (isinstance, repr, etc.) */")
@@ -1116,16 +1139,29 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         tmeths = filter(m -> m.handle_type === T, methods)
         tnew_i = findfirst(n -> n.handle_type === T, news)
         tnew   = tnew_i === nothing ? nothing : news[tnew_i]
+        # @pymutable types store a registry id in _data and route dealloc / field
+        # access through Julia rather than raw C memory.
+        is_mut_struct = T in mutable_struct_types
 
         println(io, "typedef struct { PyObject_HEAD void *_data; } _PtObj_$tname;")
         # Declare early so _pt_richcmp_T (emitted below) can reference it.
         println(io, "static PyObject *_PtType_$tname = NULL;")
         # Forward-declare _pt_make_obj_T so _pt_new_T (emitted below) can call it.
         println(io, "static PyObject *_pt_make_obj_$tname(PtHandle);")
-        println(io, "static void _pt_dealloc_$tname(PyObject *self) {")
-        println(io, "    free(((_PtObj_$tname *)self)->_data);")
-        println(io, "    PyObject_Free(self);")
-        println(io, "}")
+        if is_mut_struct
+            # Drop the registry reference (lets Julia GC the object); _data is the id.
+            println(io, "extern void _pt_dealloc_$(tname)_jl(PtHandle);")
+            println(io, "static void _pt_dealloc_$tname(PyObject *self) {")
+            println(io, "    PtHandle h = { ((_PtObj_$tname *)self)->_data };")
+            println(io, "    _pt_dealloc_$(tname)_jl(h);")
+            println(io, "    PyObject_Free(self);")
+            println(io, "}")
+        else
+            println(io, "static void _pt_dealloc_$tname(PyObject *self) {")
+            println(io, "    free(((_PtObj_$tname *)self)->_data);")
+            println(io, "    PyObject_Free(self);")
+            println(io, "}")
+        end
 
         # For each @pymethod, emit a C slot wrapper. The wrapper kind is
         # determined by the dunder and/or its Julia return type.
@@ -1257,6 +1293,30 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                 println(io, "static PyObject *_pt_slot_$(tname)_$(clean)(PyObject *self) {")
                 println(io, "    Py_INCREF(self);")
                 println(io, "    return self;")
+                println(io, "}")
+
+            elseif m.dunder === :__next__
+                # iternextfunc: PyObject* (*)(PyObject*). Return is Union{V,Nothing}
+                # (a PtOpt carrier); has_value==0 → raise StopIteration. For @pymutable
+                # iterators the Julia body advances state in-place.
+                ret_c   = c_abi_type(m.ret)
+                opt_c   = _c_ctype(ret_c)                 # PtOpt_<tag>
+                inner_C = _opt_inner_c(ret_c)
+                box_stmts = _build_pyobject(inner_C, "r.value", "_result")
+                println(io, "extern $opt_c $(sym)(PtHandle, int32_t *, char **);")
+                println(io, "static PyObject *_pt_slot_$(tname)_$(clean)(PyObject *self) {")
+                println(io, "    PtHandle h = { ((_PtObj_$tname *)self)->_data };")
+                println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+                println(io, "    $opt_c r = $(sym)(h, &_err, &_errmsg);")
+                println(io, "    if (_err) {")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError,")
+                println(io, "            _errmsg ? _errmsg : \"error in $dname\");")
+                println(io, "        free(_errmsg);")
+                println(io, "        return NULL;")
+                println(io, "    }")
+                println(io, "    if (!r.has_value) { PyErr_SetNone(PyExc_StopIteration); return NULL; }")
+                for s in box_stmts; println(io, "    ", s); end
+                println(io, "    return _result;")
                 println(io, "}")
 
             elseif is_numeric_binary(m.dunder)
@@ -1432,48 +1492,109 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         # scalar→PyObject builders used for return values. Non-scalar fields and
         # all dunders fall through to PyObject_GenericGetAttr (so repr/__class__
         # etc. keep working). PyUnicode_CompareWithASCIIString is stable-ABI safe.
-        scalar_fields = [(string(fieldname(T, i)), fieldtype(T, i), fieldoffset(T, i))
-                         for i in 1:fieldcount(T) if isscalar(fieldtype(T, i))]
-        has_getattr = !isempty(scalar_fields)
-        if has_getattr
-            println(io, "static PyObject *_pt_getattr_$tname(PyObject *self, PyObject *name) {")
-            println(io, "    void *_d = ((_PtObj_$tname *)self)->_data;")
-            for (fname, ftype, off) in scalar_fields
-                ctype = _c_ctype(ftype)
-                build = _bp_scalar(ftype, "_f", "_v")
-                println(io, "    if (PyUnicode_CompareWithASCIIString(name, \"$fname\") == 0) {")
-                println(io, "        $ctype _f = *($ctype *)((char *)_d + $off);")
-                for s in build; println(io, "        ", s); end
-                println(io, "        return _v;")
-                println(io, "    }")
+        if is_mut_struct
+            # @pymutable field access: read/write through Julia per-field accessors
+            # (fields may be String etc., not just isbits — no raw memory layout).
+            bfields = _pymut_accessor_fields(T)
+            has_getattr = !isempty(bfields)
+            has_setattr = !isempty(bfields)
+            if has_getattr
+                for (fname, FT) in bfields
+                    println(io, "extern $(_c_ctype(c_abi_type(FT))) pt_field_get_$(tname)_$(fname)(PtHandle, int32_t *, char **);")
+                end
+                println(io, "static PyObject *_pt_getattr_$tname(PyObject *self, PyObject *name) {")
+                println(io, "    PtHandle h = { ((_PtObj_$tname *)self)->_data };")
+                for (fname, FT) in bfields
+                    fc = c_abi_type(FT)
+                    box_stmts = _build_pyobject(fc, "r", "_result")
+                    println(io, "    if (PyUnicode_CompareWithASCIIString(name, \"$fname\") == 0) {")
+                    println(io, "        int32_t _err = 0; char *_errmsg = NULL;")
+                    println(io, "        $(_c_ctype(fc)) r = pt_field_get_$(tname)_$(fname)(h, &_err, &_errmsg);")
+                    println(io, "        if (_err) { PyErr_SetString(PyExc_RuntimeError, _errmsg ? _errmsg : \"error reading $fname\"); free(_errmsg); return NULL; }")
+                    for s in box_stmts; println(io, "        ", s); end
+                    println(io, "        return _result;")
+                    println(io, "    }")
+                end
+                println(io, "    return PyObject_GenericGetAttr(self, name);")
+                println(io, "}")
             end
-            println(io, "    return PyObject_GenericGetAttr(self, name);")
-            println(io, "}")
-        end
+            if has_setattr
+                for (fname, FT) in bfields
+                    println(io, "extern void pt_field_set_$(tname)_$(fname)(PtHandle, $(_c_ctype(c_abi_type(FT))), int32_t *, char **);")
+                end
+                println(io, "static int _pt_setattr_$(tname)(PyObject *self, PyObject *name, PyObject *value) {")
+                println(io, "    if (value == NULL) {")
+                println(io, "        PyErr_SetString(PyExc_TypeError, \"cannot delete $tname attribute\");")
+                println(io, "        return -1;")
+                println(io, "    }")
+                println(io, "    PtHandle h = { ((_PtObj_$(tname) *)self)->_data };")
+                for (fname, FT) in bfields
+                    println(io, "    if (PyUnicode_CompareWithASCIIString(name, \"$fname\") == 0) {")
+                    if FT === String
+                        # Parse a Python str into a borrowed const char*; the ccallable
+                        # copies it into a Julia String, so no lifetime issue.
+                        println(io, "        const char *_s;")
+                        println(io, "        if (!PyArg_Parse(value, \"s\", &_s)) return -1;")
+                        println(io, "        int32_t _err = 0; char *_errmsg = NULL;")
+                        println(io, "        pt_field_set_$(tname)_$(fname)(h, (char *)_s, &_err, &_errmsg);")
+                    else
+                        cs = _CSCALARS[FT]
+                        println(io, "        $(cs.tmptype) _tmp;")
+                        println(io, "        if (!PyArg_Parse(value, \"$(cs.fmt)\", &_tmp)) return -1;")
+                        println(io, "        int32_t _err = 0; char *_errmsg = NULL;")
+                        println(io, "        pt_field_set_$(tname)_$(fname)(h, ($(cs.ctype))_tmp, &_err, &_errmsg);")
+                    end
+                    println(io, "        if (_err) { PyErr_SetString(PyExc_RuntimeError, _errmsg ? _errmsg : \"error setting $fname\"); free(_errmsg); return -1; }")
+                    println(io, "        return 0;")
+                    println(io, "    }")
+                end
+                println(io, "    return PyObject_GenericSetAttr(self, name, value);")
+                println(io, "}")
+            end
+        else
+            scalar_fields = [(string(fieldname(T, i)), fieldtype(T, i), fieldoffset(T, i))
+                             for i in 1:fieldcount(T) if isscalar(fieldtype(T, i))]
+            has_getattr = !isempty(scalar_fields)
+            if has_getattr
+                println(io, "static PyObject *_pt_getattr_$tname(PyObject *self, PyObject *name) {")
+                println(io, "    void *_d = ((_PtObj_$tname *)self)->_data;")
+                for (fname, ftype, off) in scalar_fields
+                    ctype = _c_ctype(ftype)
+                    build = _bp_scalar(ftype, "_f", "_v")
+                    println(io, "    if (PyUnicode_CompareWithASCIIString(name, \"$fname\") == 0) {")
+                    println(io, "        $ctype _f = *($ctype *)((char *)_d + $off);")
+                    for s in build; println(io, "        ", s); end
+                    println(io, "        return _v;")
+                    println(io, "    }")
+                end
+                println(io, "    return PyObject_GenericGetAttr(self, name);")
+                println(io, "}")
+            end
 
-        # Mutable setattr: when @pyhandle T mutable=true, generate a setattrofunc
-        # that writes each scalar field directly to the heap memory at its offset.
-        has_setattr = T in mutable_types
-        if has_setattr
-            mutable_scalar_fields = [(string(fieldname(T, i)), fieldtype(T, i), fieldoffset(T, i))
-                                     for i in 1:fieldcount(T) if isscalar(fieldtype(T, i))]
-            println(io, "static int _pt_setattr_$(tname)(PyObject *self, PyObject *name, PyObject *value) {")
-            println(io, "    if (value == NULL) {")
-            println(io, "        PyErr_SetString(PyExc_TypeError, \"cannot delete $tname attribute\");")
-            println(io, "        return -1;")
-            println(io, "    }")
-            println(io, "    void *_d = ((_PtObj_$(tname) *)self)->_data;")
-            for (fname, ftype, off) in mutable_scalar_fields
-                cs = _CSCALARS[ftype]
-                println(io, "    if (PyUnicode_CompareWithASCIIString(name, \"$fname\") == 0) {")
-                println(io, "        $(cs.tmptype) _tmp;")
-                println(io, "        if (!PyArg_Parse(value, \"$(cs.fmt)\", &_tmp)) return -1;")
-                println(io, "        *($(cs.ctype) *)((char *)_d + $off) = ($(cs.ctype))_tmp;")
-                println(io, "        return 0;")
+            # Mutable setattr: when @pyhandle T mutable=true, generate a setattrofunc
+            # that writes each scalar field directly to the heap memory at its offset.
+            has_setattr = T in mutable_types
+            if has_setattr
+                mutable_scalar_fields = [(string(fieldname(T, i)), fieldtype(T, i), fieldoffset(T, i))
+                                         for i in 1:fieldcount(T) if isscalar(fieldtype(T, i))]
+                println(io, "static int _pt_setattr_$(tname)(PyObject *self, PyObject *name, PyObject *value) {")
+                println(io, "    if (value == NULL) {")
+                println(io, "        PyErr_SetString(PyExc_TypeError, \"cannot delete $tname attribute\");")
+                println(io, "        return -1;")
                 println(io, "    }")
+                println(io, "    void *_d = ((_PtObj_$(tname) *)self)->_data;")
+                for (fname, ftype, off) in mutable_scalar_fields
+                    cs = _CSCALARS[ftype]
+                    println(io, "    if (PyUnicode_CompareWithASCIIString(name, \"$fname\") == 0) {")
+                    println(io, "        $(cs.tmptype) _tmp;")
+                    println(io, "        if (!PyArg_Parse(value, \"$(cs.fmt)\", &_tmp)) return -1;")
+                    println(io, "        *($(cs.ctype) *)((char *)_d + $off) = ($(cs.ctype))_tmp;")
+                    println(io, "        return 0;")
+                    println(io, "    }")
+                end
+                println(io, "    return PyObject_GenericSetAttr(self, name, value);")
+                println(io, "}")
             end
-            println(io, "    return PyObject_GenericSetAttr(self, name, value);")
-            println(io, "}")
         end
 
         # Context manager methods (__enter__ / __exit__) go in a PyMethodDef table.
@@ -1708,6 +1829,7 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
                     methods::Vector{PtMethod}=PtMethod[],
                     news::Vector{PtNew}=PtNew[];
                     mutable_types::Vector{<:Type}=Type[],
+                    mutable_struct_types::Vector{<:Type}=Type[],
                     properties::Vector{PtProperty}=PtProperty[],
                     doc::AbstractString="", abi3::Bool=false)
     isempty(doc) && (doc = "ParselTongue extension (Julia via juliac --trim)")
@@ -1730,48 +1852,53 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
         for s in eglobals; println(io, s); end
         println(io)
     end
-    cstructs = _complex_structs(exports)
+    # All C-ABI carrier typedefs are emitted up front (before the handle-type defs),
+    # because @pymethod slot wrappers — generated inside the handle defs — may
+    # reference array/opt/dict/tuple carriers (e.g. __getitem__/__next__ returns).
+    carriers = _carrier_set(exports, methods, news, properties)
+    # PtHandle first: tuple carriers may embed it as a field.
+    if _uses_handles(exports) || !isempty(handle_types) || !isempty(methods)
+        print(io, _PTHANDLE_TYPEDEF)
+    end
+    cstructs = _complex_structs(carriers)
     if !isempty(cstructs)
         println(io, "/* C-ABI carriers for complex numbers (match Julia Complex{T}) */")
         for s in cstructs; println(io, s); end
         println(io)
     end
-    if _uses_bytes(exports)
+    if any(_carrier_is_bytes, carriers)
         print(io, _WRAP_BYTES_HELPER)
     end
-    if _uses_strarr(exports)
+    if any(_carrier_is_strarr, carriers)
         print(io, _WRAP_STRARR_HELPER)
     end
-    if _uses_handles(exports) || !isempty(handle_types) || !isempty(methods)
-        print(io, _PTHANDLE_TYPEDEF)
-    end
-    _emit_handle_type_defs(io, mod_name, handle_types, methods, news;
-                           mutable_types, properties)
-    structs = _array_structs(exports)
+    structs = _array_structs(carriers)
     if !isempty(structs)
         println(io, "/* C-ABI carriers for N-D arrays (match Julia PtArray{T,N}) */")
         for s in structs; println(io, s); end
         println(io)
         println(io, _WRAP_ARRAY_HELPER)
     end
-    ostructs = _opt_structs(exports)
+    ostructs = _opt_structs(carriers)
     if !isempty(ostructs)
         println(io, "/* C-ABI carriers for Optional types (match Julia Union{T,Nothing}) */")
         for s in ostructs; println(io, s); end
         println(io)
     end
-    dstructs = _dict_structs(exports)
+    dstructs = _dict_structs(carriers)
     if !isempty(dstructs)
         println(io, "/* C-ABI carriers for Dict{String,V} types */")
         for s in dstructs; println(io, s); end
         println(io)
     end
-    tstructs = _tuple_structs(exports)
+    tstructs = _tuple_structs(carriers)
     if !isempty(tstructs)
         println(io, "/* C-ABI carriers for tuple returns (match Julia Tuple{...}) */")
         for s in tstructs; println(io, s); end
         println(io)
     end
+    _emit_handle_type_defs(io, mod_name, handle_types, methods, news;
+                           mutable_types, mutable_struct_types, properties)
     println(io, "/* C-ABI entry points emitted by juliac --trim */")
     for e in exports
         println(io, _extern_decl(e))
@@ -1805,7 +1932,7 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
     println(io, "};")
     println(io)
     println(io, "PyMODINIT_FUNC PyInit_", mod_name, "(void) {")
-    if _uses_arrays(exports)
+    if _uses_arrays(carriers)
         # PyType_FromSpec heap-allocates the type; works in both full and stable ABI.
         println(io, "    _PtBufType = PyType_FromSpec(&_ptbuf_spec);")
         println(io, "    if (!_PtBufType) return NULL;")
