@@ -1082,7 +1082,31 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             clean = replace(replace(string(m.dunder), r"^__" => ""), r"__$" => "")
             sym   = cabi_symbol(m)
             dname = string(m.dunder)
-            if m.ret === String
+            # Dispatch on dunder FIRST so __getitem__ is handled before the
+            # ret-type dispatch below (it can have any return type).
+            if m.dunder === :__getitem__
+                # ssizeargfunc: PyObject* (*)(PyObject*, Py_ssize_t).
+                # The Julia ccallable returns c_abi_type(m.ret); box it with _build_pyobject.
+                ret_c = c_abi_type(m.ret)
+                c_ret_type = _c_ctype(ret_c)
+                box_stmts  = _build_pyobject(ret_c, "r", "_result")
+                println(io, "extern $c_ret_type $(sym)(PtHandle, int64_t, int32_t *, char **);")
+                println(io, "static PyObject *_pt_slot_$(tname)_$(clean)(PyObject *self, Py_ssize_t idx) {")
+                println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)self;")
+                println(io, "    PtHandle h = { obj->_data };")
+                println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+                println(io, "    $c_ret_type r = $(sym)(h, (int64_t)idx, &_err, &_errmsg);")
+                println(io, "    if (_err) {")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError,")
+                println(io, "            _errmsg ? _errmsg : \"error in $dname\");")
+                println(io, "        free(_errmsg);")
+                println(io, "        return NULL;")
+                println(io, "    }")
+                for s in box_stmts; println(io, "    ", s); end
+                println(io, "    return _result;")
+                println(io, "}")
+            elseif m.ret === String
+                # String return (repr/str pattern): char* → PyUnicode_FromString.
                 println(io, "extern char *$(sym)(PtHandle, int32_t *, char **);")
                 println(io, "static PyObject *_pt_slot_$(tname)_$(clean)(PyObject *self) {")
                 println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)self;")
@@ -1100,6 +1124,7 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                 println(io, "    return result;")
                 println(io, "}")
             elseif m.ret === Int64
+                # Integer return (len/hash pattern): int64_t → Py_ssize_t / Py_hash_t.
                 cret = m.dunder === :__len__ ? "Py_ssize_t" : "Py_hash_t"
                 println(io, "extern int64_t $(sym)(PtHandle, int32_t *, char **);")
                 println(io, "static $cret _pt_slot_$(tname)_$(clean)(PyObject *self) {")
@@ -1116,6 +1141,7 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                 println(io, "    return ($cret)r;")
                 println(io, "}")
             elseif m.ret === Bool
+                # Bool return (bool pattern): int8_t → int.
                 println(io, "extern int8_t $(sym)(PtHandle, int32_t *, char **);")
                 println(io, "static int _pt_slot_$(tname)_$(clean)(PyObject *self) {")
                 println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)self;")

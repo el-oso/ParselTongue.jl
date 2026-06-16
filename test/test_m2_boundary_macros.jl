@@ -473,6 +473,62 @@ end
     clear_exports!()
 end
 
+@testset "@pymethod __getitem__ (item O2)" begin
+    clear_exports!()
+    @pyfunc make_th_gi(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
+
+    # Basic: Float64 return (scalar carrier → PyFloat_FromDouble).
+    @pymethod __getitem__ th_getitem_f(h::_TestHandle, i::Int64)::Float64 =
+        i == 0 ? h.x : error("index out of range: $i")
+    m_gi = ParselTongue._METHODS[end]
+    @test m_gi.dunder === :__getitem__
+    @test m_gi.ret === Float64
+    @test th_getitem_f(_TestHandle(3.14, 1), 0) ≈ 3.14   # callable from Julia
+
+    # emit_ccallable_method: signature has _idx::Int64.
+    src = ParselTongue.emit_ccallable_method(m_gi)
+    @test occursin("_idx::Int64", src)
+    @test occursin("th_getitem_f(", src)
+    @test occursin(", _idx)", src)   # extra arg passed to Julia function
+    @test Meta.parse(src) isa Expr
+
+    # emit_cshim: ssizeargfunc slot, correct extern, boxing.
+    c_gi = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
+                      copy(ParselTongue._METHODS))
+    @test occursin("Py_sq_item", c_gi)
+    @test occursin("extern double pt_meth__TestHandle_getitem(PtHandle, int64_t", c_gi)
+    @test occursin("Py_ssize_t idx", c_gi)                # slot arg name
+    @test occursin("(int64_t)idx", c_gi)                  # cast to Julia int64_t
+    @test occursin("PyFloat_FromDouble", c_gi)            # scalar boxing
+
+    # String return: char* extern, PyUnicode_FromString boxing.
+    @pymethod __getitem__ th_getitem_s(h::_TestHandle, i::Int64)::String =
+        i == 0 ? string(h.x) : error("out of range")
+    m_gs = ParselTongue._METHODS[end]
+    c_gs = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
+                      copy(ParselTongue._METHODS))
+    @test occursin("pt_meth__TestHandle_getitem(PtHandle, int64_t", c_gs)  # int64_t index
+    @test occursin("PyUnicode_FromString", c_gs)
+
+    # Return type mismatch: __getitem__ with Nothing return is rejected.
+    err_gi_nothing = try; @eval @pymethod __getitem__ th_bad_gi_n(h::_TestHandle, i::Int64)::Nothing = nothing; catch e; e; end
+    @test (err_gi_nothing isa LoadError ? err_gi_nothing.error : err_gi_nothing) isa ErrorException
+
+    # Wrong extra arg type: must be Int64, not String.
+    err_gi_type = try; @eval @pymethod __getitem__ th_bad_gi_t(h::_TestHandle, i::String)::Float64 = 0.0; catch e; e; end
+    @test (err_gi_type isa LoadError ? err_gi_type.error : err_gi_type) isa ErrorException
+
+    # Wrong arg count: __getitem__ must have exactly 2 args.
+    err_gi_argc = try; @eval @pymethod __getitem__ th_bad_gi_c(h::_TestHandle)::Float64 = 0.0; catch e; e; end
+    @test (err_gi_argc isa LoadError ? err_gi_argc.error : err_gi_argc) isa ErrorException
+
+    # 1-arg dunders still rejected for __getitem__ form.
+    err_repr_2 = try; @eval @pymethod __repr__ th_bad_repr2(h::_TestHandle, i::Int64)::String = "x"; catch e; e; end
+    @test (err_repr_2 isa LoadError ? err_repr_2.error : err_repr_2) isa ErrorException
+
+    clear_exports!()
+end
+
 @testset "auto __getattr__ field access (item K)" begin
     # _TestHandle has fields x::Float64, n::Int64 (defined at file scope).
     clear_exports!()

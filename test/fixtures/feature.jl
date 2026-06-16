@@ -13,10 +13,13 @@ end
 @pymethod __repr__ pt2d_repr(p::Pt2D)::String = string("<Pt2D: x=", p.x, ", y=", p.y, ">")
 
 # Additional dunder methods (item O): __len__, __hash__, __bool__.
-# Pt2D.x is used as a stand-in "magnitude" for all three.
 @pymethod __len__  pt2d_len(p::Pt2D)::Int64  = Int64(round(sqrt(p.x^2 + p.y^2)))
 @pymethod __hash__ pt2d_hash(p::Pt2D)::Int64 = hash((p.x, p.y)) % Int64(typemax(Int64))
 @pymethod __bool__ pt2d_bool(p::Pt2D)::Bool  = p.x != 0.0 || p.y != 0.0
+
+# __getitem__ (item O2): index into Pt2D as a 2-element sequence (0-based).
+@pymethod __getitem__ pt2d_getitem(p::Pt2D, i::Int64)::Float64 =
+    i == 0 ? p.x : i == 1 ? p.y : error("Pt2D index out of range: $i")
 
 # Exercises every v1.x boundary kind in one extension: scalars, strings, complex,
 # 1-D and N-D arrays (both policies), in-place mutation + void, tuple returns,

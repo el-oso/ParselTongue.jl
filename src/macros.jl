@@ -62,12 +62,20 @@ const _ERRORS = PtError[]
 # ── @pymethod metadata ─────────────────────────────────────────────────
 
 # Supported dunder slots: symbol → (C slot constant, required Julia return type).
-const _PYMETHOD_SLOTS = Dict{Symbol,NamedTuple{(:slot,:ret_type),Tuple{String,Type}}}(
-    :__repr__ => (slot="Py_tp_repr",   ret_type=String),
-    :__str__  => (slot="Py_tp_str",    ret_type=String),
-    :__len__  => (slot="Py_sq_length", ret_type=Int64),
-    :__hash__ => (slot="Py_tp_hash",   ret_type=Int64),
-    :__bool__ => (slot="Py_nb_bool",   ret_type=Bool),
+# ret_type=nothing means any boundary return type is accepted (validated via c_abi_type).
+const _PYMETHOD_SLOTS = Dict{Symbol,NamedTuple}(
+    :__repr__    => (slot="Py_tp_repr",   ret_type=String),
+    :__str__     => (slot="Py_tp_str",    ret_type=String),
+    :__len__     => (slot="Py_sq_length", ret_type=Int64),
+    :__hash__    => (slot="Py_tp_hash",   ret_type=Int64),
+    :__bool__    => (slot="Py_nb_bool",   ret_type=Bool),
+    :__getitem__ => (slot="Py_sq_item",   ret_type=nothing),
+)
+
+# Extra positional argument types (after self) for dunders that take more than self.
+# For @pymethod __getitem__ f(p::T, i::Int64)::R, the extra arg is the integer index.
+const _PYMETHOD_EXTRA_ARGS = Dict{Symbol,Vector{Type}}(
+    :__getitem__ => Type[Int64],
 )
 
 """
@@ -102,11 +110,21 @@ function _register_method!(m::PtMethod)
     ishandle(c_abi_type(T)) ||
         error("@pymethod: type `$T` is not registered with @pyhandle.")
     T in _HANDLE_TYPES || push!(_HANDLE_TYPES, T)
-    # The C slot codegen is specialised per dunder (e.g. PyUnicode_FromString for
-    # __repr__/__str__), so the declared return type must match the slot's contract.
     spec = _PYMETHOD_SLOTS[m.dunder]
-    m.ret === spec.ret_type ||
-        error("@pymethod $(m.dunder): return type must be `$(spec.ret_type)`, got `$(m.ret)`.")
+    if spec.ret_type === nothing
+        # Polymorphic return (e.g. __getitem__): any non-Nothing boundary type.
+        m.ret === Nothing &&
+            error("@pymethod $(m.dunder): return type must not be Nothing.")
+        try
+            c_abi_type(m.ret)
+        catch e
+            error("@pymethod $(m.dunder): return type `$(m.ret)` is not a boundary type: $e")
+        end
+    else
+        # Fixed return type (e.g. __repr__ → String, __len__ → Int64).
+        m.ret === spec.ret_type ||
+            error("@pymethod $(m.dunder): return type must be `$(spec.ret_type)`, got `$(m.ret)`.")
+    end
     filter!(x -> !(x.handle_type === T && x.dunder === m.dunder), _METHODS)
     push!(_METHODS, m)
     return m
@@ -437,22 +455,26 @@ end
     @pymethod __len__  fname(p::T)::Int64  = ...
     @pymethod __hash__ fname(p::T)::Int64  = ...
     @pymethod __bool__ fname(p::T)::Bool   = ...
+    @pymethod __getitem__ fname(p::T, i::Int64)::R = ...
 
 Attach a Python dunder method to the `@pyhandle` type `T`. The macro:
   1. Defines the Julia function normally (it remains callable from Julia).
   2. Generates a `Base.@ccallable` entry point via juliac.
   3. Registers the slot on `T`'s Python `PyTypeObject` (overriding the default).
 
-`T` must already be registered with `@pyhandle`. The function must take exactly
-one positional argument — the self value of type `T`. Supported dunders:
+`T` must already be registered with `@pyhandle`. Supported dunders:
 
-| Dunder     | C slot         | Julia return type | Python uses          |
-|------------|----------------|-------------------|----------------------|
-| `__repr__` | `Py_tp_repr`   | `String`          | `repr(obj)`          |
-| `__str__`  | `Py_tp_str`    | `String`          | `str(obj)`           |
-| `__len__`  | `Py_sq_length` | `Int64`           | `len(obj)`           |
-| `__hash__` | `Py_tp_hash`   | `Int64`           | `hash(obj)`, dict key|
-| `__bool__` | `Py_nb_bool`   | `Bool`            | `bool(obj)`, `if obj`|
+| Dunder        | C slot         | Arg signature     | Return type          | Python uses              |
+|---------------|----------------|-------------------|----------------------|--------------------------|
+| `__repr__`    | `Py_tp_repr`   | `(self::T)`       | `String`             | `repr(obj)`              |
+| `__str__`     | `Py_tp_str`    | `(self::T)`       | `String`             | `str(obj)`               |
+| `__len__`     | `Py_sq_length` | `(self::T)`       | `Int64`              | `len(obj)`               |
+| `__hash__`    | `Py_tp_hash`   | `(self::T)`       | `Int64`              | `hash(obj)`, dict key    |
+| `__bool__`    | `Py_nb_bool`   | `(self::T)`       | `Bool`               | `bool(obj)`, `if obj`    |
+| `__getitem__` | `Py_sq_item`   | `(self::T, i::Int64)` | any boundary type| `obj[i]` (integer index) |
+
+`__getitem__` only handles integer indices (via `Py_sq_item`); slice notation
+(`obj[a:b]`) requires `Py_mp_subscript` and is not yet supported.
 """
 macro pymethod(dunder, fundef)
     dunder isa Symbol || error(
@@ -462,23 +484,52 @@ macro pymethod(dunder, fundef)
         error("@pymethod: unsupported dunder `$dunder`. Supported: $supported.")
     end
 
+    n_extra    = length(get(_PYMETHOD_EXTRA_ARGS, dunder, Type[]))
+    n_expected = 1 + n_extra
+
     fname, rawargs, ret_expr = _parse_fundef(fundef)
-    length(rawargs) == 1 || error(
-        "@pymethod $dunder: must have exactly one argument (self::T), got $(length(rawargs)).")
+    length(rawargs) == n_expected || error(
+        "@pymethod $dunder: must have exactly $n_expected argument(s) " *
+        "(self" * (n_extra > 0 ? " + $n_extra extra" : "") *
+        "), got $(length(rawargs)).")
+
+    # Parse and validate self (always rawargs[1]).
     (sname, stype_expr, smut, sdefault, skw) = rawargs[1]
     smut      && error("@pymethod $dunder: self argument cannot be Mut{…}.")
     sdefault !== nothing && error("@pymethod $dunder: self argument cannot have a default value.")
     skw       && error("@pymethod $dunder: self argument cannot be a keyword argument.")
 
+    # Parse extra args (rawargs[2:end]); collect their type expressions for runtime validation.
+    extra_type_exprs = Any[]
+    for (_, etype_expr, emut, edefault, ekw) in rawargs[2:end]
+        emut    && error("@pymethod $dunder: extra argument cannot be Mut{…}.")
+        edefault !== nothing && error("@pymethod $dunder: extra argument cannot have a default value.")
+        ekw     && error("@pymethod $dunder: extra argument cannot be a keyword argument.")
+        push!(extra_type_exprs, etype_expr)
+    end
+
     dunder_sym = QuoteNode(dunder)
     fname_sym  = QuoteNode(fname)
     sname_sym  = QuoteNode(sname)
+
+    # Build runtime type-equality checks for each extra arg.
+    expected_extra = get(_PYMETHOD_EXTRA_ARGS, dunder, Type[])
+    extra_checks = Expr[
+        :($(esc(extra_type_exprs[i])) === $(expected_extra[i]) ||
+          error(string("@pymethod ", $dunder_sym, ": extra argument ", $i,
+                       " must be typed ::", $(expected_extra[i]),
+                       ", got ::", $(esc(extra_type_exprs[i])))))
+        for i in 1:n_extra
+    ]
+
     quote
         $(esc(fundef))
         let _T = $(esc(stype_expr)), _ret = $(esc(ret_expr))
+            $(extra_checks...)
             _self_arg = ParselTongue.PtArg($sname_sym, _T, false, nothing, false)
             ParselTongue._register_method!(
                 ParselTongue.PtMethod(_T, $dunder_sym, $fname_sym, _self_arg, _ret))
         end
+        nothing
     end
 end

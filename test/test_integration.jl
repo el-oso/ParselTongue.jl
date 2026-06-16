@@ -176,6 +176,16 @@ end
         p4 = feature.make_point(3.0, 4.0)
         assert hash(p3) == hash(p4), "hash consistency"
         del p3, p4
+        # Item O2: __getitem__ (integer subscript).
+        p5 = feature.make_point(3.0, 4.0)
+        assert p5[0] == 3.0, f"__getitem__[0] = {p5[0]}"
+        assert p5[1] == 4.0, f"__getitem__[1] = {p5[1]}"
+        try:
+            _ = p5[2]
+            assert False, "__getitem__[2] should raise"
+        except RuntimeError:
+            pass
+        del p5
         # Python callables as arguments (item F)
         assert feature.apply(lambda x: x * 2.0, 3.0) == 6.0,    "apply: identity"
         assert feature.apply(abs, -5.0) == 5.0,                  "apply: builtin"

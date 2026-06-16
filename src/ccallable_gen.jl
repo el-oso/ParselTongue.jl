@@ -200,7 +200,12 @@ function emit_ccallable_method(m::PtMethod; errors::Vector{PtError}=PtError[])
 
     self_c = _type_src(c_abi_type(T))          # e.g. "ParselTongue.PtHandle{Pt2D}"
     from   = string("ParselTongue.from_c(", _type_src(T), ", _self)")
-    call   = string(m.jl_func, "(", from, ")")
+
+    # __getitem__ receives an extra Int64 index from the C slot (Py_ssize_t → int64_t).
+    # from_c(Int64, _idx) == _idx (Int64 is its own carrier), so pass it directly.
+    extra_params = m.dunder === :__getitem__ ? ", _idx::Int64" : ""
+    extra_call   = m.dunder === :__getitem__ ? ", _idx"        : ""
+    call   = string(m.jl_func, "(", from, extra_call, ")")
 
     # Catch block: identical to emit_ccallable (RuntimeError only; method bodies
     # can throw, but custom @pyerror types are not expected in dunders for now).
@@ -222,7 +227,7 @@ function emit_ccallable_method(m::PtMethod; errors::Vector{PtError}=PtError[])
     catch_stmts = String(take!(io_catch))
 
     sig     = string("Base.@ccallable function ", sym, "(_self::", self_c,
-                     ", _pt_err::Ptr{Int32}, _pt_errmsg::Ptr{Ptr{UInt8}})")
+                     extra_params, ", _pt_err::Ptr{Int32}, _pt_errmsg::Ptr{Ptr{UInt8}})")
     ret_src = _type_src(ret_c)
     zero    = _zero_cval(ret_c)
     to_c_expr = isopt(ret_c) ?

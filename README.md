@@ -1,7 +1,8 @@
 # ParselTongue.jl
 
 [![CI](https://github.com/el-oso/ParselTongue.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/el-oso/ParselTongue.jl/actions/workflows/ci.yml)
-[![Docs](https://github.com/el-oso/ParselTongue.jl/actions/workflows/Documentation.yml/badge.svg)](https://el-oso.github.io/ParselTongue.jl/)
+[![Docs (stable)](https://github.com/el-oso/ParselTongue.jl/actions/workflows/Documentation.yml/badge.svg)](https://el-oso.github.io/ParselTongue.jl/stable/)
+[![Docs (dev)](https://img.shields.io/badge/docs-dev-blue.svg)](https://el-oso.github.io/ParselTongue.jl/dev/)
 [![Julia](https://img.shields.io/badge/Julia-%E2%89%A5%201.12-9558B2.svg?logo=julia&logoColor=white)](https://julialang.org)
 
 Write a Python extension in plain Julia. Annotate functions with one macro, run
@@ -46,7 +47,7 @@ Full guide, boundary-type reference, and worked examples:
 | `@pyfunc f(a::T)::R = …` | Mark a function for export (emits it normally + records its signature). An optional leading string sets the Python name: `@pyfunc "py_name" f(…) = …`. |
 | `@pymodule name begin … end` | Group `@pyfunc` definitions and name the Python module. |
 | `@pyhandle T` | Expose an isbits struct `T` as a real Python class; scalar fields become read-only attributes. |
-| `@pymethod __repr__ f(p::T)::String = …` | Attach a Python dunder (`__repr__`/`__str__`, `__len__`/`__hash__`/`__bool__`) to a `@pyhandle` type. |
+| `@pymethod __repr__ f(p::T)::String = …` | Attach a Python dunder (`__repr__`/`__str__`, `__len__`/`__hash__`/`__bool__`, `__getitem__`) to a `@pyhandle` type. |
 | `build_extension(path; mod_name, outdir, trim, python, verbose)` | Build just the importable extension `.so` (the surrounding env must provide libjulia). |
 | `build_wheel(path; version, mod_name, outdir, python, trim, runtime, slim, abi3, emit_pyproject, verbose)` | Build a self-contained, pip-installable wheel that bundles the Julia runtime. |
 | `build_multi_wheel(sources, mod_name; …)` | Aggregate several `@pymodule` files into one wheel (one shared runtime) exposing each as a submodule, so they co-import in one process. |
@@ -128,11 +129,11 @@ metadata. The boundary type system reuses
 
 ## Status
 
-v0.17 — full build pipeline shipping: scalars, strings, N-D numeric arrays,
+v0.18 — full build pipeline shipping: scalars, strings, N-D numeric arrays,
 `ComplexF64`, `Vector{String}`, `Dict{String,V}`, `Vector{UInt8}` (bytes),
 `Union{T,Nothing}` (Optional), `NamedTuple`, `Tuple`, real-Python-class opaque
 handles (`@pyhandle` — `isinstance`, auto read-only field access, and
-`@pymethod __repr__`/`__str__`/`__len__`/`__hash__`/`__bool__`), custom Python exception
+`@pymethod __repr__`/`__str__`/`__len__`/`__hash__`/`__bool__`/`__getitem__`), custom Python exception
 types (`@pyerror`), keyword/default
 arguments, arbitrary-signature `PyCallable{Args,Ret}` callbacks, manylinux
 tagging, abi3 stable-ABI wheels, shared-runtime wheels, slim bundling,

@@ -290,8 +290,8 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   array before `PyType_FromSpec`, overriding the generated default. Each method becomes a
   `Base.@ccallable` wrapper (`pt_meth_<T>_<dunder>`) in the juliac entry, exactly like a
   `@pyfunc`. Trim-safe by construction. The declared return type is validated against the
-  slot contract at registration time. `__eq__`/`__hash__` are future work (richcompare /
-  hash slot wrappers). Files: `src/macros.jl` (`PtMethod` + `@pymethod`),
+  slot contract at registration time. (`__hash__` done in item O; `__eq__`/richcompare
+  remains future work.) Files: `src/macros.jl` (`PtMethod` + `@pymethod`),
   `src/ccallable_gen.jl` (`emit_ccallable_method`), `src/cshim.jl` (slot injection),
   threaded through `build.jl`/`wheel.jl`. **Done v0.10.0.**
 
@@ -383,6 +383,19 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   Files: `src/macros.jl` (`_PYMETHOD_SLOTS`), `src/cshim.jl` (`_emit_handle_type_defs`
   dispatch + slot loop). `src/ccallable_gen.jl` unchanged (already handles all scalar
   return types). **Done v0.15.0.**
+
+- [x] **O2. `__getitem__` (2-arg `@pymethod`)** — extends `@pymethod` to dunders that
+  take a `self` plus one extra argument. Maps to CPython's `ssizeargfunc` slot
+  (`Py_sq_item`): `PyObject* (*)(PyObject*, Py_ssize_t)`.
+  ```julia
+  @pymethod __getitem__ pt_item(p::T, i::Int64)::Float64 = ...  # obj[i]
+  ```
+  Implementation: `_PYMETHOD_EXTRA_ARGS` registry maps each multi-arg dunder to its
+  extra argument types; `@pymethod` macro validates against it; `emit_ccallable_method`
+  appends `_idx::Int64` / passes it through; `_emit_handle_type_defs` dispatches on
+  `m.dunder === :__getitem__` first (before return-type dispatch) to emit the
+  `(PyObject*, Py_ssize_t)` C slot wrapper. Supports any boundary return type.
+  **Done v0.18.0.**
 
 ## Audit findings — 2026-06-16 (open)
 
