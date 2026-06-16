@@ -75,7 +75,7 @@ Returns the path to the `.whl`.
   `parseltongue-runtime` wheel. Install that wheel once and share it across many
   extension wheels. The extension's `__init__.py` ctypes-preloads (RTLD_GLOBAL) the
   runtime package's `julia/lib` libraries before importing the extension `.so`.
-  Build the runtime wheel with [`build_runtime_wheel`](@ref).
+  Build the runtime wheel with `build_runtime_wheel`.
 - `:system` — the wheel is tiny (~1 MB) and has no runtime dependency; the extension
   locates Julia at import time via `JULIA_BINDIR` or `JULIA_PREFIX` environment
   variables, or by querying `julia` on `PATH`. **Requires Julia ≥ 1.12 to be
@@ -275,7 +275,7 @@ build_multi_wheel(["aa.jl", "bb.jl"], "mypkg")
 ```
 
 The `runtime`, `slim`, `abi3`, `manylinux`, and `emit_pyproject` options behave as in
-[`build_wheel`](@ref).
+`build_wheel`.
 """
 function build_multi_wheel(sources::AbstractVector{<:AbstractString},
                            mod_name::AbstractString;
