@@ -14,7 +14,7 @@ the Python object graph you can reach from native code.
 | Annotation | `@pyfunc` / `@pymodule` | `#[pyfunction]` / `#[pymodule]` |
 | Build command | `build_wheel("file.jl")` | `maturin build` |
 | Type mapping | Explicit boundary contract | Derive macros + `FromPyObject` / `IntoPyObject` |
-| Classes | `@pyhandle` (isbits structs → real Python types; `isinstance` / `repr` work) | `#[pyclass]` (full object protocol) |
+| Classes | `@pyhandle` (isbits structs → real Python types; `isinstance`, auto field access, `@pymethod __repr__`/`__str__`) | `#[pyclass]` (full object protocol) |
 | Custom exceptions | `@pyerror MyError <: ValueError` | `create_exception!` |
 | Python callables | `PyCallable` (Float64→Float64 now) | `Py<PyAny>` / `PyCallable` (any signature) |
 | GIL release during call | Yes (automatic) | Yes (opt-in with `py.allow_threads`) |
@@ -126,16 +126,31 @@ struct Point; x::Float64; y::Float64; end
 @pyfunc norm(p::Point)::Float64 = sqrt(p.x^2 + p.y^2)
 ```
 
+Each scalar field is automatically exposed as a **read-only Python attribute**
+(no annotation needed), and you can override `__repr__` / `__str__` with
+`@pymethod`:
+
+```julia
+@pymethod __repr__ point_repr(p::Point)::String = "Point($(p.x), $(p.y))"
+```
+
 ```python
 import mymod
 p = mymod.make_point(3.0, 4.0)
 isinstance(p, mymod.Point)   # True
-repr(p)                      # '<Point>'
+p.x, p.y                     # (3.0, 4.0)   ← auto field access
+repr(p)                      # 'Point(3.0, 4.0)'   ← @pymethod __repr__
 ```
 
+A `@pymethod` takes exactly one argument — the `self` value of the handle type —
+and its return type must match the slot (`String` for `__repr__`/`__str__`). The
+underlying Julia function stays callable from Julia. Field access is read-only:
+handles are immutable value types, so "mutation" returns a new handle.
+
 The `@pyhandle` restriction exists because GC rooting and arbitrary dunder
-protocols require dynamic dispatch that `--trim=safe` would reject. User-defined
-dunders and Python inheritance are not supported.
+protocols require dynamic dispatch that `--trim=safe` would reject. Beyond
+`__repr__`/`__str__` and auto field access, general user-defined dunders and
+Python inheritance are not supported.
 
 ## Error handling
 

@@ -99,7 +99,11 @@ function _register_method!(m::PtMethod)
     ishandle(c_abi_type(T)) ||
         error("@pymethod: type `$T` is not registered with @pyhandle.")
     T in _HANDLE_TYPES || push!(_HANDLE_TYPES, T)
-    assert_ret_boundary(m.ret)
+    # The C slot codegen is specialised per dunder (e.g. PyUnicode_FromString for
+    # __repr__/__str__), so the declared return type must match the slot's contract.
+    spec = _PYMETHOD_SLOTS[m.dunder]
+    m.ret === spec.ret_type ||
+        error("@pymethod $(m.dunder): return type must be `$(spec.ret_type)`, got `$(m.ret)`.")
     filter!(x -> !(x.handle_type === T && x.dunder === m.dunder), _METHODS)
     push!(_METHODS, m)
     return m

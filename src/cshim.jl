@@ -1108,7 +1108,33 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             println(io, "}")
         end
 
-        # Slots array: always dealloc + repr (user or default), plus user str.
+        # Auto field access (item K): expose each scalar field as a read-only
+        # Python attribute via Py_tp_getattro. Field bytes are read at the Julia
+        # struct offset (isbits layout == C layout) and converted with the same
+        # scalar→PyObject builders used for return values. Non-scalar fields and
+        # all dunders fall through to PyObject_GenericGetAttr (so repr/__class__
+        # etc. keep working). PyUnicode_CompareWithASCIIString is stable-ABI safe.
+        scalar_fields = [(string(fieldname(T, i)), fieldtype(T, i), fieldoffset(T, i))
+                         for i in 1:fieldcount(T) if isscalar(fieldtype(T, i))]
+        has_getattr = !isempty(scalar_fields)
+        if has_getattr
+            println(io, "static PyObject *_pt_getattr_$tname(PyObject *self, PyObject *name) {")
+            println(io, "    void *_d = ((_PtObj_$tname *)self)->_data;")
+            for (fname, ftype, off) in scalar_fields
+                ctype = _c_ctype(ftype)
+                build = _bp_scalar(ftype, "_f", "_v")
+                println(io, "    if (PyUnicode_CompareWithASCIIString(name, \"$fname\") == 0) {")
+                println(io, "        $ctype _f = *($ctype *)((char *)_d + $off);")
+                for s in build; println(io, "        ", s); end
+                println(io, "        return _v;")
+                println(io, "    }")
+            end
+            println(io, "    return PyObject_GenericGetAttr(self, name);")
+            println(io, "}")
+        end
+
+        # Slots array: always dealloc + repr (user or default), plus user str
+        # and auto field-access getattro.
         println(io, "static PyType_Slot _pt_slots_$tname[] = {")
         println(io, "    {Py_tp_dealloc, (void *)_pt_dealloc_$tname},")
         if has_repr
@@ -1118,6 +1144,9 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         end
         if has_str
             println(io, "    {Py_tp_str,     (void *)_pt_slot_$(tname)_str},")
+        end
+        if has_getattr
+            println(io, "    {Py_tp_getattro, (void *)_pt_getattr_$tname},")
         end
         println(io, "    {0, NULL}")
         println(io, "};")

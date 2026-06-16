@@ -143,6 +143,9 @@ end
         assert repr(p) == "<Pt2D: x=3.0, y=4.0>", f"repr: {repr(p)}"
         assert feature.point_x(p) == 3.0, "point_x"
         assert feature.point_y(p) == 4.0, "point_y"
+        # Auto field access (item K): scalar fields exposed as read-only attributes.
+        assert p.x == 3.0, f"field access p.x: {p.x}"
+        assert p.y == 4.0, f"field access p.y: {p.y}"
         assert feature.point_norm(p) == 5.0, "point_norm 3-4-5"
         p2 = feature.point_scale(p, 2.0)
         assert isinstance(p2, feature.Pt2D), "scaled result is Pt2D"

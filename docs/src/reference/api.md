@@ -21,8 +21,13 @@ CurrentModule = ParselTongue
 
 ```@docs
 @pyhandle
+@pymethod
 PtHandle
 ```
+
+Scalar fields of a `@pyhandle` type are automatically exposed as read-only Python
+attributes (`p.x`); no annotation is required. `@pymethod` attaches a Python
+dunder (`__repr__` or `__str__`) implemented by a Julia function.
 
 ## Building
 

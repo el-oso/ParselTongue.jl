@@ -280,26 +280,29 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
 
 ## Phase 5 — handle ergonomics + distribution
 
-- [ ] **J. User-defined dunders on handles (`@pymethod`)** — allow annotating Julia functions
-  as Python special methods on a `@pyhandle` type, e.g.:
+- [x] **J. User-defined dunders on handles (`@pymethod`)** — annotate a Julia function as a
+  Python special method on a `@pyhandle` type, e.g.:
   ```julia
-  @pymethod __repr__ (p::Point2D)::String = "<Point2D x=$(p.x) y=$(p.y)>"
-  @pymethod __eq__   (a::Point2D, b::Point2D)::Bool = a.x == b.x && a.y == b.y
+  @pymethod __repr__ point_repr(p::Point2D)::String = "<Point2D x=$(p.x) y=$(p.y)>"
   ```
-  The `PyType_Slot` machinery from item 12 is already in place; `@pymethod` injects
-  additional slots into the per-type `_pt_slots_<T>[]` array before `PyType_FromSpec`.
-  Each method becomes a `Base.@ccallable` wrapper in the juliac entry, exactly like a
-  `@pyfunc`. Trim-safe by construction. Start with `__repr__`, `__eq__`, `__hash__`,
-  `__len__`. Files: `src/macros.jl` (new `PtMethod` struct + `@pymethod`),
-  `src/ccallable_gen.jl` (emit wrapper), `src/cshim.jl` (slot injection).
-  Effort M · Risk L (slot mechanism proven by item 12).
+  Implemented for `__repr__` and `__str__` (both `String`-returning, single `self` arg).
+  `@pymethod` injects a `Py_tp_repr` / `Py_tp_str` slot into the per-type `_pt_slots_<T>[]`
+  array before `PyType_FromSpec`, overriding the generated default. Each method becomes a
+  `Base.@ccallable` wrapper (`pt_meth_<T>_<dunder>`) in the juliac entry, exactly like a
+  `@pyfunc`. Trim-safe by construction. The declared return type is validated against the
+  slot contract at registration time. `__eq__`/`__hash__` are future work (richcompare /
+  hash slot wrappers). Files: `src/macros.jl` (`PtMethod` + `@pymethod`),
+  `src/ccallable_gen.jl` (`emit_ccallable_method`), `src/cshim.jl` (slot injection),
+  threaded through `build.jl`/`wheel.jl`. **Done v0.10.0.**
 
-- [ ] **K. Read-only field access via `__getattr__`** — for `@pyhandle T`, auto-generate a
-  `__getattr__` slot that exposes `fieldnames(T)` as Python attributes. No user annotation
-  required; fields are discovered at build time. Accessor returns the field value converted
-  via the existing `to_c` → C shim path. Conflicts with Python attribute lookup conventions
-  (shadowed by instance dict / type attrs) — use `Py_tp_getattro` pattern.
-  Files: `src/cshim.jl` (emit `_pt_getattr_<T>` + slot). Effort S · Risk L.
+- [x] **K. Read-only field access via `__getattr__`** — for `@pyhandle T`, auto-generate a
+  `Py_tp_getattro` slot that exposes every scalar `fieldname(T)` as a read-only Python
+  attribute. No user annotation; fields and offsets are discovered at build time via
+  `fieldoffset`/`fieldtype` (isbits layout == C layout). Reads the field bytes and converts
+  with the existing scalar→PyObject builders. Uses `PyUnicode_CompareWithASCIIString`
+  (stable-ABI safe); non-scalar fields and all dunders fall through to
+  `PyObject_GenericGetAttr` so `repr`/`__class__` keep working.
+  Files: `src/cshim.jl` (`_pt_getattr_<T>` + slot). **Done v0.10.0.**
 
 - [ ] **L. `PyCallable` with arbitrary signatures** — today `PyCallable` is hardcoded to
   `Float64 → Float64`. Generalize to `PyCallable{Tuple{A...}, R}` so users can accept any

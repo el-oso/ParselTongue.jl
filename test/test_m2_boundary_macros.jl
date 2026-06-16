@@ -396,9 +396,33 @@ end
     @test occursin("Py_tp_str", c2)
     @test occursin("_pt_slot__TestHandle_str", c2)
 
+    # @pymethod rejects a return type that doesn't match the slot contract.
+    err3 = try; @eval @pymethod __repr__ th_bad(h::_TestHandle)::Int64 = 0; catch e; e; end
+    @test (err3 isa LoadError ? err3.error : err3) isa ErrorException
+
     # clear_exports! resets _METHODS.
     clear_exports!()
     @test isempty(ParselTongue._METHODS)
+end
+
+@testset "auto __getattr__ field access (item K)" begin
+    # _TestHandle has fields x::Float64, n::Int64 (defined at file scope).
+    clear_exports!()
+    @pyfunc make_th2(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
+    c = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle])
+
+    # getattro slot + function generated, with a comparison per scalar field.
+    @test occursin("Py_tp_getattro", c)
+    @test occursin("_pt_getattr__TestHandle", c)
+    @test occursin("PyUnicode_CompareWithASCIIString(name, \"x\")", c)
+    @test occursin("PyUnicode_CompareWithASCIIString(name, \"n\")", c)
+    # Float64 field → PyFloat_FromDouble; Int64 field → PyLong_FromLongLong.
+    @test occursin("PyFloat_FromDouble", c)
+    @test occursin("PyLong_FromLongLong", c)
+    # Unknown attrs (and dunders) fall through to the generic getattr.
+    @test occursin("PyObject_GenericGetAttr(self, name)", c)
+    # Field offset of the second field (Int64 after Float64) is 8.
+    @test occursin("(char *)_d + 8", c)
 end
 
 @testset "NamedTuple return (item 8)" begin
