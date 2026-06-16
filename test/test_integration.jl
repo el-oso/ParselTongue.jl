@@ -37,6 +37,21 @@ function _py_run(script::AbstractString)
     String(take!(buf))
 end
 
+# Run a Python script in a *clean* environment with only the given env pairs (plus
+# HOME/PATH). Used to prove runtime=:system wheels import without LD_LIBRARY_PATH —
+# the ctypes RTLD_GLOBAL preload in __init__.py must do the work itself.
+function _py_run_env(script::AbstractString, env::Pair...)
+    py = Sys.which("python3")
+    base = ["HOME" => get(ENV, "HOME", ""), "PATH" => get(ENV, "PATH", "/usr/bin:/bin")]
+    buf = IOBuffer()
+    try
+        run(pipeline(setenv(`$py -c $script`, base..., env...), stdout=buf, stderr=buf))
+    catch e
+        error("Python process failed:\n$(String(take!(buf)))\nCaused by: $e")
+    end
+    String(take!(buf))
+end
+
 function _have_tools()
     Sys.which("python3") !== nothing || return false
     (Sys.which("cc") !== nothing || Sys.which("gcc") !== nothing) || return false
@@ -241,16 +256,31 @@ end
         """)
         @test occursin("feature/__init__.py", names)
         @test occursin(r"feature/_feature\..*\.(so|pyd)", names)
+
+        # Import the :system wheel with ONLY JULIA_BINDIR set — no LD_LIBRARY_PATH.
+        # This proves the ctypes RTLD_GLOBAL preload in __init__.py resolves libjulia
+        # on its own (setting LD_LIBRARY_PATH from inside Python does not affect the
+        # already-initialised loader). Windows handles DLLs differently — skip there.
+        if !Sys.iswindows()
+            extract = joinpath(outdir, "x")
+            _py_run("import zipfile; zipfile.ZipFile($(repr(whl))).extractall($(repr(extract)))")
+            out = _py_run_env("""
+            import sys; sys.path.insert(0, $(repr(extract)))
+            import feature
+            assert feature.add(40, 2) == 42, "add"
+            assert feature.greet("World") == "Hello, World!", "greet"
+            print("SYS_OK")
+            """, "JULIA_BINDIR" => Sys.BINDIR)
+            @test occursin("SYS_OK", out)
+        end
     end
 end
 
 # Item N: build_multi_wheel aggregates several @pymodule files into ONE extension
 # (one jl_init) exposed as submodules, so they co-import in one process. Two
 # separately-trimmed .so's cannot — each re-runs jl_init and aborts. Uses
-# runtime=:system (no vendoring) for speed; on Linux the loader needs
-# LD_LIBRARY_PATH set in the *environment* before launch (setting it from inside
-# __init__.py does not affect the already-initialised loader), so the import check
-# sets JULIA_BINDIR + LD_LIBRARY_PATH explicitly here.
+# runtime=:system (no vendoring) for speed; the import sets ONLY JULIA_BINDIR — the
+# ctypes RTLD_GLOBAL preload in __init__.py resolves libjulia without LD_LIBRARY_PATH.
 @testset "integration: build_multi_wheel (item N)" begin
     if !_have_tools()
         @info "skipping build_multi_wheel integration test (need python3, a C compiler, and juliac)"
@@ -283,12 +313,8 @@ end
             @info "Windows: multi-wheel built (co-import check skipped — see build_wheel notes)"
         else
             extract = joinpath(outdir, "x")
-            _py_run("""
-            import zipfile
-            zipfile.ZipFile($(repr(whl))).extractall($(repr(extract)))
-            """)
-            libdir = abspath(joinpath(Sys.BINDIR, "..", "lib"))
-            script = """
+            _py_run("import zipfile; zipfile.ZipFile($(repr(whl))).extractall($(repr(extract)))")
+            out = _py_run_env("""
             import sys; sys.path.insert(0, $(repr(extract)))
             import mathpkg
             assert mathpkg.geo.area(3.0, 4.0) == 12.0, "geo.area"
@@ -296,20 +322,8 @@ end
             # interleave both submodules in one process (shared runtime)
             assert mathpkg.geo.area(2.0, 5.0) == 10.0 and mathpkg.num.gcd_(9, 6) == 3
             print("MULTI_OK")
-            """
-            py = Sys.which("python3")
-            buf = IOBuffer()
-            cmd = setenv(`$py -c $script`,
-                         "JULIA_BINDIR" => Sys.BINDIR,
-                         "LD_LIBRARY_PATH" => "$libdir:$(joinpath(libdir, "julia"))",
-                         "HOME" => get(ENV, "HOME", ""),
-                         "PATH" => get(ENV, "PATH", ""))
-            try
-                run(pipeline(cmd, stdout=buf, stderr=buf))
-            catch e
-                error("multi-wheel co-import failed:\n$(String(take!(buf)))\n$e")
-            end
-            @test occursin("MULTI_OK", String(take!(buf)))
+            """, "JULIA_BINDIR" => Sys.BINDIR)
+            @test occursin("MULTI_OK", out)
         end
     end
 end

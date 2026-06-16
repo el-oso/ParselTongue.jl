@@ -73,8 +73,8 @@ Returns the path to the `.whl`.
   transitive dependencies are vendored inside the wheel. No extra install required.
 - `:shared` — the wheel is tiny (~1 MB); the Julia runtime is provided by a separate
   `parseltongue-runtime` wheel. Install that wheel once and share it across many
-  extension wheels. The extension's `__init__.py` sets `LD_LIBRARY_PATH` to point at
-  the runtime package's `julia/lib` dirs before importing the extension `.so`.
+  extension wheels. The extension's `__init__.py` ctypes-preloads (RTLD_GLOBAL) the
+  runtime package's `julia/lib` libraries before importing the extension `.so`.
   Build the runtime wheel with [`build_runtime_wheel`](@ref).
 - `:system` — the wheel is tiny (~1 MB) and has no runtime dependency; the extension
   locates Julia at import time via `JULIA_BINDIR` or `JULIA_PREFIX` environment
@@ -547,8 +547,8 @@ end
 const _RUNTIME_INIT_PY = """\"\"\"Julia runtime libraries for ParselTongue extension wheels.
 
 This package vendors libjulia and its transitive dependencies. Extension wheels
-built with build_wheel(...; runtime=:shared) set LD_LIBRARY_PATH to point at
-the julia/lib directories here before importing their compiled extension .so.
+built with build_wheel(...; runtime=:shared) ctypes-preload the libraries from
+the julia/lib directories here (RTLD_GLOBAL) before importing their extension .so.
 \"\"\"
 import os as _os
 _JULIA_LIB = _os.path.join(_os.path.dirname(__file__), "julia", "lib")
@@ -619,10 +619,48 @@ function build_runtime_wheel(;
     return whl_path
 end
 
-# Write __init__.py for a shared-runtime extension wheel.
-# Linux: sets LD_LIBRARY_PATH (re-read by glibc at each dlopen).
-# macOS: uses ctypes.CDLL to preload Julia dylibs globally before import
-#   (DYLD_LIBRARY_PATH is not re-read after process start, so env-var trick fails).
+# Generated Python lines (4-space indented for inside `def _preload():`) that
+# RTLD_GLOBAL-load every Julia shared lib in `_l1`/`_l2` to a fixpoint: repeat
+# passes while any previously-failed lib now loads, so a lib whose dependencies
+# load later still gets in. Once libjulia*.so* are loaded RTLD_GLOBAL, the
+# extension's own dlopen resolves its DT_NEEDED against the already-loaded copies.
+# This is the portable mechanism — neither LD_LIBRARY_PATH (Linux) nor
+# DYLD_LIBRARY_PATH (macOS) is honoured once the process loader has initialised.
+# Built as \n-joined single-line literals (NOT a triple-quoted block — Julia
+# dedents those and would unindent the body out of _preload()).
+function _ctypes_preload_lines(pat::AbstractString)
+    [
+        "    import ctypes as _ct, glob as _gl",
+        "    _libs = sorted(_gl.glob(_os.path.join(_l1, '$pat'))) + \\",
+        "            sorted(_gl.glob(_os.path.join(_l2, '$pat')))",
+        "    _pending = list(_libs)",
+        "    while _pending:",
+        "        _progress = False; _still = []",
+        "        for _lib in _pending:",
+        "            try: _ct.CDLL(_lib, mode=_ct.RTLD_GLOBAL); _progress = True",
+        "            except OSError: _still.append(_lib)",
+        "        if not _progress: break",
+        "        _pending = _still",
+    ]
+end
+
+# Body of `def _preload():` for the given OS. macOS/Linux both ctypes-preload the
+# Julia libs (the working mechanism); Linux additionally sets LD_LIBRARY_PATH as a
+# belt-and-suspenders hint for any child processes the extension may spawn.
+function _preload_body(_os_kernel::Symbol)
+    if _os_kernel === :apple
+        join(_ctypes_preload_lines("*.dylib"), "\n")
+    else
+        join(vcat(_ctypes_preload_lines("*.so*"),
+                  ["    _prev = _os.environ.get('LD_LIBRARY_PATH', '')",
+                   "    _os.environ['LD_LIBRARY_PATH'] = ':'.join(x for x in (_l1, _l2, _prev) if x)"]),
+             "\n")
+    end
+end
+
+# Write __init__.py for a shared-runtime extension wheel. Both Unix variants
+# RTLD_GLOBAL-preload the Julia libs via ctypes before importing the extension
+# (env-var search-path tricks don't work after the loader has initialised).
 function _write_shared_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractString,
                                    exports::AbstractVector{PtExport}, mod::AbstractString,
                                    handle_types::AbstractVector{<:Type}=Type[];
@@ -658,24 +696,7 @@ _preload()
 del _preload, _ilu, _os
 $(imports_str)$(submod_str)$(all_str)"""
     else
-        # NB: build these as explicit \n-joined single-line literals, NOT a
-        # triple-quoted block — Julia dedents `"""…"""` literals and would strip
-        # the leading indentation off the 2nd+ lines, moving them out of _preload().
-        preload_body = if _os_kernel === :apple
-            # ctypes global-load every *.dylib in the runtime package's lib dirs.
-            join([
-                "    import ctypes as _ct, glob as _gl",
-                "    for _lib in sorted(_gl.glob(_os.path.join(_l1, '*.dylib'))) + \\",
-                "                sorted(_gl.glob(_os.path.join(_l2, '*.dylib'))):",
-                "        try: _ct.CDLL(_lib, _ct.RTLD_GLOBAL)",
-                "        except OSError: pass",
-            ], "\n")
-        else
-            join([
-                "    _prev = _os.environ.get('LD_LIBRARY_PATH', '')",
-                "    _os.environ['LD_LIBRARY_PATH'] = ':'.join(x for x in (_l1, _l2, _prev) if x)",
-            ], "\n")
-        end
+        preload_body = _preload_body(_os_kernel)
         """\"\"\"$mod — built with ParselTongue. Requires parseltongue-runtime.\"\"\"
 import importlib.util as _ilu, os as _os
 def _preload():
@@ -707,8 +728,9 @@ $(imports_str)$(submod_str)$(all_str)"""
 end
 
 # Write __init__.py for a system-runtime extension wheel.
-# Locates Julia on the target machine at import time via env vars or PATH.
-# Linux: sets LD_LIBRARY_PATH; macOS: ctypes.CDLL preload (same as :shared).
+# Locates Julia on the target machine at import time via env vars or PATH, then
+# ctypes-preloads (RTLD_GLOBAL) its libs before importing the extension (same
+# mechanism as :shared).
 function _write_system_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractString,
                                    exports::AbstractVector{PtExport}, mod::AbstractString,
                                    handle_types::AbstractVector{<:Type}=Type[];
@@ -759,22 +781,7 @@ _preload()
 del _preload, _os, _sh
 $(imports_str)$(submod_str)$(all_str)"""
     else
-        # See note in _write_shared_pkg_pyfiles: \n-joined literals avoid the
-        # triple-quote dedent that would unindent the preload body.
-        preload_body = if _os_kernel === :apple
-            join([
-                "    import ctypes as _ct, glob as _gl",
-                "    for _lib in sorted(_gl.glob(_os.path.join(_l1, '*.dylib'))) + \\",
-                "                sorted(_gl.glob(_os.path.join(_l2, '*.dylib'))):",
-                "        try: _ct.CDLL(_lib, _ct.RTLD_GLOBAL)",
-                "        except OSError: pass",
-            ], "\n")
-        else
-            join([
-                "    _prev = _os.environ.get('LD_LIBRARY_PATH', '')",
-                "    _os.environ['LD_LIBRARY_PATH'] = ':'.join(x for x in (_l1, _l2, _prev) if x)",
-            ], "\n")
-        end
+        preload_body = _preload_body(_os_kernel)
         """\"\"\"$mod — built with ParselTongue. Requires Julia ≥ 1.12 on the system.\"\"\"
 import os as _os, shutil as _sh
 def _preload():
