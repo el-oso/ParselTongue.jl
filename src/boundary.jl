@@ -177,6 +177,11 @@ macro pyhandle(T_expr)
         function ParselTongue.from_c(::Type{$T}, h::ParselTongue.PtHandle{$T})::$T
             unsafe_load(Ptr{$T}(h.ptr))
         end
+        # Trim-safety scan for to_c/from_c. check_trim_compat walks the supertype
+        # chain of T looking for @contract specs — for user structs that don't subtype
+        # PyBoundary this is a no-op today. TypeContracts would need a structural form
+        # (@verify T for_contract=PyBoundary trim_compat=true) to cover this case.
+        TypeContracts.check_trim_compat($T)
         nothing
     end
 end
@@ -270,6 +275,10 @@ macro boundary(T_expr, carrier_eq, block)
                       "` failed protocol validation after registration. Missing: " *
                       join(_m, ", ") * ".")
             end
+            # Trim-safety scan. Same structural gap as @pyhandle: a no-op for types
+            # that don't subtype PyBoundary. TypeContracts needs structural trim
+            # checking to cover user-registered boundary types.
+            TypeContracts.check_trim_compat(_t)
         end
         nothing
     end
@@ -592,7 +601,7 @@ The bare name `PyCallable` (no parameters) defaults to `Float64 → Float64`:
 Supported argument and return scalar types: `Int8`–`Int64`, `UInt8`–`UInt64`,
 `Bool`, `Float32`, `Float64`.
 """
-struct PyCallable{Args<:Tuple, Ret}
+struct PyCallable{Args<:Tuple, Ret} <: PyBoundary
     ptr::Ptr{Cvoid}
 end
 
@@ -602,6 +611,10 @@ from_c(::Type{PyCallable{A,R}}, p::Ptr{Cvoid}) where {A,R} = PyCallable{A,R}(p)
 # Bare `PyCallable` (UnionAll) defaults to the Float64 → Float64 signature.
 from_c(::Type{PyCallable}, p::Ptr{Cvoid}) = PyCallable{Tuple{Float64},Float64}(p)
 to_c(f::PyCallable) = f.ptr
+
+# Verify the PyBoundary contract on a concrete PyCallable instantiation and confirm
+# that to_c/from_c are trim-safe (no invokelatest, Base.which, etc.).
+@verify PyCallable{Tuple{Float64},Float64} trim_compat=true
 
 # ── Per-type scalar boxing / unboxing (trim-safe direct ccalls) ────────
 # Each method is concretely typed, so dispatch from the @generated call operator
