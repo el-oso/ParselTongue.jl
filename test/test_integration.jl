@@ -240,7 +240,7 @@ end
             print("\\n".join(z.namelist()))
         """)
         @test occursin("feature/__init__.py", names)
-        @test occursin(r"feature/_feature\..*\.so", names)
+        @test occursin(r"feature/_feature\..*\.(so|pyd)", names)
     end
 end
 
@@ -277,7 +277,7 @@ end
         @test occursin("mathpkg/__init__.py", names)
         @test occursin("mathpkg/geo.py", names)
         @test occursin("mathpkg/num.py", names)
-        @test occursin(r"mathpkg/_mathpkg\..*\.so", names)
+        @test occursin(r"mathpkg/_mathpkg\..*\.(so|pyd)", names)
 
         if Sys.iswindows()
             @info "Windows: multi-wheel built (co-import check skipped — see build_wheel notes)"
