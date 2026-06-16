@@ -1116,6 +1116,10 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         tnew   = tnew_i === nothing ? nothing : news[tnew_i]
 
         println(io, "typedef struct { PyObject_HEAD void *_data; } _PtObj_$tname;")
+        # Declare early so _pt_richcmp_T (emitted below) can reference it.
+        println(io, "static PyObject *_PtType_$tname = NULL;")
+        # Forward-declare _pt_make_obj_T so _pt_new_T (emitted below) can call it.
+        println(io, "static PyObject *_pt_make_obj_$tname(PtHandle);")
         println(io, "static void _pt_dealloc_$tname(PyObject *self) {")
         println(io, "    free(((_PtObj_$tname *)self)->_data);")
         println(io, "    PyObject_Free(self);")
@@ -1330,7 +1334,6 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         println(io, "    \"$mod_name.$tname\", sizeof(_PtObj_$tname), 0,")
         println(io, "    Py_TPFLAGS_DEFAULT, _pt_slots_$tname")
         println(io, "};")
-        println(io, "static PyObject *_PtType_$tname = NULL;")
         println(io, "static PyObject *_pt_make_obj_$tname(PtHandle h) {")
         println(io, "    _PtObj_$tname *obj = (_PtObj_$tname *)")
         println(io, "        PyType_GenericAlloc((PyTypeObject *)_PtType_$tname, 0);")
