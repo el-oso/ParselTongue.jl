@@ -129,7 +129,7 @@ end
         p = feature.make_point(3.0, 4.0)
         assert isinstance(p, feature.Pt2D), f"expected Pt2D instance, got {type(p)}"
         assert type(p).__name__ == "Pt2D", f"type name: {type(p).__name__}"
-        assert repr(p) == "<Pt2D>", f"repr: {repr(p)}"
+        assert repr(p) == "<Pt2D: x=3.0, y=4.0>", f"repr: {repr(p)}"
         assert feature.point_x(p) == 3.0, "point_x"
         assert feature.point_y(p) == 4.0, "point_y"
         assert feature.point_norm(p) == 5.0, "point_norm 3-4-5"

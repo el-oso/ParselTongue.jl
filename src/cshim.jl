@@ -1056,24 +1056,72 @@ typedef struct { void *ptr; } PtHandle;
 
 # Emit per-type C structs, destructors, PyType_Spec, make-object helpers.
 # Each @pyhandle T gets a proper PyTypeObject so Python sees `mod.T` as a real class.
-function _emit_handle_type_defs(io::IO, mod_name::AbstractString, handle_types::AbstractVector{<:Type})
+# `methods` is the full list of PtMethod registrations; dunders for T are injected
+# as custom slots (overriding the generated defaults where applicable).
+function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
+                                handle_types::AbstractVector{<:Type},
+                                methods::AbstractVector{PtMethod}=PtMethod[])
     isempty(handle_types) && return
     println(io, "/* @pyhandle types: each becomes a real Python class (isinstance, repr, etc.) */")
     for T in handle_types
-        tname = string(T.name.name)
+        tname  = string(T.name.name)
+        tmeths = filter(m -> m.handle_type === T, methods)
+
         println(io, "typedef struct { PyObject_HEAD void *_data; } _PtObj_$tname;")
         println(io, "static void _pt_dealloc_$tname(PyObject *self) {")
         println(io, "    free(((_PtObj_$tname *)self)->_data);")
         println(io, "    PyObject_Free(self);")
         println(io, "}")
-        println(io, "static PyObject *_pt_repr_$tname(PyObject *self) {")
-        println(io, "    return PyUnicode_FromString(\"<$tname>\");")
-        println(io, "}")
+
+        # For each @pymethod, emit a C slot wrapper that extracts the handle,
+        # calls the Julia @ccallable, and converts the Cstring result.
+        for m in tmeths
+            clean = replace(replace(string(m.dunder), r"^__" => ""), r"__$" => "")
+            sym   = cabi_symbol(m)
+            slot  = _PYMETHOD_SLOTS[m.dunder].slot
+            # extern declaration for the Julia @ccallable
+            println(io, "extern char *$(sym)(PtHandle, int32_t *, char **);")
+            # C slot wrapper (Py_tp_repr / Py_tp_str return PyObject *)
+            println(io, "static PyObject *_pt_slot_$(tname)_$(clean)(PyObject *self) {")
+            println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)self;")
+            println(io, "    PtHandle h = { obj->_data };")
+            println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+            println(io, "    char *r = $(sym)(h, &_err, &_errmsg);")
+            println(io, "    if (_err) {")
+            println(io, "        PyErr_SetString(PyExc_RuntimeError,")
+            println(io, "            _errmsg ? _errmsg : \"error in $(m.dunder)\");")
+            println(io, "        free(_errmsg);")
+            println(io, "        return NULL;")
+            println(io, "    }")
+            println(io, "    PyObject *result = PyUnicode_FromString(r);")
+            println(io, "    free(r);")
+            println(io, "    return result;")
+            println(io, "}")
+        end
+
+        # Default repr (used when no @pymethod __repr__ is registered).
+        has_repr = any(m -> m.dunder === :__repr__, tmeths)
+        has_str  = any(m -> m.dunder === :__str__,  tmeths)
+        if !has_repr
+            println(io, "static PyObject *_pt_repr_$tname(PyObject *self) {")
+            println(io, "    return PyUnicode_FromString(\"<$tname>\");")
+            println(io, "}")
+        end
+
+        # Slots array: always dealloc + repr (user or default), plus user str.
         println(io, "static PyType_Slot _pt_slots_$tname[] = {")
         println(io, "    {Py_tp_dealloc, (void *)_pt_dealloc_$tname},")
-        println(io, "    {Py_tp_repr,    (void *)_pt_repr_$tname},")
+        if has_repr
+            println(io, "    {Py_tp_repr,    (void *)_pt_slot_$(tname)_repr},")
+        else
+            println(io, "    {Py_tp_repr,    (void *)_pt_repr_$tname},")
+        end
+        if has_str
+            println(io, "    {Py_tp_str,     (void *)_pt_slot_$(tname)_str},")
+        end
         println(io, "    {0, NULL}")
         println(io, "};")
+
         println(io, "static PyType_Spec _pt_spec_$tname = {")
         println(io, "    \"$mod_name.$tname\", sizeof(_PtObj_$tname), 0,")
         println(io, "    Py_TPFLAGS_DEFAULT, _pt_slots_$tname")
@@ -1185,7 +1233,8 @@ stable-ABI calls. The resulting `.abi3.so` is compatible with any CPython ≥ 3.
 """
 function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
                     errors::Vector{PtError}=PtError[],
-                    handle_types::Vector{<:Type}=Type[];
+                    handle_types::Vector{<:Type}=Type[],
+                    methods::Vector{PtMethod}=PtMethod[];
                     doc::AbstractString="", abi3::Bool=false)
     isempty(doc) && (doc = "ParselTongue extension (Julia via juliac --trim)")
     io = IOBuffer()
@@ -1219,10 +1268,10 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
     if _uses_strarr(exports)
         print(io, _WRAP_STRARR_HELPER)
     end
-    if _uses_handles(exports)
+    if _uses_handles(exports) || !isempty(handle_types) || !isempty(methods)
         print(io, _PTHANDLE_TYPEDEF)
     end
-    _emit_handle_type_defs(io, mod_name, handle_types)
+    _emit_handle_type_defs(io, mod_name, handle_types, methods)
     structs = _array_structs(exports)
     if !isempty(structs)
         println(io, "/* C-ABI carriers for N-D arrays (match Julia PtArray{T,N}) */")

@@ -59,6 +59,52 @@ end
 # Build-host registry for custom exception types.
 const _ERRORS = PtError[]
 
+# ── @pymethod metadata ─────────────────────────────────────────────────
+
+# Supported dunder slots: symbol → (C slot constant, required Julia return type).
+const _PYMETHOD_SLOTS = Dict{Symbol,NamedTuple{(:slot,:ret_type),Tuple{String,Type}}}(
+    :__repr__ => (slot="Py_tp_repr", ret_type=String),
+    :__str__  => (slot="Py_tp_str",  ret_type=String),
+)
+
+"""
+    PtMethod(handle_type, dunder, jl_func, self_arg, ret)
+
+Metadata for one Python dunder method registered via [`@pymethod`](@ref).
+`handle_type` is the `@pyhandle` type; `dunder` the Python slot symbol
+(e.g. `:__repr__`); `jl_func` the user's Julia function name; `self_arg`
+the self `PtArg`; `ret` the Julia return type.
+"""
+struct PtMethod
+    handle_type::Type
+    dunder::Symbol
+    jl_func::Symbol
+    self_arg::PtArg
+    ret::Type
+end
+
+# C-ABI symbol for the @ccallable wrapper: pt_meth_<TypeName>_<clean>.
+# <clean> strips the leading/trailing __ from the dunder name.
+cabi_symbol(m::PtMethod) = string("pt_meth_", m.handle_type.name.name, "_",
+    replace(replace(string(m.dunder), r"^__" => ""), r"__$" => ""))
+
+# Build-host registry for @pymethod registrations.
+const _METHODS = PtMethod[]
+
+function _register_method!(m::PtMethod)
+    T = m.handle_type
+    # Use c_abi_type dispatch (registered by @pyhandle, persists across clear_exports!)
+    # to validate that T is a handle type. Also ensure it's tracked in _HANDLE_TYPES
+    # for PyTypeObject generation (re-adds if clear_exports! removed it).
+    ishandle(c_abi_type(T)) ||
+        error("@pymethod: type `$T` is not registered with @pyhandle.")
+    T in _HANDLE_TYPES || push!(_HANDLE_TYPES, T)
+    assert_ret_boundary(m.ret)
+    filter!(x -> !(x.handle_type === T && x.dunder === m.dunder), _METHODS)
+    push!(_METHODS, m)
+    return m
+end
+
 # A valid Python / C identifier (also the C-ABI symbol name).
 _is_py_ident(s::AbstractString) = occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", s)
 
@@ -81,7 +127,7 @@ const _EXPORTS = PtExport[]
 
 Reset the export registry. Called at the start of each `build_extension`.
 """
-clear_exports!() = (empty!(_EXPORTS); empty!(_ERRORS); empty!(_HANDLE_TYPES); _MODULE_NAME[] = nothing; _CURRENT_SUBMODULE[] = ""; nothing)
+clear_exports!() = (empty!(_EXPORTS); empty!(_ERRORS); empty!(_HANDLE_TYPES); empty!(_METHODS); _MODULE_NAME[] = nothing; _CURRENT_SUBMODULE[] = ""; nothing)
 
 # Distinct, ordered submodule names among `exports` (excluding the "" top level).
 function submodule_names(exports::AbstractVector{PtExport})
@@ -376,4 +422,50 @@ function _set_module_name!(s::AbstractString)
     end
     _MODULE_NAME[] = String(s)
     return nothing
+end
+
+"""
+    @pymethod __repr__ fname(p::T)::String = ...
+    @pymethod __str__  fname(p::T)::String = ...
+
+Attach a Python dunder method to the `@pyhandle` type `T`. The macro:
+  1. Defines the Julia function normally (it remains callable from Julia).
+  2. Generates a `Base.@ccallable` entry point via juliac.
+  3. Registers the slot on `T`'s Python `PyTypeObject` (overriding the default).
+
+`T` must already be registered with `@pyhandle`. The function must take exactly
+one positional argument — the self value of type `T`. Supported dunders:
+
+| Dunder     | C slot       | Julia return type |
+|------------|--------------|-------------------|
+| `__repr__` | `Py_tp_repr` | `String`          |
+| `__str__`  | `Py_tp_str`  | `String`          |
+"""
+macro pymethod(dunder, fundef)
+    dunder isa Symbol || error(
+        "@pymethod: first argument must be a dunder symbol (e.g. __repr__), got: $dunder")
+    if !haskey(_PYMETHOD_SLOTS, dunder)
+        supported = join(sort!(collect(string.(keys(_PYMETHOD_SLOTS)))), ", ")
+        error("@pymethod: unsupported dunder `$dunder`. Supported: $supported.")
+    end
+
+    fname, rawargs, ret_expr = _parse_fundef(fundef)
+    length(rawargs) == 1 || error(
+        "@pymethod $dunder: must have exactly one argument (self::T), got $(length(rawargs)).")
+    (sname, stype_expr, smut, sdefault, skw) = rawargs[1]
+    smut      && error("@pymethod $dunder: self argument cannot be Mut{…}.")
+    sdefault !== nothing && error("@pymethod $dunder: self argument cannot have a default value.")
+    skw       && error("@pymethod $dunder: self argument cannot be a keyword argument.")
+
+    dunder_sym = QuoteNode(dunder)
+    fname_sym  = QuoteNode(fname)
+    sname_sym  = QuoteNode(sname)
+    quote
+        $(esc(fundef))
+        let _T = $(esc(stype_expr)), _ret = $(esc(ret_expr))
+            _self_arg = ParselTongue.PtArg($sname_sym, _T, false, nothing, false)
+            ParselTongue._register_method!(
+                ParselTongue.PtMethod(_T, $dunder_sym, $fname_sym, _self_arg, _ret))
+        end
+    end
 end

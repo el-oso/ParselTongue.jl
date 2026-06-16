@@ -336,6 +336,71 @@ end
     @test !occursin("PyCapsule_CheckExact", c)        # no capsule arg-checks
 end
 
+@testset "@pymethod dunder methods (item J)" begin
+    clear_exports!()
+    @pyfunc make_th(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
+
+    # @pymethod registers in _METHODS and the Julia function is callable.
+    @pymethod __repr__ th_repr(h::_TestHandle)::String = string("<TH x=", h.x, ">")
+    @test length(ParselTongue._METHODS) == 1
+    m = ParselTongue._METHODS[1]
+    @test m.handle_type === _TestHandle
+    @test m.dunder === :__repr__
+    @test m.jl_func === :th_repr
+    @test m.ret === String
+    @test th_repr(_TestHandle(1.5, 7)) == "<TH x=1.5>"   # Julia callable
+
+    # C symbol follows the pt_meth_<TypeName>_<clean> convention.
+    @test ParselTongue.cabi_symbol(m) == "pt_meth__TestHandle_repr"
+
+    # emit_ccallable_method generates valid Julia with the right signature.
+    src = ParselTongue.emit_ccallable_method(m)
+    @test occursin("pt_meth__TestHandle_repr", src)
+    @test occursin("PtHandle{_TestHandle}", src)
+    @test occursin("from_c(_TestHandle", src)
+    @test occursin("th_repr(", src)
+    @test occursin("to_c(", src)
+    @test Meta.parse(src) isa Expr
+
+    # emit_cshim with methods: replaces default repr slot with custom.
+    c = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
+                   copy(ParselTongue._METHODS))
+    @test occursin("_pt_slot__TestHandle_repr", c)        # custom slot function
+    @test occursin("pt_meth__TestHandle_repr", c)         # extern + call
+    @test occursin("PyUnicode_FromString(r)", c)          # Cstring → PyObject *
+    @test !occursin("_pt_repr__TestHandle", c)            # default NOT emitted
+
+    # Without @pymethod: default repr is emitted.
+    c_no_meth = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle])
+    @test occursin("_pt_repr__TestHandle", c_no_meth)
+    @test !occursin("_pt_slot__TestHandle_repr", c_no_meth)
+
+    # @pymethod rejects unknown types (not registered with @pyhandle).
+    err = try; @eval @pymethod __repr__ bad_repr(x::Int64)::String = "x"; catch e; e; end
+    @test (err isa LoadError ? err.error : err) isa ErrorException
+
+    # @pymethod rejects unsupported dunders.
+    err2 = try; @eval @pymethod __add__ add_th(h::_TestHandle)::String = ""; catch e; e; end
+    @test (err2 isa LoadError ? err2.error : err2) isa ErrorException
+
+    # Second @pymethod for same dunder replaces the first (last wins).
+    @pymethod __repr__ th_repr2(h::_TestHandle)::String = "<TH2>"
+    @test length(ParselTongue._METHODS) == 1   # still one, not two
+    @test ParselTongue._METHODS[1].jl_func === :th_repr2
+
+    # __str__ is also supported.
+    @pymethod __str__ th_str(h::_TestHandle)::String = string("TH(", h.x, ")")
+    @test length(ParselTongue._METHODS) == 2
+    c2 = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
+                    copy(ParselTongue._METHODS))
+    @test occursin("Py_tp_str", c2)
+    @test occursin("_pt_slot__TestHandle_str", c2)
+
+    # clear_exports! resets _METHODS.
+    clear_exports!()
+    @test isempty(ParselTongue._METHODS)
+end
+
 @testset "NamedTuple return (item 8)" begin
     @test assert_ret_boundary(NamedTuple{(:x, :y), Tuple{Float64, Int64}}) isa Type
     clear_exports!()

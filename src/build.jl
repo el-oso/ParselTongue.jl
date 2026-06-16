@@ -95,14 +95,14 @@ function build_extension(user_path::AbstractString;
     # 1. Populate the export registry by including the user source in a sandbox.
     #    When called from build_wheel, the caller already included the file and passes
     #    pre-populated exports/errors to avoid a redundant second include.
-    exports, errors, handle_types = if _preloaded !== nothing
+    exports, errors, handle_types, methods = if _preloaded !== nothing
         _preloaded
     else
         clear_exports!()
         sandbox = Module(:ParselTongueUserSandbox)
         Core.eval(sandbox, :(using ParselTongue))
         Base.include(sandbox, user_path)
-        copy(_EXPORTS), copy(_ERRORS), copy(_HANDLE_TYPES)
+        copy(_EXPORTS), copy(_ERRORS), copy(_HANDLE_TYPES), copy(_METHODS)
     end
     isempty(exports) && error(
         "ParselTongue: no @pyfunc exports found in $user_path. " *
@@ -123,7 +123,7 @@ function build_extension(user_path::AbstractString;
     # Use invokelatest: @pyhandle definitions in the sandbox bump the world counter,
     # so c_abi_type dispatch inside the codegen must use the current latest world.
     entry_path = joinpath(builddir, "_pt_entry.jl")
-    write(entry_path, Base.invokelatest(emit_entry, exports, user_path; errors))
+    write(entry_path, Base.invokelatest(emit_entry, exports, user_path; errors, methods))
 
     # 3. Run juliac --trim to produce the trimmed object archive.
     img = joinpath(builddir, "img.a")
@@ -131,7 +131,7 @@ function build_extension(user_path::AbstractString;
 
     # 4. Generate the C PyInit shim.
     cpath = joinpath(builddir, string("_", mod, "module.c"))
-    write(cpath, Base.invokelatest(emit_cshim, mod, exports, errors, handle_types; abi3))
+    write(cpath, Base.invokelatest(emit_cshim, mod, exports, errors, handle_types, methods; abi3))
 
     # 5. Link the shim + archive into the extension module.
     so_path = joinpath(outdir, string(mod, ext_suffix))

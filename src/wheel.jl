@@ -129,7 +129,7 @@ function build_wheel(user_path::AbstractString;
           _MODULE_NAME[] !== nothing ? _MODULE_NAME[] :
           _default_mod_name(user_path)
     _is_valid_modname(mod) || error("ParselTongue: invalid module name '$mod'.")
-    preloaded    = (copy(_EXPORTS), copy(_ERRORS), copy(_HANDLE_TYPES))
+    preloaded    = (copy(_EXPORTS), copy(_ERRORS), copy(_HANDLE_TYPES), copy(_METHODS))
     exports      = preloaded[1]
     handle_types = preloaded[3]
 

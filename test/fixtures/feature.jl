@@ -9,6 +9,9 @@ struct Pt2D
 end
 @pyhandle Pt2D
 
+# Custom repr via @pymethod (item J): overrides the generated "<Pt2D>" default.
+@pymethod __repr__ pt2d_repr(p::Pt2D)::String = string("<Pt2D: x=", p.x, ", y=", p.y, ">")
+
 # Exercises every v1.x boundary kind in one extension: scalars, strings, complex,
 # 1-D and N-D arrays (both policies), in-place mutation + void, tuple returns,
 # and opaque handles.
