@@ -60,4 +60,7 @@ end
         end
         (lo + hi) / 2.0
     end
+
+    # Arbitrary callable signatures (item L): two Int64 args → Int64.
+    @pyfunc combine(f::PyCallable{Tuple{Int64,Int64},Int64}, a::Int64, b::Int64)::Int64 = f(a, b)
 end

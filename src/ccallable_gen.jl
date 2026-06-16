@@ -54,6 +54,9 @@ function _type_src(@nospecialize(T::Type))
         return string("ParselTongue.PtVarArgs{", _type_src(T.parameters[1]), "}")
     elseif T isa DataType && isopt(T)
         return string("ParselTongue.PtOpt{", _type_src(_opt_inner_c(T)), "}")
+    elseif T isa DataType && T.name === PyCallable.body.body.name
+        return string("ParselTongue.PyCallable{", _type_src(T.parameters[1]), ", ",
+                      _type_src(T.parameters[2]), "}")
     elseif T isa DataType && T <: Tuple
         return string("Tuple{", join((_type_src(S) for S in fieldtypes(T)), ", "), "}")
     end

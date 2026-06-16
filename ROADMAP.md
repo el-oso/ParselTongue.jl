@@ -304,15 +304,18 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   `PyObject_GenericGetAttr` so `repr`/`__class__` keep working.
   Files: `src/cshim.jl` (`_pt_getattr_<T>` + slot). **Done v0.10.0.**
 
-- [ ] **L. `PyCallable` with arbitrary signatures** — today `PyCallable` is hardcoded to
-  `Float64 → Float64`. Generalize to `PyCallable{Tuple{A...}, R}` so users can accept any
-  trim-safe callback type, e.g. `PyCallable{Tuple{Float64, Int64}, Bool}`. The C shim
-  already builds the argument list via `PyObject_CallFunctionObjArgs`; the wrapper just
-  needs to marshall typed args/returns using the existing carrier machinery.
-  Files: `src/boundary.jl` (parameterize `PyCallable`), `src/cshim.jl` (`_ap_callable`,
-  `_call_py_callable` emit per signature). Effort M · Risk M (trim-safety of the marshalling
-  path needs a spike). Done-when: `@pyfunc apply(f::PyCallable{Tuple{String},Int64}, s::String)::Int64`
-  builds and calls a Python lambda.
+- [x] **L. `PyCallable` with arbitrary signatures** — `PyCallable` is now
+  `PyCallable{Args<:Tuple, Ret}`; the bare name aliases `Float64 → Float64` for compat.
+  The call operator is a `@generated` method that emits one straight-line body per
+  concrete signature: unrolled `_py_box` calls fill the argument tuple, `PyObject_Call`
+  invokes the callback, and `_py_unbox` extracts the result via `Ret`. All ccalls + concrete
+  `_py_box`/`_py_unbox` dispatch, so `--trim=safe` accepts it (validated by the integration
+  build of a 2-arg fixture — no separate spike file needed). The C shim is unchanged: the
+  carrier stays `Ptr{Cvoid}` for every signature (`ispycallable(C) = C === Ptr{Cvoid}`).
+  Supported scalar arg/return types: `Int8`–`Int64`, `UInt8`–`UInt64`, `Bool`, `Float32`,
+  `Float64`. Files: `src/boundary.jl` (parameterize + box/unbox + `@generated` operator),
+  `src/ccallable_gen.jl` (`_type_src` PyCallable case). **Done v0.11.0.** Non-scalar
+  callback args/returns remain future work.
 
 - [ ] **M. `pyproject.toml` generation** — `build_wheel` optionally emits a `pyproject.toml`
   (and `setup.cfg` / `METADATA`) alongside the `.whl` so the output directory is a

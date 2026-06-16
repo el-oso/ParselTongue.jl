@@ -16,7 +16,7 @@ the Python object graph you can reach from native code.
 | Type mapping | Explicit boundary contract | Derive macros + `FromPyObject` / `IntoPyObject` |
 | Classes | `@pyhandle` (isbits structs → real Python types; `isinstance`, auto field access, `@pymethod __repr__`/`__str__`) | `#[pyclass]` (full object protocol) |
 | Custom exceptions | `@pyerror MyError <: ValueError` | `create_exception!` |
-| Python callables | `PyCallable` (Float64→Float64 now) | `Py<PyAny>` / `PyCallable` (any signature) |
+| Python callables | `PyCallable{Args,Ret}` (any scalar signature) | `Py<PyAny>` / `PyCallable` (any signature) |
 | GIL release during call | Yes (automatic) | Yes (opt-in with `py.allow_threads`) |
 | Stable-ABI wheel (abi3) | Yes (`abi3=true`, floor CPython 3.11) | Yes (`--features abi3`) |
 | manylinux tagging | Yes (auto or pinned) | Yes (via `maturin`) |
@@ -214,17 +214,21 @@ fn apply(f: &Bound<'_, PyAny>, x: f64) -> PyResult<f64> {
 }
 ```
 
-**ParselTongue** currently supports `PyCallable` with a `Float64 → Float64`
-signature:
+**ParselTongue** supports `PyCallable{Args, Ret}` with any scalar signature.
+The bare name `PyCallable` defaults to `Float64 → Float64`; parameterize it to
+declare other signatures:
 
 ```julia
-@pyfunc apply(f::PyCallable, x::Float64)::Float64 = f(x)
+@pyfunc apply(f::PyCallable, x::Float64)::Float64 = f(x)            # Float64 → Float64
+@pyfunc combine(f::PyCallable{Tuple{Int64,Int64},Int64},           # (Int64, Int64) → Int64
+                a::Int64, b::Int64)::Int64 = f(a, b)
 ```
 
-Internally, `f(x)` re-acquires the GIL and calls `PyObject_Call` through a
-chain of `ccall`s — all trim-safe. Other numeric signatures will require
-additional functor overloads; arbitrary Python-object return types are not yet
-supported.
+Internally, `f(a, b, …)` re-acquires the GIL and calls `PyObject_Call` through a
+chain of `ccall`s emitted by a `@generated` method — one straight-line, trim-safe
+body per concrete signature. Supported argument/return scalar types: `Int8`–`Int64`,
+`UInt8`–`UInt64`, `Bool`, `Float32`, `Float64`. Array/string/object arguments and
+returns to/from the callback are not yet supported.
 
 ## Distribution
 
@@ -276,8 +280,8 @@ build can take minutes.
 - You need **free-threading** CPython.
 - Wheel size matters: a 2 MB PyO3 wheel vs a 100 MB ParselTongue wheel is a
   real deployment difference.
-- You need to call Python with **arbitrary argument types** from native code, not
-  just `Float64 → Float64`.
+- You need to call Python callbacks with **non-scalar argument types** (arrays,
+  strings, objects); ParselTongue's `PyCallable{Args,Ret}` is limited to scalars.
 - Your project already has Rust tooling in the CI pipeline.
 
 ## Both are good choices when

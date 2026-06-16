@@ -156,6 +156,9 @@ end
         assert feature.apply(abs, -5.0) == 5.0,                  "apply: builtin"
         root = feature.bisect(lambda x: x**2 - 2.0, 1.0, 2.0)
         assert abs(root - 2.0**0.5) < 1e-10,                     "bisect: sqrt(2)"
+        # Arbitrary callable signatures (item L): (Int64, Int64) -> Int64
+        assert feature.combine(lambda a, b: a + b, 3, 4) == 7,   "combine: add"
+        assert feature.combine(lambda a, b: a * b, 6, 7) == 42,  "combine: mul"
         print("FEATURE_OK")
         """
         out = _py_run(script)

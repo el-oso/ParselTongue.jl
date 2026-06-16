@@ -572,57 +572,117 @@ to_c(v::PtVarArgs{T}) where {T<:_PtVarArgElt} = to_c(v.data)
 # dispatch — so it is trim-safe under --trim=safe.
 
 """
-    PyCallable
+    PyCallable{Args<:Tuple, Ret}
+    PyCallable                      # alias for PyCallable{Tuple{Float64}, Float64}
 
-Boundary type for a Python callable passed as a `@pyfunc` argument. On the Julia
-side, calling `f(x::Float64)::Float64` re-acquires the GIL, boxes the argument,
-invokes `PyObject_Call`, and returns the unwrapped `Float64` result — all via direct
-`ccall` invocations, so it is trim-safe under `--trim=safe`.
+Boundary type for a Python callable passed as a `@pyfunc` argument. The type
+parameters declare the call signature: `Args` is a `Tuple` of argument types and
+`Ret` the return type. Calling `f(a, b, …)::Ret` re-acquires the GIL, boxes each
+argument, invokes `PyObject_Call`, and returns the unwrapped `Ret` result — all
+via direct `ccall` invocations emitted by a `@generated` method, so it is
+trim-safe under `--trim=safe`.
 
-The Python callable must accept a single positional `float` and return a `float`.
+The bare name `PyCallable` (no parameters) defaults to `Float64 → Float64`:
+
+```julia
+@pyfunc apply(f::PyCallable, x::Float64)::Float64 = f(x)             # Float64→Float64
+@pyfunc apply2(f::PyCallable{Tuple{Int64,Int64},Int64}, a::Int64, b::Int64)::Int64 = f(a, b)
+```
+
+Supported argument and return scalar types: `Int8`–`Int64`, `UInt8`–`UInt64`,
+`Bool`, `Float32`, `Float64`.
 """
-struct PyCallable
+struct PyCallable{Args<:Tuple, Ret}
     ptr::Ptr{Cvoid}
 end
 
-c_abi_type(::Type{PyCallable}) = Ptr{Cvoid}
-from_c(::Type{PyCallable}, p::Ptr{Cvoid}) = PyCallable(p)
+# Carrier is always a raw PyObject* (void *), regardless of the declared signature.
+c_abi_type(::Type{<:PyCallable}) = Ptr{Cvoid}
+from_c(::Type{PyCallable{A,R}}, p::Ptr{Cvoid}) where {A,R} = PyCallable{A,R}(p)
+# Bare `PyCallable` (UnionAll) defaults to the Float64 → Float64 signature.
+from_c(::Type{PyCallable}, p::Ptr{Cvoid}) = PyCallable{Tuple{Float64},Float64}(p)
 to_c(f::PyCallable) = f.ptr
 
-# Call the Python callable with a single Float64 argument, returning Float64.
-# Re-acquires the GIL (released by the C shim before calling Julia), builds a
-# one-element tuple, calls PyObject_Call, extracts the double result.
-function (f::PyCallable)(x::Float64)::Float64
-    gstate = ccall(:PyGILState_Ensure, Int32, ())
-    args_tup = ccall(:PyTuple_New, Ptr{Cvoid}, (Int,), 1)
-    if args_tup == Ptr{Cvoid}(0)
-        ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-        error("PyCallable: failed to build args tuple")
+# ── Per-type scalar boxing / unboxing (trim-safe direct ccalls) ────────
+# Each method is concretely typed, so dispatch from the @generated call operator
+# resolves statically and compiles to a single ccall.
+_py_box(x::Float64) = ccall(:PyFloat_FromDouble,         Ptr{Cvoid}, (Float64,),   x)
+_py_box(x::Float32) = ccall(:PyFloat_FromDouble,         Ptr{Cvoid}, (Float64,),   Float64(x))
+_py_box(x::Int8)    = ccall(:PyLong_FromLongLong,        Ptr{Cvoid}, (Clonglong,), Clonglong(x))
+_py_box(x::Int16)   = ccall(:PyLong_FromLongLong,        Ptr{Cvoid}, (Clonglong,), Clonglong(x))
+_py_box(x::Int32)   = ccall(:PyLong_FromLongLong,        Ptr{Cvoid}, (Clonglong,), Clonglong(x))
+_py_box(x::Int64)   = ccall(:PyLong_FromLongLong,        Ptr{Cvoid}, (Clonglong,), x)
+_py_box(x::UInt8)   = ccall(:PyLong_FromUnsignedLongLong,Ptr{Cvoid}, (Culonglong,),Culonglong(x))
+_py_box(x::UInt16)  = ccall(:PyLong_FromUnsignedLongLong,Ptr{Cvoid}, (Culonglong,),Culonglong(x))
+_py_box(x::UInt32)  = ccall(:PyLong_FromUnsignedLongLong,Ptr{Cvoid}, (Culonglong,),Culonglong(x))
+_py_box(x::UInt64)  = ccall(:PyLong_FromUnsignedLongLong,Ptr{Cvoid}, (Culonglong,),x)
+_py_box(x::Bool)    = ccall(:PyBool_FromLong,            Ptr{Cvoid}, (Clong,),     Clong(x))
+
+_py_unbox(::Type{Float64}, r::Ptr{Cvoid}) = ccall(:PyFloat_AsDouble, Float64, (Ptr{Cvoid},), r)
+_py_unbox(::Type{Float32}, r::Ptr{Cvoid}) = Float32(ccall(:PyFloat_AsDouble, Float64, (Ptr{Cvoid},), r))
+_py_unbox(::Type{Int8},    r::Ptr{Cvoid}) = Int8(ccall(:PyLong_AsLongLong,  Clonglong, (Ptr{Cvoid},), r))
+_py_unbox(::Type{Int16},   r::Ptr{Cvoid}) = Int16(ccall(:PyLong_AsLongLong, Clonglong, (Ptr{Cvoid},), r))
+_py_unbox(::Type{Int32},   r::Ptr{Cvoid}) = Int32(ccall(:PyLong_AsLongLong, Clonglong, (Ptr{Cvoid},), r))
+_py_unbox(::Type{Int64},   r::Ptr{Cvoid}) = ccall(:PyLong_AsLongLong, Clonglong, (Ptr{Cvoid},), r)
+_py_unbox(::Type{UInt8},   r::Ptr{Cvoid}) = UInt8(ccall(:PyLong_AsUnsignedLongLong,  Culonglong, (Ptr{Cvoid},), r))
+_py_unbox(::Type{UInt16},  r::Ptr{Cvoid}) = UInt16(ccall(:PyLong_AsUnsignedLongLong, Culonglong, (Ptr{Cvoid},), r))
+_py_unbox(::Type{UInt32},  r::Ptr{Cvoid}) = UInt32(ccall(:PyLong_AsUnsignedLongLong, Culonglong, (Ptr{Cvoid},), r))
+_py_unbox(::Type{UInt64},  r::Ptr{Cvoid}) = ccall(:PyLong_AsUnsignedLongLong, Culonglong, (Ptr{Cvoid},), r)
+_py_unbox(::Type{Bool},    r::Ptr{Cvoid}) = ccall(:PyObject_IsTrue, Cint, (Ptr{Cvoid},), r) != 0
+
+# Call the Python callable. Generated per concrete (Args, Ret): builds the arg
+# tuple with unrolled _py_box calls, invokes PyObject_Call, unboxes via Ret.
+# The generated body contains only ccalls and concrete _py_box/_py_unbox dispatch,
+# so --trim=safe accepts it. The C shim released the GIL before calling Julia, so
+# we re-acquire it here via PyGILState_Ensure.
+@generated function (f::PyCallable{Args,Ret})(args...) where {Args,Ret}
+    argtypes = (Args.parameters...,)
+    nargs    = length(argtypes)
+    if length(args) != nargs
+        return :(error(string("PyCallable: expected ", $nargs, " argument(s), got ", $(length(args)))))
     end
-    item = ccall(:PyFloat_FromDouble, Ptr{Cvoid}, (Float64,), x)
-    if item == Ptr{Cvoid}(0)
+    body = Expr(:block)
+    push!(body.args, :(gstate = ccall(:PyGILState_Ensure, Int32, ())))
+    push!(body.args, :(args_tup = ccall(:PyTuple_New, Ptr{Cvoid}, (Int,), $nargs)))
+    push!(body.args, quote
+        if args_tup == Ptr{Cvoid}(0)
+            ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
+            error("PyCallable: failed to build args tuple")
+        end
+    end)
+    for i in 1:nargs
+        Ti = argtypes[i]
+        push!(body.args, quote
+            local item = _py_box(convert($Ti, args[$i]))
+            if item == Ptr{Cvoid}(0)
+                ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), args_tup)
+                ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
+                error("PyCallable: failed to box argument")
+            end
+            # PyTuple_SetItem steals the reference to `item`.
+            ccall(:PyTuple_SetItem, Int32, (Ptr{Cvoid}, Int, Ptr{Cvoid}), args_tup, $(i - 1), item)
+        end)
+    end
+    push!(body.args, quote
+        local result = ccall(:PyObject_Call, Ptr{Cvoid},
+                             (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}), f.ptr, args_tup, Ptr{Cvoid}(0))
         ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), args_tup)
+        if result == Ptr{Cvoid}(0)
+            ccall(:PyErr_Clear, Cvoid, ())
+            ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
+            error("PyCallable: Python callable raised an exception")
+        end
+        local r = _py_unbox($Ret, result)
+        ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), result)
+        if ccall(:PyErr_Occurred, Ptr{Cvoid}, ()) != C_NULL
+            ccall(:PyErr_Clear, Cvoid, ())
+            ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
+            error("PyCallable: Python callable returned an incompatible value")
+        end
         ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-        error("PyCallable: failed to box Float64 argument")
-    end
-    ccall(:PyTuple_SetItem, Int32, (Ptr{Cvoid}, Int, Ptr{Cvoid}), args_tup, 0, item)
-    result = ccall(:PyObject_Call, Ptr{Cvoid}, (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}),
-                   f.ptr, args_tup, Ptr{Cvoid}(0))
-    ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), args_tup)
-    if result == Ptr{Cvoid}(0)
-        ccall(:PyErr_Clear, Cvoid, ())
-        ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-        error("PyCallable: Python callable raised an exception")
-    end
-    r = ccall(:PyFloat_AsDouble, Float64, (Ptr{Cvoid},), result)
-    ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), result)
-    if ccall(:PyErr_Occurred, Ptr{Cvoid}, ()) != C_NULL
-        ccall(:PyErr_Clear, Cvoid, ())
-        ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-        error("PyCallable: Python callable returned a non-float value")
-    end
-    ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-    return r
+        return r
+    end)
+    return body
 end
 
 # ── Boundary validation (build host) ──────────────────────────────────

@@ -1444,9 +1444,37 @@ end
     # ── boundary protocol ─────────────────────────────────────────────────
     @test c_abi_type(PyCallable) === Ptr{Cvoid}
     p = Ptr{Cvoid}(42)
-    @test from_c(PyCallable, p) === PyCallable(p)
-    @test to_c(PyCallable(p)) === p
+    # Bare PyCallable defaults to Float64 → Float64.
+    @test from_c(PyCallable, p) === PyCallable{Tuple{Float64},Float64}(p)
+    @test to_c(PyCallable{Tuple{Float64},Float64}(p)) === p
     @test is_boundary_type(PyCallable)
+
+    # ── parameterized signatures (item L) ─────────────────────────────────
+    TC = PyCallable{Tuple{Int64,Int64},Int64}
+    @test c_abi_type(TC) === Ptr{Cvoid}            # carrier unchanged for any signature
+    @test from_c(TC, p) === TC(p)
+    @test to_c(TC(p)) === p
+    @test is_boundary_type(TC)
+    @test is_boundary_type(PyCallable{Tuple{Float64,Float64},Float64})
+    # Scalar box/unbox helpers are concretely typed (trim-safe building blocks).
+    @test hasmethod(ParselTongue._py_box, Tuple{Int64})
+    @test hasmethod(ParselTongue._py_box, Tuple{Float64})
+    @test hasmethod(ParselTongue._py_unbox, Tuple{Type{Int64}, Ptr{Cvoid}})
+    @test hasmethod(ParselTongue._py_unbox, Tuple{Type{Bool}, Ptr{Cvoid}})
+
+    # A multi-arg PyCallable signature lowers to a void* carrier per arg.
+    clear_exports!()
+    @eval @pymodule _testcallable_multi begin
+        @pyfunc apply2args(f::PyCallable{Tuple{Int64,Int64},Int64}, a::Int64, b::Int64)::Int64 = f(a, b)
+    end
+    em = _EXPORTS[1]
+    @test ispycallable(c_abi_type(em.args[1].jl_type))   # still void* carrier
+    decl_m = _extern_decl(em)
+    @test occursin("void *", decl_m)
+    src_m = emit_ccallable(em)
+    @test occursin("ParselTongue.PyCallable{Tuple{Int64, Int64}, Int64}", src_m)
+    @test Meta.parse(src_m) isa Expr
+    clear_exports!()
 
     # ── ispycallable predicate ────────────────────────────────────────────
     @test  ispycallable(Ptr{Cvoid})
