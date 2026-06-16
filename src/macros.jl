@@ -72,6 +72,10 @@ const _PYMETHOD_SLOTS = Dict{Symbol,NamedTuple}(
     :__getitem__ => (slot="Py_sq_item",      ret_type=nothing),
     :__eq__      => (slot="Py_tp_richcompare", ret_type=Bool),
     :__ne__      => (slot="Py_tp_richcompare", ret_type=Bool),
+    :__lt__      => (slot="Py_tp_richcompare", ret_type=Bool),
+    :__le__      => (slot="Py_tp_richcompare", ret_type=Bool),
+    :__gt__      => (slot="Py_tp_richcompare", ret_type=Bool),
+    :__ge__      => (slot="Py_tp_richcompare", ret_type=Bool),
 )
 
 # Extra positional argument types (after self) for dunders that take more than self.
@@ -80,6 +84,10 @@ const _PYMETHOD_EXTRA_ARGS = Dict{Symbol,Any}(
     :__getitem__ => Type[Int64],
     :__eq__      => :same_handle,
     :__ne__      => :same_handle,
+    :__lt__      => :same_handle,
+    :__le__      => :same_handle,
+    :__gt__      => :same_handle,
+    :__ge__      => :same_handle,
 )
 
 """
@@ -462,6 +470,10 @@ end
     @pymethod __getitem__ fname(p::T, i::Int64)::R = ...
     @pymethod __eq__   fname(p::T, other::T)::Bool = ...
     @pymethod __ne__   fname(p::T, other::T)::Bool = ...
+    @pymethod __lt__   fname(p::T, other::T)::Bool = ...
+    @pymethod __le__   fname(p::T, other::T)::Bool = ...
+    @pymethod __gt__   fname(p::T, other::T)::Bool = ...
+    @pymethod __ge__   fname(p::T, other::T)::Bool = ...
 
 Attach a Python dunder method to the `@pyhandle` type `T`. The macro:
   1. Defines the Julia function normally (it remains callable from Julia).
@@ -478,17 +490,24 @@ Attach a Python dunder method to the `@pyhandle` type `T`. The macro:
 | `__hash__`    | `Py_tp_hash`   | `(self::T)`       | `Int64`              | `hash(obj)`, dict key    |
 | `__bool__`    | `Py_nb_bool`   | `(self::T)`       | `Bool`               | `bool(obj)`, `if obj`    |
 | `__getitem__` | `Py_sq_item`   | `(self::T, i::Int64)` | any boundary type| `obj[i]` (integer index) |
-| `__eq__`      | `Py_tp_richcompare` | `(self::T, other::T)` | `Bool`      | `obj == other`, `obj != other` (auto-negated) |
-| `__ne__`      | `Py_tp_richcompare` | `(self::T, other::T)` | `Bool`      | `obj != other` (overrides auto-negation of `__eq__`) |
+| `__eq__`      | `Py_tp_richcompare` | `(self::T, other::T)` | `Bool`      | `obj == other` (auto-derives `__ne__`) |
+| `__ne__`      | `Py_tp_richcompare` | `(self::T, other::T)` | `Bool`      | `obj != other` (auto-derives `__eq__`) |
+| `__lt__`      | `Py_tp_richcompare` | `(self::T, other::T)` | `Bool`      | `obj < other` |
+| `__le__`      | `Py_tp_richcompare` | `(self::T, other::T)` | `Bool`      | `obj <= other` |
+| `__gt__`      | `Py_tp_richcompare` | `(self::T, other::T)` | `Bool`      | `obj > other` |
+| `__ge__`      | `Py_tp_richcompare` | `(self::T, other::T)` | `Bool`      | `obj >= other` |
 
 `__getitem__` only handles integer indices (via `Py_sq_item`); slice notation
 (`obj[a:b]`) requires `Py_mp_subscript` and is not yet supported.
 
-`__eq__` and `__ne__` share a single `Py_tp_richcompare` C slot. Defining only
-`__eq__` gives `__ne__` for free (negation). If `other` is a different type,
-`NotImplemented` is returned automatically. Note that Python makes a type
-unhashable when `__eq__` is defined without `__hash__`; register `@pymethod
-__hash__` as well to retain hashability.
+All six comparison dunders share a single `Py_tp_richcompare` C slot (one
+`_pt_richcmp_T` function per handle type). Defining only `__eq__` gives `__ne__`
+for free and vice versa. For the ordering ops (`__lt__`/`__le__`/`__gt__`/`__ge__`),
+Python handles reflected operations automatically (e.g. `a > b` tries `b.__lt__(a)`
+if `a.__gt__(b)` returns `NotImplemented`), so you only need to define the ops you
+want. Cross-type comparison always returns `NotImplemented`. Note that Python makes
+a type unhashable when `__eq__` is defined without `__hash__`; register
+`@pymethod __hash__` as well to retain hashability.
 """
 macro pymethod(dunder, fundef)
     dunder isa Symbol || error(

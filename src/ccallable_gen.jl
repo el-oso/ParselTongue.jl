@@ -206,14 +206,14 @@ function emit_ccallable_method(m::PtMethod; errors::Vector{PtError}=PtError[])
     T_src = _type_src(T)
     extra_params = if m.dunder === :__getitem__
         ", _idx::Int64"
-    elseif m.dunder ∈ (:__eq__, :__ne__)
+    elseif m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__)
         ", _other::$self_c"
     else
         ""
     end
     extra_call = if m.dunder === :__getitem__
         ", _idx"
-    elseif m.dunder ∈ (:__eq__, :__ne__)
+    elseif m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__)
         string(", ParselTongue.from_c(", T_src, ", _other)")
     else
         ""

@@ -397,6 +397,19 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   `(PyObject*, Py_ssize_t)` C slot wrapper. Supports any boundary return type.
   **Done v0.18.0.**
 
+- [x] **O3. `__eq__` / `__ne__` (comparison via `Py_tp_richcompare`)** — both dunders share
+  a single C slot via a per-type `_pt_richcmp_T` dispatcher. `__eq__` auto-derives `__ne__`
+  (negation) and vice versa. Cross-type comparison returns `NotImplemented`. A new
+  `:same_handle` sentinel in `_PYMETHOD_EXTRA_ARGS` validates the second arg at macro time.
+  **Done v0.19.0.**
+
+- [x] **O4. `__lt__` / `__le__` / `__gt__` / `__ge__` (ordering via `Py_tp_richcompare`)** — all
+  four ordering ops extend the same `_pt_richcmp_T` dispatcher. No auto-derivation between
+  ordering ops (Python handles the reflected op: `a > b` tries `b.__lt__(a)` if `__gt__` returns
+  `NotImplemented`). The richcmp generator builds a branch list from registered dunders and emits
+  a single if/else if/else chain; unregistered ops fall through to `Py_RETURN_NOTIMPLEMENTED`.
+  **Done v0.20.0.**
+
 ## Audit findings — 2026-06-16 (open)
 
 Findings from a full source audit of `src/`. Grouped by severity. Fix bugs before

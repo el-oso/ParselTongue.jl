@@ -24,6 +24,10 @@ end
 # __eq__ (item O3): value equality; __ne__ is auto-negated.
 @pymethod __eq__ pt2d_eq(p::Pt2D, other::Pt2D)::Bool = p.x == other.x && p.y == other.y
 
+# __lt__ / __le__ (item O4): ordering by norm; __gt__ / __ge__ via Python reflection.
+@pymethod __lt__ pt2d_lt(p::Pt2D, other::Pt2D)::Bool = (p.x^2 + p.y^2) < (other.x^2 + other.y^2)
+@pymethod __le__ pt2d_le(p::Pt2D, other::Pt2D)::Bool = (p.x^2 + p.y^2) <= (other.x^2 + other.y^2)
+
 # Exercises every v1.x boundary kind in one extension: scalars, strings, complex,
 # 1-D and N-D arrays (both policies), in-place mutation + void, tuple returns,
 # and opaque handles.

@@ -129,7 +129,7 @@ The C carrier is `PtHandle { void *ptr; }`. `from_c(T, h)` = `unsafe_load(Ptr{T}
 | `__hash__` | `Py_tp_hash` | — | `int64_t` → `Py_hash_t` | |
 | `__bool__` | `Py_nb_bool` | — | `int8_t` → `int` | |
 | `__getitem__` | `Py_sq_item` | `Int64` index (`Py_ssize_t` → `int64_t`) | any boundary → `PyObject*` | Integer indices only; slices need `Py_mp_subscript` |
-| `__eq__`, `__ne__` | `Py_tp_richcompare` (shared) | same handle type → `PtHandle{T}` | `int8_t` → `PyBool_FromLong` | Single `_pt_richcmp_T` C function; cross-type → `NotImplemented`; `__ne__` auto-derived from `__eq__` if only one registered |
+| `__eq__`, `__ne__`, `__lt__`, `__le__`, `__gt__`, `__ge__` | `Py_tp_richcompare` (shared) | same handle type → `PtHandle{T}` | `int8_t` → `PyBool_FromLong` | Single `_pt_richcmp_T`; `__eq__`↔`__ne__` auto-derived (negation); ordering ops return `NotImplemented` when not registered (Python handles reflection) |
 
 ### How `cshim.jl` generates richcmp
 
@@ -140,6 +140,10 @@ In `_emit_handle_type_defs` (`cshim.jl:1061`):
   `Py_TYPE(other) != (PyTypeObject *)_PtType_T → Py_RETURN_NOTIMPLEMENTED`, then dispatches
   on `op`. If only `__eq__`: `op == Py_NE) r = !r`. If only `__ne__`: `op == Py_EQ) r = !r`.
 - The slot array loop also skips `__eq__`/`__ne__` and adds ONE `{Py_tp_richcompare, ...}` entry.
+
+**Ordering reflection**: Python automatically tries the reflected operation (e.g. `a > b` calls
+`b.__lt__(a)`) when `__gt__` returns `NotImplemented`. So defining only `__lt__`/`__le__`
+covers all four comparison directions for same-type objects.
 
 **Hash/eq interaction**: defining `__eq__` without `__hash__` makes the type unhashable
 (CPython's `type_ready` sets `tp_hash = PyObject_HashNotImplemented` when `tp_richcompare`

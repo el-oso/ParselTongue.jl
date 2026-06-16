@@ -1079,8 +1079,8 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         #   Int64   → int64_t extern; Py_ssize_t/Py_hash_t slot (len/hash pattern)
         #   Bool    → int8_t extern; int slot (bool/inquiry pattern)
         for m in tmeths
-            # __eq__ / __ne__ are handled together below as a single tp_richcompare slot.
-            m.dunder ∈ (:__eq__, :__ne__) && continue
+            # Comparison dunders are handled together below as a single tp_richcompare slot.
+            m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__) && continue
             clean = replace(replace(string(m.dunder), r"^__" => ""), r"__$" => "")
             sym   = cabi_symbol(m)
             dname = string(m.dunder)
@@ -1161,59 +1161,53 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             end
         end
 
-        # __eq__ / __ne__ → a single Py_tp_richcompare slot wrapper.
-        # Both share one C function that dispatches on `op`. If only one is
-        # registered, the other is auto-derived (negation). Comparing against a
-        # different Python type returns Py_RETURN_NOTIMPLEMENTED.
-        eq_idx = findfirst(m -> m.dunder === :__eq__, tmeths)
-        ne_idx = findfirst(m -> m.dunder === :__ne__, tmeths)
-        has_richcmp = !isnothing(eq_idx) || !isnothing(ne_idx)
+        # All six comparison dunders → a single Py_tp_richcompare slot wrapper.
+        # One _pt_richcmp_T function dispatches on `op`. __eq__ / __ne__ are
+        # auto-derived from each other (negation) if only one is registered.
+        # Ordering ops (lt/le/gt/ge) return NotImplemented when not registered;
+        # Python handles the reflected operation (e.g. a>b → b.__lt__(a)).
+        # Cross-type comparison always returns Py_RETURN_NOTIMPLEMENTED.
+        _cmp_all = [(:__lt__,"Py_LT"),(:__le__,"Py_LE"),(:__eq__,"Py_EQ"),
+                    (:__ne__,"Py_NE"),(:__gt__,"Py_GT"),(:__ge__,"Py_GE")]
+        cmp_idx  = Dict(d => findfirst(m -> m.dunder === d, tmeths) for (d,_) in _cmp_all)
+        has_richcmp = any(!isnothing, values(cmp_idx))
         if has_richcmp
-            isnothing(eq_idx) || println(io, "extern int8_t $(cabi_symbol(tmeths[eq_idx]))(PtHandle, PtHandle, int32_t *, char **);")
-            isnothing(ne_idx) || println(io, "extern int8_t $(cabi_symbol(tmeths[ne_idx]))(PtHandle, PtHandle, int32_t *, char **);")
+            # extern declarations for registered ops
+            for (d, _) in _cmp_all
+                i = cmp_idx[d]; isnothing(i) && continue
+                println(io, "extern int8_t $(cabi_symbol(tmeths[i]))(PtHandle, PtHandle, int32_t *, char **);")
+            end
             println(io, "static PyObject *_pt_richcmp_$(tname)(PyObject *self, PyObject *other, int op) {")
-            println(io, "    if (op != Py_EQ && op != Py_NE) Py_RETURN_NOTIMPLEMENTED;")
             println(io, "    if (Py_TYPE(other) != (PyTypeObject *)_PtType_$tname) Py_RETURN_NOTIMPLEMENTED;")
             println(io, "    PtHandle h_s = { ((_PtObj_$tname *)self)->_data };")
             println(io, "    PtHandle h_o = { ((_PtObj_$tname *)other)->_data };")
             println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
             println(io, "    int8_t r;")
-            if !isnothing(eq_idx) && !isnothing(ne_idx)
-                # Both registered: dispatch on op.
-                eq_sym = cabi_symbol(tmeths[eq_idx])
-                ne_sym = cabi_symbol(tmeths[ne_idx])
-                println(io, "    if (op == Py_EQ) {")
-                println(io, "        r = $eq_sym(h_s, h_o, &_err, &_errmsg);")
-                println(io, "    } else {")
-                println(io, "        r = $ne_sym(h_s, h_o, &_err, &_errmsg);")
-                println(io, "    }")
-                println(io, "    if (_err) {")
-                println(io, "        const char *_msg = op == Py_EQ ? \"error in __eq__\" : \"error in __ne__\";")
-                println(io, "        PyErr_SetString(PyExc_RuntimeError, _errmsg ? _errmsg : _msg);")
-                println(io, "        free(_errmsg);")
-                println(io, "        return NULL;")
-                println(io, "    }")
-            elseif !isnothing(eq_idx)
-                # Only __eq__: __ne__ is its negation.
-                eq_sym = cabi_symbol(tmeths[eq_idx])
-                println(io, "    r = $eq_sym(h_s, h_o, &_err, &_errmsg);")
-                println(io, "    if (_err) {")
-                println(io, "        PyErr_SetString(PyExc_RuntimeError, _errmsg ? _errmsg : \"error in __eq__\");")
-                println(io, "        free(_errmsg);")
-                println(io, "        return NULL;")
-                println(io, "    }")
-                println(io, "    if (op == Py_NE) r = !r;")
-            else
-                # Only __ne__: __eq__ is its negation.
-                ne_sym = cabi_symbol(tmeths[ne_idx])
-                println(io, "    r = $ne_sym(h_s, h_o, &_err, &_errmsg);")
-                println(io, "    if (_err) {")
-                println(io, "        PyErr_SetString(PyExc_RuntimeError, _errmsg ? _errmsg : \"error in __ne__\");")
-                println(io, "        free(_errmsg);")
-                println(io, "        return NULL;")
-                println(io, "    }")
-                println(io, "    if (op == Py_EQ) r = !r;")
+            # Build branches: each entry = (py_op, sym_to_call, negate, err_msg).
+            # __eq__ auto-derives from __ne__ and vice versa; ordering ops don't
+            # auto-derive (Python handles the reflected op at the interpreter level).
+            branches = Tuple{String,String,Bool,String}[]
+            for (d, py_op) in _cmp_all
+                dname = string(d)
+                i = cmp_idx[d]
+                if !isnothing(i)
+                    push!(branches, (py_op, cabi_symbol(tmeths[i]), false, "error in $dname"))
+                elseif d === :__ne__ && !isnothing(cmp_idx[:__eq__])
+                    push!(branches, (py_op, cabi_symbol(tmeths[cmp_idx[:__eq__]]), true, "error in __eq__"))
+                elseif d === :__eq__ && !isnothing(cmp_idx[:__ne__])
+                    push!(branches, (py_op, cabi_symbol(tmeths[cmp_idx[:__ne__]]), true, "error in __ne__"))
+                end
             end
+            for (i, (py_op, sym, negate, err_msg)) in enumerate(branches)
+                kw = i == 1 ? "if" : "} else if"
+                println(io, "    $kw (op == $py_op) {")
+                println(io, "        r = $sym(h_s, h_o, &_err, &_errmsg);")
+                println(io, "        if (_err) { PyErr_SetString(PyExc_RuntimeError, _errmsg ? _errmsg : \"$err_msg\"); free(_errmsg); return NULL; }")
+                negate && println(io, "        r = !r;")
+            end
+            println(io, "    } else {")
+            println(io, "        Py_RETURN_NOTIMPLEMENTED;")
+            println(io, "    }")
             println(io, "    return PyBool_FromLong((long)r);")
             println(io, "}")
         end
@@ -1261,8 +1255,8 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             println(io, "    {Py_tp_repr,    (void *)_pt_repr_$tname},")
         end
         for m in tmeths
-            m.dunder === :__repr__ && continue           # already emitted above
-            m.dunder ∈ (:__eq__, :__ne__) && continue   # handled by richcmp below
+            m.dunder === :__repr__ && continue                                          # already emitted above
+            m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__) && continue  # handled by richcmp below
             clean = replace(replace(string(m.dunder), r"^__" => ""), r"__$" => "")
             slot  = _PYMETHOD_SLOTS[m.dunder].slot
             println(io, "    {$slot, (void *)_pt_slot_$(tname)_$(clean)},")

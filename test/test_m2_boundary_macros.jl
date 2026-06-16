@@ -559,8 +559,9 @@ end
     @test occursin("Py_EQ", c_eq)
     @test occursin("Py_NE", c_eq)
     @test occursin("Py_RETURN_NOTIMPLEMENTED", c_eq)
-    # Auto-negation branch: only __eq__ registered, so "op == Py_NE) r = !r" present.
-    @test occursin("op == Py_NE) r = !r", c_eq)
+    # Auto-negation branch: only __eq__ registered → Py_NE branch calls eq + r=!r.
+    @test occursin("op == Py_NE)", c_eq)    # Py_NE branch present
+    @test occursin("r = !r;", c_eq)         # negation in Py_NE branch
 
     # Both __eq__ and __ne__ registered: dispatch on op, no auto-negation.
     @pymethod __ne__ th_ne(h::_TestHandle, other::_TestHandle)::Bool =
@@ -568,19 +569,21 @@ end
     c_both = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
                         copy(ParselTongue._METHODS))
     @test occursin("extern int8_t pt_meth__TestHandle_ne(PtHandle, PtHandle,", c_both)
-    @test occursin("op == Py_EQ", c_both)           # dispatch branch
-    @test !occursin("op == Py_NE) r = !r", c_both)  # no auto-negation
+    @test occursin("op == Py_EQ)", c_both)           # EQ dispatch branch
+    @test occursin("op == Py_NE)", c_both)           # NE dispatch branch
+    @test !occursin("r = !r;", c_both)               # no auto-negation when both registered
     @test occursin("\"error in __eq__\"", c_both)
     @test occursin("\"error in __ne__\"", c_both)
 
-    # Only __ne__ registered: __eq__ auto-negated.
+    # Only __ne__ registered: __eq__ auto-derived (negation).
     clear_exports!()
     @pymethod __ne__ th_ne_only(h::_TestHandle, other::_TestHandle)::Bool = h.x != other.x
     c_ne = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
                       copy(ParselTongue._METHODS))
     @test occursin("_pt_richcmp__TestHandle", c_ne)
-    @test occursin("op == Py_EQ) r = !r", c_ne)    # auto-negation for EQ
-    @test !occursin("op == Py_NE) r = !r", c_ne)
+    @test occursin("op == Py_EQ)", c_ne)    # EQ branch (auto-derived)
+    @test occursin("r = !r;", c_ne)         # negation in EQ branch
+    @test occursin("op == Py_NE)", c_ne)    # NE branch (registered)
 
     # Error: return type must be Bool.
     clear_exports!()
@@ -598,6 +601,69 @@ end
     # Error: too many args.
     err_argc2 = try; @eval @pymethod __eq__ th_bad_eq_argc2(h::_TestHandle, o::_TestHandle, x::Int64)::Bool = false; catch e; e; end
     @test (err_argc2 isa LoadError ? err_argc2.error : err_argc2) isa ErrorException
+
+    clear_exports!()
+end
+
+@testset "@pymethod __lt__ / __le__ / __gt__ / __ge__ (item O4)" begin
+    clear_exports!()
+
+    # Register all four ordering dunders.
+    @pymethod __lt__ th_lt(h::_TestHandle, o::_TestHandle)::Bool = h.x < o.x
+    @pymethod __le__ th_le(h::_TestHandle, o::_TestHandle)::Bool = h.x <= o.x
+    @pymethod __gt__ th_gt(h::_TestHandle, o::_TestHandle)::Bool = h.x > o.x
+    @pymethod __ge__ th_ge(h::_TestHandle, o::_TestHandle)::Bool = h.x >= o.x
+
+    for (d, jl_f) in [(:__lt__, :th_lt), (:__le__, :th_le), (:__gt__, :th_gt), (:__ge__, :th_ge)]
+        m = ParselTongue._METHODS[findfirst(m -> m.dunder === d, ParselTongue._METHODS)]
+        @test m.dunder === d
+        @test m.ret === Bool
+        @test m.handle_type === _TestHandle
+    end
+    # Callable from Julia.
+    @test th_lt(_TestHandle(1.0, 0), _TestHandle(2.0, 0)) == true
+    @test th_gt(_TestHandle(3.0, 0), _TestHandle(2.0, 0)) == true
+
+    # emit_ccallable_method: _other param and from_c for all four.
+    for m in filter(m -> m.dunder ∈ (:__lt__,:__le__,:__gt__,:__ge__), ParselTongue._METHODS)
+        src = ParselTongue.emit_ccallable_method(m)
+        @test occursin("_other::ParselTongue.PtHandle", src)
+        @test occursin("from_c(_TestHandle, _other)", src)
+        @test Meta.parse(src) isa Expr
+    end
+
+    # emit_cshim: all four ops in one richcmp function; no individual slots.
+    c4 = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
+                    copy(ParselTongue._METHODS))
+    @test occursin("_pt_richcmp__TestHandle", c4)
+    @test occursin("Py_tp_richcompare", c4)
+    @test occursin("op == Py_LT)", c4)
+    @test occursin("op == Py_LE)", c4)
+    @test occursin("op == Py_GT)", c4)
+    @test occursin("op == Py_GE)", c4)
+    @test occursin("pt_meth__TestHandle_lt", c4)
+    @test occursin("pt_meth__TestHandle_le", c4)
+    @test occursin("pt_meth__TestHandle_gt", c4)
+    @test occursin("pt_meth__TestHandle_ge", c4)
+    @test !occursin("r = !r;", c4)      # no auto-negation (all four explicitly registered)
+
+    # Only __lt__ registered: gt/le/ge not present; Python handles reflection.
+    clear_exports!()
+    @pymethod __lt__ th_lt2(h::_TestHandle, o::_TestHandle)::Bool = h.x < o.x
+    c_lt = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
+                      copy(ParselTongue._METHODS))
+    @test occursin("op == Py_LT)", c_lt)
+    @test !occursin("op == Py_GT)", c_lt)   # __gt__ not registered, Python handles reflection
+    @test !occursin("op == Py_LE)", c_lt)
+    @test !occursin("op == Py_GE)", c_lt)
+    @test occursin("Py_RETURN_NOTIMPLEMENTED", c_lt)   # else branch always present
+
+    # Validation errors carried over from __eq__/__ne__ (same :same_handle spec).
+    err_ret = try; @eval @pymethod __lt__ th_bad_lt(h::_TestHandle, o::_TestHandle)::String = ""; catch e; e; end
+    @test (err_ret isa LoadError ? err_ret.error : err_ret) isa ErrorException
+
+    err_type = try; @eval @pymethod __gt__ th_bad_gt(h::_TestHandle, o::Int64)::Bool = false; catch e; e; end
+    @test (err_type isa LoadError ? err_type.error : err_type) isa ErrorException
 
     clear_exports!()
 end

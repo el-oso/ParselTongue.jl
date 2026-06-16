@@ -196,6 +196,15 @@ end
         assert not (pa != pb), "__ne__: auto-negation equal"
         assert not (pa == 42), "__eq__: cross-type comparison is False"
         del pa, pb, pc
+        # Item O4: __lt__ / __le__ (ordering by norm; __gt__ / __ge__ via Python reflection).
+        p_s = feature.make_point(3.0, 0.0)  # norm 3
+        p_l = feature.make_point(4.0, 0.0)  # norm 4
+        assert p_s < p_l,    "__lt__"
+        assert p_s <= p_l,   "__le__"
+        assert p_l > p_s,    "__gt__ (Python reflection of __lt__)"
+        assert p_l >= p_s,   "__ge__ (Python reflection of __le__)"
+        assert not (p_l < p_s), "__lt__ false"
+        del p_s, p_l
         # Python callables as arguments (item F)
         assert feature.apply(lambda x: x * 2.0, 3.0) == 6.0,    "apply: identity"
         assert feature.apply(abs, -5.0) == 5.0,                  "apply: builtin"
