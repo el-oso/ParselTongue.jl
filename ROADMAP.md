@@ -366,6 +366,24 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   reverting A2 turns the gate red, pinpointing `pt_opt_some`/`pyw_opt_some`.
   **Done v0.14.0.**
 
+- [x] **O. Additional 1-arg dunders (`__len__`, `__hash__`, `__bool__`)** — extends
+  `@pymethod` beyond `__repr__`/`__str__` to three more single-self-arg dunders:
+  ```julia
+  @pymethod __len__  pt_len(p::T)::Int64 = ...   # len(obj)
+  @pymethod __hash__ pt_hash(p::T)::Int64 = ...   # hash(obj), usable as dict key
+  @pymethod __bool__ pt_bool(p::T)::Bool  = ...   # bool(obj), if obj
+  ```
+  Each dunder maps to a distinct C slot signature: `lenfunc` (`Py_ssize_t`),
+  `hashfunc` (`Py_hash_t`), and `inquiry` (`int`). The C wrapper is dispatched
+  by the Julia return type — `Int64` → ssize/hash wrapper, `Bool` → int wrapper —
+  avoiding a new registry field. The slot array emission is now a unified loop
+  over all registered `@pymethod`s (with only `__repr__` special-cased for the
+  default fallback), so future dunders need only an entry in `_PYMETHOD_SLOTS`
+  and a C wrapper branch.
+  Files: `src/macros.jl` (`_PYMETHOD_SLOTS`), `src/cshim.jl` (`_emit_handle_type_defs`
+  dispatch + slot loop). `src/ccallable_gen.jl` unchanged (already handles all scalar
+  return types). **Done v0.15.0.**
+
 ## Audit findings — 2026-06-16 (open)
 
 Findings from a full source audit of `src/`. Grouped by severity. Fix bugs before

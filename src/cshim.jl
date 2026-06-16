@@ -1073,35 +1073,68 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         println(io, "    PyObject_Free(self);")
         println(io, "}")
 
-        # For each @pymethod, emit a C slot wrapper that extracts the handle,
-        # calls the Julia @ccallable, and converts the Cstring result.
+        # For each @pymethod, emit a C slot wrapper. The wrapper kind is
+        # determined by the Julia return type declared in the slot registry:
+        #   String  → char* extern; PyObject* slot (repr/str pattern)
+        #   Int64   → int64_t extern; Py_ssize_t/Py_hash_t slot (len/hash pattern)
+        #   Bool    → int8_t extern; int slot (bool/inquiry pattern)
         for m in tmeths
             clean = replace(replace(string(m.dunder), r"^__" => ""), r"__$" => "")
             sym   = cabi_symbol(m)
-            slot  = _PYMETHOD_SLOTS[m.dunder].slot
-            # extern declaration for the Julia @ccallable
-            println(io, "extern char *$(sym)(PtHandle, int32_t *, char **);")
-            # C slot wrapper (Py_tp_repr / Py_tp_str return PyObject *)
-            println(io, "static PyObject *_pt_slot_$(tname)_$(clean)(PyObject *self) {")
-            println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)self;")
-            println(io, "    PtHandle h = { obj->_data };")
-            println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
-            println(io, "    char *r = $(sym)(h, &_err, &_errmsg);")
-            println(io, "    if (_err) {")
-            println(io, "        PyErr_SetString(PyExc_RuntimeError,")
-            println(io, "            _errmsg ? _errmsg : \"error in $(m.dunder)\");")
-            println(io, "        free(_errmsg);")
-            println(io, "        return NULL;")
-            println(io, "    }")
-            println(io, "    PyObject *result = PyUnicode_FromString(r);")
-            println(io, "    free(r);")
-            println(io, "    return result;")
-            println(io, "}")
+            dname = string(m.dunder)
+            if m.ret === String
+                println(io, "extern char *$(sym)(PtHandle, int32_t *, char **);")
+                println(io, "static PyObject *_pt_slot_$(tname)_$(clean)(PyObject *self) {")
+                println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)self;")
+                println(io, "    PtHandle h = { obj->_data };")
+                println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+                println(io, "    char *r = $(sym)(h, &_err, &_errmsg);")
+                println(io, "    if (_err) {")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError,")
+                println(io, "            _errmsg ? _errmsg : \"error in $dname\");")
+                println(io, "        free(_errmsg);")
+                println(io, "        return NULL;")
+                println(io, "    }")
+                println(io, "    PyObject *result = PyUnicode_FromString(r);")
+                println(io, "    free(r);")
+                println(io, "    return result;")
+                println(io, "}")
+            elseif m.ret === Int64
+                cret = m.dunder === :__len__ ? "Py_ssize_t" : "Py_hash_t"
+                println(io, "extern int64_t $(sym)(PtHandle, int32_t *, char **);")
+                println(io, "static $cret _pt_slot_$(tname)_$(clean)(PyObject *self) {")
+                println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)self;")
+                println(io, "    PtHandle h = { obj->_data };")
+                println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+                println(io, "    int64_t r = $(sym)(h, &_err, &_errmsg);")
+                println(io, "    if (_err) {")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError,")
+                println(io, "            _errmsg ? _errmsg : \"error in $dname\");")
+                println(io, "        free(_errmsg);")
+                println(io, "        return ($cret)(-1);")
+                println(io, "    }")
+                println(io, "    return ($cret)r;")
+                println(io, "}")
+            elseif m.ret === Bool
+                println(io, "extern int8_t $(sym)(PtHandle, int32_t *, char **);")
+                println(io, "static int _pt_slot_$(tname)_$(clean)(PyObject *self) {")
+                println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)self;")
+                println(io, "    PtHandle h = { obj->_data };")
+                println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+                println(io, "    int8_t r = $(sym)(h, &_err, &_errmsg);")
+                println(io, "    if (_err) {")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError,")
+                println(io, "            _errmsg ? _errmsg : \"error in $dname\");")
+                println(io, "        free(_errmsg);")
+                println(io, "        return -1;")
+                println(io, "    }")
+                println(io, "    return r ? 1 : 0;")
+                println(io, "}")
+            end
         end
 
         # Default repr (used when no @pymethod __repr__ is registered).
         has_repr = any(m -> m.dunder === :__repr__, tmeths)
-        has_str  = any(m -> m.dunder === :__str__,  tmeths)
         if !has_repr
             println(io, "static PyObject *_pt_repr_$tname(PyObject *self) {")
             println(io, "    return PyUnicode_FromString(\"<$tname>\");")
@@ -1133,8 +1166,8 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             println(io, "}")
         end
 
-        # Slots array: always dealloc + repr (user or default), plus user str
-        # and auto field-access getattro.
+        # Slots array: always dealloc + repr (user or default), then all other
+        # @pymethod dunders in registration order, then auto field-access getattro.
         println(io, "static PyType_Slot _pt_slots_$tname[] = {")
         println(io, "    {Py_tp_dealloc, (void *)_pt_dealloc_$tname},")
         if has_repr
@@ -1142,8 +1175,11 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         else
             println(io, "    {Py_tp_repr,    (void *)_pt_repr_$tname},")
         end
-        if has_str
-            println(io, "    {Py_tp_str,     (void *)_pt_slot_$(tname)_str},")
+        for m in tmeths
+            m.dunder === :__repr__ && continue  # already emitted above
+            clean = replace(replace(string(m.dunder), r"^__" => ""), r"__$" => "")
+            slot  = _PYMETHOD_SLOTS[m.dunder].slot
+            println(io, "    {$slot, (void *)_pt_slot_$(tname)_$(clean)},")
         end
         if has_getattr
             println(io, "    {Py_tp_getattro, (void *)_pt_getattr_$tname},")

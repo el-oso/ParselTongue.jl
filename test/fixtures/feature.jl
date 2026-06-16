@@ -12,6 +12,12 @@ end
 # Custom repr via @pymethod (item J): overrides the generated "<Pt2D>" default.
 @pymethod __repr__ pt2d_repr(p::Pt2D)::String = string("<Pt2D: x=", p.x, ", y=", p.y, ">")
 
+# Additional dunder methods (item O): __len__, __hash__, __bool__.
+# Pt2D.x is used as a stand-in "magnitude" for all three.
+@pymethod __len__  pt2d_len(p::Pt2D)::Int64  = Int64(round(sqrt(p.x^2 + p.y^2)))
+@pymethod __hash__ pt2d_hash(p::Pt2D)::Int64 = hash((p.x, p.y)) % Int64(typemax(Int64))
+@pymethod __bool__ pt2d_bool(p::Pt2D)::Bool  = p.x != 0.0 || p.y != 0.0
+
 # Exercises every v1.x boundary kind in one extension: scalars, strings, complex,
 # 1-D and N-D arrays (both policies), in-place mutation + void, tuple returns,
 # and opaque handles.

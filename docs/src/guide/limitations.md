@@ -5,19 +5,19 @@ known constraints, with the reasoning behind each.
 
 ## One extension per Python process
 
-Each wheel embeds its own copy of `libjulia`. Importing **two** ParselTongue
-extensions into the same Python process aborts the process — two Julia runtimes
-cannot coexist.
+Each separately compiled extension embeds its own trimmed Julia system image. That
+image's self-initialisation routine runs on `dlopen`; a second such routine in the
+same process aborts in `jl_init_threadtls`. This means two independent ParselTongue
+`.so` / `.pyd` files cannot coexist in one Python process, **regardless of whether
+`runtime=:bundled`, `:shared`, or `:system` is used**:
 
 ```python
-import mathx     # ok
-import strx      # abort: a second libjulia re-runs jl_init and aborts the process
+import mathx     # ok — first .so loads, Julia self-initialises
+import strx      # SIGABRT — second .so tries to self-initialise Julia again
 ```
 
-Each separately compiled extension embeds its own trimmed system image and runs
-`jl_init` on first use; a second one aborts in `jl_init_threadtls`, even if both
-link the same `libjulia`. The fix is to keep everything behind **one** compiled
-extension and split the API at the Python level:
+The fix is always the same: put everything behind **one** compiled extension and
+split the API at the Python level:
 
 - **Within one source file:** use [`@pymodule pkg.sub`](/examples/scientific#Submodules)
   to expose submodules (`pkg.linalg`, `pkg.dsp`, …), all backed by one image, so
@@ -26,6 +26,10 @@ extension and split the API at the Python level:
   aggregates them into one extension and exposes each file as a submodule
   (`pkg.a`, `pkg.b`) — they import and run together in one process. Function names
   must be unique across the files (they share one C method table).
+
+Removing this limit would require a juliac "link-only" trim mode that emits
+`@ccallable` stubs without embedding a self-init — a Julia toolchain change outside
+ParselTongue's scope.
 
 ## Wheel size (~100 MB)
 
@@ -49,3 +53,27 @@ will be reinterpreted. Match dtypes carefully on the Python side.
 This is a feature, not a bug: type-unstable or dynamically-dispatched code in an
 exported path fails the build. See [Building](/guide/building#Trim-modes) for the
 `:unsafe_warn` escape hatch.
+
+## Rust-style Result/Option types
+
+[ErrorTypes.jl](https://github.com/jakobnissen/ErrorTypes.jl) and similar
+`Result{T,E}` / `Option{T}` libraries work fine **inside** Julia helper functions —
+the monadic operators (`@?`, `and_then`, `map`) are pure Julia and invisible to the
+boundary. The `@pyfunc` that crosses into Python must unwrap to a boundary type:
+
+```julia
+using ErrorTypes
+
+_safe_div_impl(a::Float64, b::Float64)::Result{Float64,String} =
+    b == 0.0 ? Err("division by zero") : Ok(a / b)
+
+@pyfunc safe_div(a::Float64, b::Float64)::Float64 =
+    is_ok(_safe_div_impl(a, b)) ?
+        unwrap(_safe_div_impl(a, b)) :
+        error(unwrap_err(_safe_div_impl(a, b)))
+```
+
+From Python's perspective, `Err(...)` and `throw(...)` are identical — both become
+Python exceptions. `Union{T,Nothing}` already covers `Option{T}` if you want an
+optional return. ErrorTypes.jl is not a ParselTongue dependency and not needed for
+any boundary feature; it is purely an ergonomic choice inside your Julia logic.

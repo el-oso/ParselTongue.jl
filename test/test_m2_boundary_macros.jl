@@ -415,6 +415,64 @@ end
     @test isempty(ParselTongue._METHODS)
 end
 
+@testset "@pymethod __len__ / __hash__ / __bool__ (item O)" begin
+    clear_exports!()
+    @pyfunc make_th3(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
+
+    # __len__: Int64 return, Py_sq_length slot.
+    @pymethod __len__ th_len(h::_TestHandle)::Int64 = Int64(abs(h.n))
+    m_len = ParselTongue._METHODS[end]
+    @test m_len.dunder === :__len__
+    @test m_len.ret === Int64
+    @test th_len(_TestHandle(1.0, 5)) == 5   # callable from Julia
+    c_len = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
+                       copy(ParselTongue._METHODS))
+    @test occursin("Py_sq_length", c_len)
+    @test occursin("extern int64_t pt_meth__TestHandle_len", c_len)
+    @test occursin("Py_ssize_t _pt_slot__TestHandle_len", c_len)
+    @test occursin("(Py_ssize_t)r", c_len)
+    @test occursin("(Py_ssize_t)(-1)", c_len)   # error return
+
+    # __hash__: Int64 return, Py_tp_hash slot.
+    @pymethod __hash__ th_hash(h::_TestHandle)::Int64 = Int64(abs(h.n))
+    m_hash = ParselTongue._METHODS[end]
+    @test m_hash.dunder === :__hash__
+    @test m_hash.ret === Int64
+    c_hash = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
+                        copy(ParselTongue._METHODS))
+    @test occursin("Py_tp_hash", c_hash)
+    @test occursin("extern int64_t pt_meth__TestHandle_hash", c_hash)
+    @test occursin("Py_hash_t _pt_slot__TestHandle_hash", c_hash)
+    @test occursin("(Py_hash_t)r", c_hash)
+
+    # __bool__: Bool return, Py_nb_bool slot.
+    @pymethod __bool__ th_bool(h::_TestHandle)::Bool = h.n != 0
+    m_bool = ParselTongue._METHODS[end]
+    @test m_bool.dunder === :__bool__
+    @test m_bool.ret === Bool
+    @test th_bool(_TestHandle(0.0, 0)) == false
+    @test th_bool(_TestHandle(0.0, 1)) == true
+    c_bool = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
+                        copy(ParselTongue._METHODS))
+    @test occursin("Py_nb_bool", c_bool)
+    @test occursin("extern int8_t pt_meth__TestHandle_bool", c_bool)
+    @test occursin("int _pt_slot__TestHandle_bool", c_bool)
+    @test occursin("r ? 1 : 0", c_bool)
+
+    # Return type mismatch is rejected: __len__ must return Int64.
+    err_len = try; @eval @pymethod __len__ th_bad_len(h::_TestHandle)::String = "x"; catch e; e; end
+    @test (err_len isa LoadError ? err_len.error : err_len) isa ErrorException
+
+    # Return type mismatch: __bool__ must return Bool.
+    err_bool = try; @eval @pymethod __bool__ th_bad_bool(h::_TestHandle)::Int64 = 0; catch e; e; end
+    @test (err_bool isa LoadError ? err_bool.error : err_bool) isa ErrorException
+
+    # All three together: slot array contains all three entries.
+    @test occursin("Py_sq_length", c_bool) && occursin("Py_tp_hash", c_bool) && occursin("Py_nb_bool", c_bool)
+
+    clear_exports!()
+end
+
 @testset "auto __getattr__ field access (item K)" begin
     # _TestHandle has fields x::Float64, n::Int64 (defined at file scope).
     clear_exports!()

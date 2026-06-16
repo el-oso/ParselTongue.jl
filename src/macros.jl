@@ -63,8 +63,11 @@ const _ERRORS = PtError[]
 
 # Supported dunder slots: symbol → (C slot constant, required Julia return type).
 const _PYMETHOD_SLOTS = Dict{Symbol,NamedTuple{(:slot,:ret_type),Tuple{String,Type}}}(
-    :__repr__ => (slot="Py_tp_repr", ret_type=String),
-    :__str__  => (slot="Py_tp_str",  ret_type=String),
+    :__repr__ => (slot="Py_tp_repr",   ret_type=String),
+    :__str__  => (slot="Py_tp_str",    ret_type=String),
+    :__len__  => (slot="Py_sq_length", ret_type=Int64),
+    :__hash__ => (slot="Py_tp_hash",   ret_type=Int64),
+    :__bool__ => (slot="Py_nb_bool",   ret_type=Bool),
 )
 
 """
@@ -431,6 +434,9 @@ end
 """
     @pymethod __repr__ fname(p::T)::String = ...
     @pymethod __str__  fname(p::T)::String = ...
+    @pymethod __len__  fname(p::T)::Int64  = ...
+    @pymethod __hash__ fname(p::T)::Int64  = ...
+    @pymethod __bool__ fname(p::T)::Bool   = ...
 
 Attach a Python dunder method to the `@pyhandle` type `T`. The macro:
   1. Defines the Julia function normally (it remains callable from Julia).
@@ -440,10 +446,13 @@ Attach a Python dunder method to the `@pyhandle` type `T`. The macro:
 `T` must already be registered with `@pyhandle`. The function must take exactly
 one positional argument — the self value of type `T`. Supported dunders:
 
-| Dunder     | C slot       | Julia return type |
-|------------|--------------|-------------------|
-| `__repr__` | `Py_tp_repr` | `String`          |
-| `__str__`  | `Py_tp_str`  | `String`          |
+| Dunder     | C slot         | Julia return type | Python uses          |
+|------------|----------------|-------------------|----------------------|
+| `__repr__` | `Py_tp_repr`   | `String`          | `repr(obj)`          |
+| `__str__`  | `Py_tp_str`    | `String`          | `str(obj)`           |
+| `__len__`  | `Py_sq_length` | `Int64`           | `len(obj)`           |
+| `__hash__` | `Py_tp_hash`   | `Int64`           | `hash(obj)`, dict key|
+| `__bool__` | `Py_nb_bool`   | `Bool`            | `bool(obj)`, `if obj`|
 """
 macro pymethod(dunder, fundef)
     dunder isa Symbol || error(

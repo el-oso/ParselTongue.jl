@@ -166,6 +166,16 @@ end
         assert isinstance(p2, feature.Pt2D), "scaled result is Pt2D"
         assert feature.point_x(p2) == 6.0 and feature.point_y(p2) == 8.0, "point_scale"
         del p, p2   # tp_dealloc calls free()
+        # Item O: __len__, __hash__, __bool__ dunders.
+        p3 = feature.make_point(3.0, 4.0)
+        assert len(p3) == 5, f"__len__ (norm ~5): {len(p3)}"
+        assert isinstance(hash(p3), int), f"__hash__ returned non-int: {hash(p3)}"
+        assert bool(p3) == True, "__bool__ non-zero point"
+        assert bool(feature.make_point(0.0, 0.0)) == False, "__bool__ zero point"
+        # hash consistency: equal-valued points should produce equal hashes.
+        p4 = feature.make_point(3.0, 4.0)
+        assert hash(p3) == hash(p4), "hash consistency"
+        del p3, p4
         # Python callables as arguments (item F)
         assert feature.apply(lambda x: x * 2.0, 3.0) == 6.0,    "apply: identity"
         assert feature.apply(abs, -5.0) == 5.0,                  "apply: builtin"

@@ -14,7 +14,7 @@ the Python object graph you can reach from native code.
 | Annotation | `@pyfunc` / `@pymodule` | `#[pyfunction]` / `#[pymodule]` |
 | Build CLI | `pt wheel file.jl` (or `build_wheel("file.jl")`) | `maturin build` |
 | Type mapping | Explicit boundary contract | Derive macros + `FromPyObject` / `IntoPyObject` |
-| Classes | `@pyhandle` (isbits structs → real Python types; `isinstance`, auto field access, `@pymethod __repr__`/`__str__`) | `#[pyclass]` (full object protocol) |
+| Classes | `@pyhandle` (isbits structs → real Python types; `isinstance`, auto field access, `@pymethod __repr__`/`__str__`/`__len__`/`__hash__`/`__bool__`) | `#[pyclass]` (full object protocol) |
 | Custom exceptions | `@pyerror MyError <: ValueError` | `create_exception!` |
 | Python callables | `PyCallable{Args,Ret}` (any scalar signature) | `Py<PyAny>` / `PyCallable` (any signature) |
 | GIL release during call | Yes (automatic) | Yes (opt-in with `py.allow_threads`) |
