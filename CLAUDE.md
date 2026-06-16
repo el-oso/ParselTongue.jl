@@ -95,12 +95,55 @@ and `to_c(x::T)` (native → carrier). Built-in boundary types:
 | `NamedTuple` | dict | tuple carrier |
 | `Union{T,Nothing}` | T or None | `PtOpt{C}` |
 | `PtVarArgs{T}` | *args (variadic) | `PtArray{T,1}` |
-| `PyCapsule` handle (`@pyhandle T`) | opaque capsule | `PtHandle` |
+| `@pyhandle T` (isbits struct) | real Python class (`isinstance`, auto fields, dunders) | `PtHandle{T}` |
 | `PyCallable` | callable (Float64→Float64) | `Ptr{Cvoid}` |
 | User type via `@boundary T carrier=C` | depends on carrier | any existing carrier |
 
 The protocol is registered as a `TypeContracts` `@contract` (`PyBoundary`) so a non-boundary type
 is rejected at build time with a clear message rather than a cryptic trim failure (`assert_boundary`).
+
+## `@pyhandle` and `@pymethod` — the real-Python-class system
+
+`@pyhandle T` registers an isbits Julia struct as a real Python type (`PyType_FromSpec`).
+Each handle Python object is a `_PtObj_T { PyObject_HEAD; void *_data; }` where `_data`
+is a heap-allocated copy of the struct (malloc'd by `to_c`; freed by `_pt_dealloc_T`).
+The C carrier is `PtHandle { void *ptr; }`. `from_c(T, h)` = `unsafe_load(Ptr{T}(h.ptr))`.
+
+`@pymethod` attaches a Python dunder to a `@pyhandle` type. Key internals:
+
+| Registry | Location | Purpose |
+|---|---|---|
+| `_PYMETHOD_SLOTS` | `macros.jl:66` | `dunder → (slot, ret_type)`. `ret_type=nothing` = any boundary type. `slot="Py_tp_richcompare"` for both `__eq__` and `__ne__`. |
+| `_PYMETHOD_EXTRA_ARGS` | `macros.jl:78` | Extra arg specs beyond self. `Type[Int64]` for `__getitem__`; `:same_handle` sentinel for `__eq__`/`__ne__` (second arg must be same handle type). |
+| `_METHODS` | `macros.jl:103` | `PtMethod[]` — build-host registry. |
+| `PtMethod` | `macros.jl:89` | `{handle_type, dunder, jl_func, self_arg, ret}` — no extra args stored; derived from dunder in generators. |
+
+`cabi_symbol(m::PtMethod)` → `"pt_meth_<TypeName>_<clean>"` where `<clean>` strips leading/trailing `__`.
+
+### Supported dunders and their C slots
+
+| Dunder | C slot | Extra arg | C return | Notes |
+|---|---|---|---|---|
+| `__repr__`, `__str__` | `Py_tp_repr/str` | — | `char*` → `PyUnicode_FromString` | |
+| `__len__` | `Py_sq_length` | — | `int64_t` → `Py_ssize_t` | |
+| `__hash__` | `Py_tp_hash` | — | `int64_t` → `Py_hash_t` | |
+| `__bool__` | `Py_nb_bool` | — | `int8_t` → `int` | |
+| `__getitem__` | `Py_sq_item` | `Int64` index (`Py_ssize_t` → `int64_t`) | any boundary → `PyObject*` | Integer indices only; slices need `Py_mp_subscript` |
+| `__eq__`, `__ne__` | `Py_tp_richcompare` (shared) | same handle type → `PtHandle{T}` | `int8_t` → `PyBool_FromLong` | Single `_pt_richcmp_T` C function; cross-type → `NotImplemented`; `__ne__` auto-derived from `__eq__` if only one registered |
+
+### How `cshim.jl` generates richcmp
+
+In `_emit_handle_type_defs` (`cshim.jl:1061`):
+- The `for m in tmeths` loop **skips** `__eq__`/`__ne__` (they need no individual slot wrappers).
+- After the loop, if any eq/ne registered: emit `extern int8_t ...` declarations + one
+  `_pt_richcmp_T(PyObject *self, PyObject *other, int op)` that type-checks `other` via
+  `Py_TYPE(other) != (PyTypeObject *)_PtType_T → Py_RETURN_NOTIMPLEMENTED`, then dispatches
+  on `op`. If only `__eq__`: `op == Py_NE) r = !r`. If only `__ne__`: `op == Py_EQ) r = !r`.
+- The slot array loop also skips `__eq__`/`__ne__` and adds ONE `{Py_tp_richcompare, ...}` entry.
+
+**Hash/eq interaction**: defining `__eq__` without `__hash__` makes the type unhashable
+(CPython's `type_ready` sets `tp_hash = PyObject_HashNotImplemented` when `tp_richcompare`
+is set but `tp_hash` is not). Register `@pymethod __hash__` alongside `__eq__` to retain hashability.
 
 ## The CLI (`app/pt.jl`, `src/cli.jl`)
 
