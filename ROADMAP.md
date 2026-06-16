@@ -333,32 +333,32 @@ Phase 5 work; inconsistencies and improvements opportunistically.
 
 ### Bugs
 
-- [ ] **A1. `_bp_dict` key-string leak on error** (`cshim.jl:553`) — when
+- [x] **A1. `_bp_dict` key-string leak on error** (`cshim.jl:553`) — when
   `PyDict_SetItemString` fails mid-loop, the remaining key strings at indices
   `ii+1..len-1` that were already `strdup`'d are never freed. Fix: free remaining
   keys before breaking out of the loop, mirroring the `_ap_dict` cleanup pattern.
 
-- [ ] **A2. `_bp_opt` Cstring memory leak** (`cshim.jl:527`) — for
+- [x] **A2. `_bp_opt` Cstring memory leak** (`cshim.jl:527`) — for
   `Union{String,Nothing}` returns, the inner `Cstring` value is passed to
   `PyUnicode_FromString` but never `free`'d. Every successful Optional String
   return leaks the Julia-malloc'd buffer. Fix: emit `free((void *)val.value);`
   after `PyUnicode_FromString`, matching what `_bp_str` does.
 
-- [ ] **A3. Keyword-only required args silently positional** (`cshim.jl:829`,
+- [x] **A3. Keyword-only required args silently positional** (`cshim.jl:829`,
   `macros.jl:202`) — a `@pyfunc f(a::Int; kw::Float64)::Float64` where `kw` has
   no default passes `@pyfunc` validation but is emitted as `METH_VARARGS` (no
   kwargs dict), making it unreachable by keyword from Python. Fix: either reject
   keyword-only args without defaults in `_register_export!`, or detect
   `any(a.is_keyword for a in e.args)` in `_wrapper_fn` and force `METH_KEYWORDS`.
 
-- [ ] **A4. `PyFloat_AsDouble` error silently dropped in `PyCallable`**
+- [x] **A4. `PyFloat_AsDouble` error silently dropped in `PyCallable`**
   (`boundary.jl:612`) — if the Python callable returns a non-float object,
   `PyFloat_AsDouble` returns `-1.0` and sets a Python exception, but the Julia
   side never checks `PyErr_Occurred()`. The GIL is released and the exception
   state is lost. Fix: check `PyErr_Occurred() != C_NULL` after the call, clear
   the error, and `error(...)`.
 
-- [ ] **A5. `_pt_errmsg` not written on success path** (`ccallable_gen.jl:119`)
+- [x] **A5. `_pt_errmsg` not written on success path** (`ccallable_gen.jl:119`)
   — the generated `@ccallable` wrapper only stores into `_pt_errmsg` inside the
   `catch` block; on success the pointer is left as whatever the caller
   initialised. The C shim happens to zero-initialise it, but this is a latent
@@ -367,26 +367,26 @@ Phase 5 work; inconsistencies and improvements opportunistically.
 
 ### Inconsistencies
 
-- [ ] **A6. `_ap_stra` `memset` has no `ni>0` guard** (`cshim.jl:274`) — emits
+- [x] **A6. `_ap_stra` `memset` has no `ni>0` guard** (`cshim.jl:274`) — emits
   `memset(tmp.data, 0, (size_t)ni * sizeof(char *))` without a guard; `_ap_dict`
   uses `ni > 0 ? ... : 1`. Technically safe (memset of 0 bytes is a no-op) but
   looks like a bug at a glance. Align to `_ap_dict` style.
 
-- [ ] **A7. `has_kw` flag logic diverges between varargs and non-varargs**
+- [x] **A7. `has_kw` flag logic diverges between varargs and non-varargs**
   (`cshim.jl:1246`) — non-varargs uses `any(a.default !== nothing, e.args)`;
   varargs uses `any(a.is_keyword, e.args)`. Unify to
   `has_defaults || any(a.is_keyword, e.args)` in both paths.
 
-- [ ] **A8. Dict unsigned branch uses string prefix instead of type identity**
+- [x] **A8. Dict unsigned branch uses string prefix instead of type identity**
   (`cshim.jl:399`) — `startswith(cs.ctype, "u")` instead of explicit type
   identity checks as used in other branches. Fragile if a new type with a
   `ctype` beginning with `"u"` is added.
 
-- [ ] **A9. Dead `_MODULE_NAME[] = nothing` in `build.jl`** (`build.jl:102`) —
+- [x] **A9. Dead `_MODULE_NAME[] = nothing` in `build.jl`** (`build.jl:102`) —
   `clear_exports!()` already sets `_MODULE_NAME[] = nothing`; the explicit
   assignment two lines later is dead code.
 
-- [ ] **A10. `_uses_bytes`/`_uses_strarr`/`_uses_handles` miss nested carriers**
+- [x] **A10. `_uses_bytes`/`_uses_strarr`/`_uses_handles` miss nested carriers**
   (`cshim.jl:984`) — these predicates check top-level return carriers and tuple
   fields but not carriers inside `PtOpt` or dict value types. Latent: currently
   Optional wrapping of bytes/strarr/handles is not generated, but the predicates
@@ -394,55 +394,55 @@ Phase 5 work; inconsistencies and improvements opportunistically.
 
 ### Improvements
 
-- [ ] **A11. Naked `::Int` on `findfirst` in `_wrapper_fn_varargs`**
+- [x] **A11. Naked `::Int` on `findfirst` in `_wrapper_fn_varargs`**
   (`cshim.jl:663`) — `findfirst(...)::Int` throws a `TypeError` instead of a
   clear message if it returns `nothing`. Replace with `something(findfirst(...))`.
 
-- [ ] **A12. `from_c(String, Cstring)` no null guard** (`boundary.jl:111`) —
+- [x] **A12. `from_c(String, Cstring)` no null guard** (`boundary.jl:111`) —
   `unsafe_string(c)` with a null `Cstring` is undefined behaviour. Add
   `@assert c != C_NULL` (strips in AOT; avoids dynamic dispatch from `error()`).
 
-- [ ] **A13. `@pyhandle to_c` malloc return unchecked** (`boundary.jl:171`) —
+- [x] **A13. `@pyhandle to_c` malloc return unchecked** (`boundary.jl:171`) —
   `Ptr{T}(Libc.malloc(sizeof(T)))` not checked for null before `unsafe_store!`;
   OOM segfaults instead of erroring. Add `@assert p != C_NULL`.
 
-- [ ] **A14. `to_c(String)` malloc return unchecked** (`boundary.jl:115`) — same
+- [x] **A14. `to_c(String)` malloc return unchecked** (`boundary.jl:115`) — same
   pattern: `Ptr{UInt8}(Libc.malloc(n + 1))` before `unsafe_copyto!` without a
   null check. Add `@assert p != C_NULL`.
 
-- [ ] **A15. `PyLong_FromSsize_t` return unchecked in `_pt_wrap_ndarray`**
+- [x] **A15. `PyLong_FromSsize_t` return unchecked in `_pt_wrap_ndarray`**
   (`cshim.jl:1142`) — on OOM, returns NULL which is then passed to
   `PyTuple_SetItem` (which steals the ref), leaving a NULL element in the shape
   tuple. Check the return value and propagate NULL on failure.
 
-- [ ] **A16. Missing ownership comment in `_pt_wrap_ndarray`** (`cshim.jl:1136`)
+- [x] **A16. Missing ownership comment in `_pt_wrap_ndarray`** (`cshim.jl:1136`)
   — the ordering of `Py_DECREF(flat)` before checking `arr` is correct but
   subtle (numpy never took ownership of `buf` if `frombuffer` failed). Add a
   comment explaining the invariant.
 
-- [ ] **A17. `doc` string unescaped in generated `PyModuleDef`** (`cshim.jl:1260`)
+- [x] **A17. `doc` string unescaped in generated `PyModuleDef`** (`cshim.jl:1260`)
   — `doc` is interpolated verbatim into a C string literal. Currently always a
   static string, but if ever exposed via `build_extension(...; doc=)` a user
   value containing `"` or `\` would produce malformed C. C-escape before
   interpolation.
 
-- [ ] **A18. Method docstring escape relies on implicit invariant** (`cshim.jl:1250`)
+- [x] **A18. Method docstring escape relies on implicit invariant** (`cshim.jl:1250`)
   — `export_name` is safe in a C literal only because `_is_py_ident` validates
   it. Add a comment cross-referencing the validator so the dependency is explicit.
 
-- [ ] **A19. `_opt_inner` assumes binary Union** (`boundary.jl:463`) — returns
+- [x] **A19. `_opt_inner` assumes binary Union** (`boundary.jl:463`) — returns
   wrong type for `Union{A, B, Nothing}` (three-way). Add an `@assert` that
   exactly one of `T.a`, `T.b` is `Nothing`.
 
-- [ ] **A20. `PtVarArgs` not blocked as return type** (`macros.jl:297`) —
+- [x] **A20. `PtVarArgs` not blocked as return type** (`macros.jl:297`) —
   `assert_ret_boundary` passes for `PtVarArgs{T}` since it has `to_c` defined,
   but returning a varargs container is semantically nonsensical. Reject it in
   `assert_ret_boundary` or `_register_export!`.
 
-- [ ] **A21. Extra positional CLI args silently ignored** (`cli.jl:84`) — `pt
+- [x] **A21. Extra positional CLI args silently ignored** (`cli.jl:84`) — `pt
   build file1.jl file2.jl` silently ignores `file2.jl`. Emit a warning or error.
 
-- [ ] **A22. Runtime version pin fragile for pre-release Julia** (`wheel.jl:198`)
+- [x] **A22. Runtime version pin fragile for pre-release Julia** (`wheel.jl:198`)
   — `~= X.Y.0` version pin derived from `VERSION` string; a nightly
   `1.13.0-DEV` would produce `~= 1.13.0` which pip won't match against a
   `parseltongue-runtime 1.13.0.DEV` package. Document the limitation.

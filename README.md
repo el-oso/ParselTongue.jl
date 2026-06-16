@@ -30,6 +30,11 @@ $ python -c "import mathx; print(mathx.add(40,2), mathx.greet('World'))"
 42 Hello, World!
 ```
 
+## Documentation
+
+Full guide, boundary-type reference, and worked examples:
+**https://el-oso.github.io/ParselTongue.jl/**
+
 ## API
 
 | Macro / function | Purpose |
