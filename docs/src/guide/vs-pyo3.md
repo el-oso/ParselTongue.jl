@@ -22,7 +22,7 @@ the Python object graph you can reach from native code.
 | manylinux tagging | Yes (auto or pinned) | Yes (via `maturin`) |
 | Wheel size | ~100 MB (bundled Julia runtime) | ~1–5 MB |
 | macOS support | Yes (`-dynamiclib`, `@loader_path`) | Yes |
-| Windows support | Not yet | Yes |
+| Windows support | Yes (MinGW-w64) | Yes |
 | Async | No | Yes |
 | Free-threading (GIL-free CPython) | No | Experimental |
 | Maturity | Early (v0.2x) | Production (v0.22+, widely used) |
@@ -215,7 +215,7 @@ supported.
 | abi3 | `abi3=true` (CPython ≥ 3.11) | `abi3` feature (CPython ≥ 3.8) |
 | manylinux | Auto-detected or `manylinux="2.17"` | Handled by `maturin` |
 | macOS | `.dylib` + `@loader_path` rpaths | `.dylib` + `@rpath` |
-| Windows | Not yet | Yes |
+| Windows | `.pyd`, `os.add_dll_directory` | Yes |
 
 The dominant wheel-size difference comes from the Julia runtime. The trimmed
 extension code is small; the Julia stdlib's `__init__` functions fatally
@@ -251,7 +251,7 @@ build can take minutes.
   guarantees in the extension layer.
 - You need to expose **mutable Python objects** (`#[pyclass]`), rich Python
   protocols (`__iter__`, `__len__`, properties), or Python inheritance.
-- You need **Windows** support or **free-threading** CPython.
+- You need **free-threading** CPython.
 - Wheel size matters: a 2 MB PyO3 wheel vs a 100 MB ParselTongue wheel is a
   real deployment difference.
 - You need to call Python with **arbitrary argument types** from native code, not

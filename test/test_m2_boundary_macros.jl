@@ -381,7 +381,7 @@ end
                                 isfile(joinpath(julia_lib, n)) && !islink(joinpath(julia_lib, n)),
                           readdir(julia_lib))
     if !isempty(libjulia_int)
-        needs = _readelf_needed(joinpath(julia_lib, first(libjulia_int)))
+        needs = _dynlib_needed(joinpath(julia_lib, first(libjulia_int)))
         @test !isempty(needs)
         # libjulia-internal must not DT_NEED OpenBLAS or SuiteSparse/cholmod (item 9 claim).
         @test !any(n -> occursin("openblas", lowercase(n)), needs)
@@ -462,7 +462,7 @@ end
     @pyfunc _test_sys_add(a::Float64, b::Float64)::Float64 = a + b
     pkgdir = mktempdir()
     try
-        _write_system_pkg_pyfiles(pkgdir, "_mymod", _EXPORTS, "mymod")
+        _write_system_pkg_pyfiles(pkgdir, "_mymod", _EXPORTS, "mymod"; _os_kernel=:linux)
         init = read(joinpath(pkgdir, "__init__.py"), String)
         # Discovers Julia via JULIA_BINDIR, JULIA_PREFIX, or PATH.
         @test occursin("JULIA_BINDIR", init)

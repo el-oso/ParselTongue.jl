@@ -22,7 +22,7 @@ Code map: `src/boundary.jl` (carriers + `c_abi_type`/`from_c`/`to_c`),
 - Full `#[pyclass]`-style objects with inheritance / dunder protocols (a *scoped*
   opaque-handle track is optional — Phase 4).
 - `async`, free-threading, sub-interpreters.
-- Windows (macOS shipped v0.20.0; Windows deferred — see analysis below).
+- Windows ARM64 (x86-64 shipped v0.25.0 via MinGW-w64; ARM64 depends on Julia Windows arm64 support).
 - Removing one-extension-per-process (inherent to the trim-image model; mitigated
   by `@pymodule pkg.sub` submodules, already shipped).
 
@@ -292,41 +292,15 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   now passes `_preloaded=(exports, errors)` to `build_extension`, which skips the
   second include. The user file is loaded exactly once per `build_wheel` call.
 
-- [ ] **I. Windows support (MinGW-w64)** *(platform breadth)* — v0.24.0 (partial; not yet verified on Windows hardware).
-  Implements all Windows platform branches; actual `.pyd` compilation requires Windows + Julia.
-  See gap analysis below for what was implemented and what needs on-Windows verification.
+- [x] **I. Windows support (MinGW-w64)** *(platform breadth)* — shipped v0.25.0. Verified via CI on `windows-latest`.
+  All Windows platform branches implemented and passing unit + integration tests on GitHub Actions.
   Files: `src/build.jl` (`_find_cc` Windows search, `_py_lib_flags`, `_link_extension` Windows branch,
   `_abi3_ext_suffix` `.pyd` fallback); `src/wheel.jl` (`_is_dynlib` `.dll`, `_SKIP_LIB` `.dll`,
   `_vendor_libs_win`, `_objdump_needed`, `_dynlib_needed` Windows dispatch, `build_wheel` Windows
   vendoring from `bin/`, `_write_pkg_pyfiles`/`_write_shared_pkg_pyfiles`/`_write_system_pkg_pyfiles`
   Windows preload via `os.add_dll_directory`, `build_runtime_wheel` Windows vendoring,
-  `_current_os_kernel` helper). MSVC not yet supported — use MinGW-w64 gcc.
-  Tests: 20 unit tests (all pass on Linux) covering `_is_dynlib`, `_SKIP_LIB`, bundled/shared/system
-  `__init__.py` Windows content, `_py_lib_flags` Unix no-op, `_os_kernel` cross-platform param.
-
-## Windows support — gap analysis
-
-Windows is deferred but not blocked on any fundamental design issue. The gaps are
-mechanical (platform branches), not architectural. Everything below is `build.jl` /
-`wheel.jl` / `__init__.py` work:
-
-| Area | Current (Linux/macOS) | Windows needed |
-|---|---|---|
-| **Extension suffix** | `.so` / `.dylib` via `EXT_SUFFIX` | `.pyd` — `sysconfig` already returns the right value; `build.jl:149` has a `TBD` note |
-| **Linker flags** | `-shared -fPIC -Wl,--whole-archive img.a` (Linux) / `-dynamiclib -force_load` (macOS) | MSVC: `cl /LD /WHOLEARCHIVE:img.lib`; MinGW: same as Linux |
-| **Compiler search** | `_find_cc()` looks for `cc`, `gcc`, `clang` | Add `cl.exe`; prefer MinGW-w64 if GCC on Windows desired |
-| **rpaths** | `$ORIGIN` (Linux) / `@loader_path` (macOS) | Windows has no rpath; DLLs found via `PATH` or `AddDllDirectory` (Python 3.8+) |
-| **Bundled wheel preload** | `LD_LIBRARY_PATH` (Linux) / `ctypes.CDLL` loop (macOS) | `os.add_dll_directory(lib_dir)` (Python 3.8+) before importing `_mod.pyd` |
-| **System/shared `__init__.py`** | Same preload as bundled | Same `os.add_dll_directory` branch |
-| **Julia lib layout** | `lib/` and `lib/julia/` (Unix) | `bin/` holds DLLs on Windows (different tree to vendor) |
-| **slim BFS** | `readelf -d` (Linux) / `otool -L` (macOS) | `dumpbin /dependents` or `objdump -p` (MinGW) |
-| **juliac itself** | Ships in Julia 1.12+ for Linux/macOS | Must work on Windows — outside ParselTongue's control but Julia team ships it |
-| **Platform wheel tag** | `linux_x86_64` / `manylinux_*` / `macosx_*` | `win_amd64` or `win32` — `wheel.jl` `_wheel_plat` branch needed |
-
-**Effort estimate**: M–L. No fundamental blockers — each gap is a known if/else branch.
-MinGW-w64 (GCC on Windows) is the lower-risk path since the linker flags are nearly
-identical to Linux. MSVC requires a different link command and `.lib` import library.
-The `juliac` prerequisite and Julia's Windows arm64 status are the only external dependencies.
+  `_current_os_kernel` helper). MSVC not supported — use MinGW-w64 gcc (pre-installed at
+  `C:\msys64\mingw64\bin` on GitHub runners; CI adds it to PATH automatically).
 
 ## Cross-cutting conventions
 
