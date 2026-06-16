@@ -186,6 +186,16 @@ end
         except RuntimeError:
             pass
         del p5
+        # Item O3: __eq__ / __ne__ (rich comparison).
+        pa = feature.make_point(3.0, 4.0)
+        pb = feature.make_point(3.0, 4.0)
+        pc = feature.make_point(1.0, 2.0)
+        assert pa == pb,     "__eq__: equal points"
+        assert not (pa == pc), "__eq__: unequal points"
+        assert pa != pc,     "__ne__: auto-negation"
+        assert not (pa != pb), "__ne__: auto-negation equal"
+        assert not (pa == 42), "__eq__: cross-type comparison is False"
+        del pa, pb, pc
         # Python callables as arguments (item F)
         assert feature.apply(lambda x: x * 2.0, 3.0) == 6.0,    "apply: identity"
         assert feature.apply(abs, -5.0) == 5.0,                  "apply: builtin"

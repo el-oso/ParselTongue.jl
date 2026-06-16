@@ -529,6 +529,79 @@ end
     clear_exports!()
 end
 
+@testset "@pymethod __eq__ / __ne__ (item O3)" begin
+    clear_exports!()
+
+    # Basic __eq__: register, callable from Julia, metadata correct.
+    @pymethod __eq__ th_eq(h::_TestHandle, other::_TestHandle)::Bool =
+        h.x == other.x && h.n == other.n
+    m_eq = ParselTongue._METHODS[end]
+    @test m_eq.dunder === :__eq__
+    @test m_eq.ret === Bool
+    @test m_eq.handle_type === _TestHandle
+    @test th_eq(_TestHandle(1.0, 1), _TestHandle(1.0, 1)) == true   # callable from Julia
+    @test th_eq(_TestHandle(1.0, 1), _TestHandle(2.0, 1)) == false
+
+    # emit_ccallable_method: second PtHandle param, from_c for both args.
+    src = ParselTongue.emit_ccallable_method(m_eq)
+    @test occursin("_other::ParselTongue.PtHandle", src)
+    @test occursin("from_c(_TestHandle, _other)", src)
+    @test occursin("th_eq(", src)
+    @test Meta.parse(src) isa Expr
+
+    # emit_cshim: richcmp function emitted, NOT individual eq/ne slots.
+    c_eq = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
+                      copy(ParselTongue._METHODS))
+    @test occursin("_pt_richcmp__TestHandle", c_eq)
+    @test occursin("Py_tp_richcompare", c_eq)
+    @test !occursin("Py_sq_eq", c_eq)     # no such CPython slot
+    @test occursin("extern int8_t pt_meth__TestHandle_eq(PtHandle, PtHandle,", c_eq)
+    @test occursin("Py_EQ", c_eq)
+    @test occursin("Py_NE", c_eq)
+    @test occursin("Py_RETURN_NOTIMPLEMENTED", c_eq)
+    # Auto-negation branch: only __eq__ registered, so "op == Py_NE) r = !r" present.
+    @test occursin("op == Py_NE) r = !r", c_eq)
+
+    # Both __eq__ and __ne__ registered: dispatch on op, no auto-negation.
+    @pymethod __ne__ th_ne(h::_TestHandle, other::_TestHandle)::Bool =
+        h.x != other.x || h.n != other.n
+    c_both = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
+                        copy(ParselTongue._METHODS))
+    @test occursin("extern int8_t pt_meth__TestHandle_ne(PtHandle, PtHandle,", c_both)
+    @test occursin("op == Py_EQ", c_both)           # dispatch branch
+    @test !occursin("op == Py_NE) r = !r", c_both)  # no auto-negation
+    @test occursin("\"error in __eq__\"", c_both)
+    @test occursin("\"error in __ne__\"", c_both)
+
+    # Only __ne__ registered: __eq__ auto-negated.
+    clear_exports!()
+    @pymethod __ne__ th_ne_only(h::_TestHandle, other::_TestHandle)::Bool = h.x != other.x
+    c_ne = emit_cshim("demo", _EXPORTS, PtError[], [_TestHandle],
+                      copy(ParselTongue._METHODS))
+    @test occursin("_pt_richcmp__TestHandle", c_ne)
+    @test occursin("op == Py_EQ) r = !r", c_ne)    # auto-negation for EQ
+    @test !occursin("op == Py_NE) r = !r", c_ne)
+
+    # Error: return type must be Bool.
+    clear_exports!()
+    err_ret = try; @eval @pymethod __eq__ th_bad_eq_ret(h::_TestHandle, o::_TestHandle)::Int64 = 0; catch e; e; end
+    @test (err_ret isa LoadError ? err_ret.error : err_ret) isa ErrorException
+
+    # Error: second arg type must match handle type.
+    err_type = try; @eval @pymethod __eq__ th_bad_eq_type(h::_TestHandle, o::Int64)::Bool = false; catch e; e; end
+    @test (err_type isa LoadError ? err_type.error : err_type) isa ErrorException
+
+    # Error: wrong arg count (missing second arg).
+    err_argc = try; @eval @pymethod __eq__ th_bad_eq_argc(h::_TestHandle)::Bool = false; catch e; e; end
+    @test (err_argc isa LoadError ? err_argc.error : err_argc) isa ErrorException
+
+    # Error: too many args.
+    err_argc2 = try; @eval @pymethod __eq__ th_bad_eq_argc2(h::_TestHandle, o::_TestHandle, x::Int64)::Bool = false; catch e; e; end
+    @test (err_argc2 isa LoadError ? err_argc2.error : err_argc2) isa ErrorException
+
+    clear_exports!()
+end
+
 @testset "auto __getattr__ field access (item K)" begin
     # _TestHandle has fields x::Float64, n::Int64 (defined at file scope).
     clear_exports!()

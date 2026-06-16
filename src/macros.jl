@@ -64,18 +64,22 @@ const _ERRORS = PtError[]
 # Supported dunder slots: symbol → (C slot constant, required Julia return type).
 # ret_type=nothing means any boundary return type is accepted (validated via c_abi_type).
 const _PYMETHOD_SLOTS = Dict{Symbol,NamedTuple}(
-    :__repr__    => (slot="Py_tp_repr",   ret_type=String),
-    :__str__     => (slot="Py_tp_str",    ret_type=String),
-    :__len__     => (slot="Py_sq_length", ret_type=Int64),
-    :__hash__    => (slot="Py_tp_hash",   ret_type=Int64),
-    :__bool__    => (slot="Py_nb_bool",   ret_type=Bool),
-    :__getitem__ => (slot="Py_sq_item",   ret_type=nothing),
+    :__repr__    => (slot="Py_tp_repr",      ret_type=String),
+    :__str__     => (slot="Py_tp_str",       ret_type=String),
+    :__len__     => (slot="Py_sq_length",    ret_type=Int64),
+    :__hash__    => (slot="Py_tp_hash",      ret_type=Int64),
+    :__bool__    => (slot="Py_nb_bool",      ret_type=Bool),
+    :__getitem__ => (slot="Py_sq_item",      ret_type=nothing),
+    :__eq__      => (slot="Py_tp_richcompare", ret_type=Bool),
+    :__ne__      => (slot="Py_tp_richcompare", ret_type=Bool),
 )
 
 # Extra positional argument types (after self) for dunders that take more than self.
-# For @pymethod __getitem__ f(p::T, i::Int64)::R, the extra arg is the integer index.
-const _PYMETHOD_EXTRA_ARGS = Dict{Symbol,Vector{Type}}(
+# :same_handle means the extra arg must be the same @pyhandle type as self.
+const _PYMETHOD_EXTRA_ARGS = Dict{Symbol,Any}(
     :__getitem__ => Type[Int64],
+    :__eq__      => :same_handle,
+    :__ne__      => :same_handle,
 )
 
 """
@@ -456,6 +460,8 @@ end
     @pymethod __hash__ fname(p::T)::Int64  = ...
     @pymethod __bool__ fname(p::T)::Bool   = ...
     @pymethod __getitem__ fname(p::T, i::Int64)::R = ...
+    @pymethod __eq__   fname(p::T, other::T)::Bool = ...
+    @pymethod __ne__   fname(p::T, other::T)::Bool = ...
 
 Attach a Python dunder method to the `@pyhandle` type `T`. The macro:
   1. Defines the Julia function normally (it remains callable from Julia).
@@ -472,9 +478,17 @@ Attach a Python dunder method to the `@pyhandle` type `T`. The macro:
 | `__hash__`    | `Py_tp_hash`   | `(self::T)`       | `Int64`              | `hash(obj)`, dict key    |
 | `__bool__`    | `Py_nb_bool`   | `(self::T)`       | `Bool`               | `bool(obj)`, `if obj`    |
 | `__getitem__` | `Py_sq_item`   | `(self::T, i::Int64)` | any boundary type| `obj[i]` (integer index) |
+| `__eq__`      | `Py_tp_richcompare` | `(self::T, other::T)` | `Bool`      | `obj == other`, `obj != other` (auto-negated) |
+| `__ne__`      | `Py_tp_richcompare` | `(self::T, other::T)` | `Bool`      | `obj != other` (overrides auto-negation of `__eq__`) |
 
 `__getitem__` only handles integer indices (via `Py_sq_item`); slice notation
 (`obj[a:b]`) requires `Py_mp_subscript` and is not yet supported.
+
+`__eq__` and `__ne__` share a single `Py_tp_richcompare` C slot. Defining only
+`__eq__` gives `__ne__` for free (negation). If `other` is a different type,
+`NotImplemented` is returned automatically. Note that Python makes a type
+unhashable when `__eq__` is defined without `__hash__`; register `@pymethod
+__hash__` as well to retain hashability.
 """
 macro pymethod(dunder, fundef)
     dunder isa Symbol || error(
@@ -484,7 +498,9 @@ macro pymethod(dunder, fundef)
         error("@pymethod: unsupported dunder `$dunder`. Supported: $supported.")
     end
 
-    n_extra    = length(get(_PYMETHOD_EXTRA_ARGS, dunder, Type[]))
+    _extra_spec = get(_PYMETHOD_EXTRA_ARGS, dunder, nothing)
+    n_extra    = _extra_spec isa AbstractVector ? length(_extra_spec) :
+                 _extra_spec === :same_handle ? 1 : 0
     n_expected = 1 + n_extra
 
     fname, rawargs, ret_expr = _parse_fundef(fundef)
@@ -513,14 +529,24 @@ macro pymethod(dunder, fundef)
     sname_sym  = QuoteNode(sname)
 
     # Build runtime type-equality checks for each extra arg.
-    expected_extra = get(_PYMETHOD_EXTRA_ARGS, dunder, Type[])
-    extra_checks = Expr[
-        :($(esc(extra_type_exprs[i])) === $(expected_extra[i]) ||
-          error(string("@pymethod ", $dunder_sym, ": extra argument ", $i,
-                       " must be typed ::", $(expected_extra[i]),
-                       ", got ::", $(esc(extra_type_exprs[i])))))
-        for i in 1:n_extra
-    ]
+    extra_checks = if _extra_spec isa AbstractVector
+        expected_extra = _extra_spec
+        Expr[
+            :($(esc(extra_type_exprs[i])) === $(expected_extra[i]) ||
+              error(string("@pymethod ", $dunder_sym, ": extra argument ", $i,
+                           " must be typed ::", $(expected_extra[i]),
+                           ", got ::", $(esc(extra_type_exprs[i])))))
+            for i in 1:n_extra
+        ]
+    elseif _extra_spec === :same_handle
+        # __eq__ / __ne__: second arg must be the same @pyhandle type as self.
+        Expr[:($(esc(extra_type_exprs[1])) === _T ||
+               error(string("@pymethod ", $dunder_sym,
+                            ": second argument type must match self type (", _T,
+                            "), got ", $(esc(extra_type_exprs[1])))))]
+    else
+        Expr[]
+    end
 
     quote
         $(esc(fundef))

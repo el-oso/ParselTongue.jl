@@ -1079,6 +1079,8 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         #   Int64   → int64_t extern; Py_ssize_t/Py_hash_t slot (len/hash pattern)
         #   Bool    → int8_t extern; int slot (bool/inquiry pattern)
         for m in tmeths
+            # __eq__ / __ne__ are handled together below as a single tp_richcompare slot.
+            m.dunder ∈ (:__eq__, :__ne__) && continue
             clean = replace(replace(string(m.dunder), r"^__" => ""), r"__$" => "")
             sym   = cabi_symbol(m)
             dname = string(m.dunder)
@@ -1159,6 +1161,63 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             end
         end
 
+        # __eq__ / __ne__ → a single Py_tp_richcompare slot wrapper.
+        # Both share one C function that dispatches on `op`. If only one is
+        # registered, the other is auto-derived (negation). Comparing against a
+        # different Python type returns Py_RETURN_NOTIMPLEMENTED.
+        eq_idx = findfirst(m -> m.dunder === :__eq__, tmeths)
+        ne_idx = findfirst(m -> m.dunder === :__ne__, tmeths)
+        has_richcmp = !isnothing(eq_idx) || !isnothing(ne_idx)
+        if has_richcmp
+            isnothing(eq_idx) || println(io, "extern int8_t $(cabi_symbol(tmeths[eq_idx]))(PtHandle, PtHandle, int32_t *, char **);")
+            isnothing(ne_idx) || println(io, "extern int8_t $(cabi_symbol(tmeths[ne_idx]))(PtHandle, PtHandle, int32_t *, char **);")
+            println(io, "static PyObject *_pt_richcmp_$(tname)(PyObject *self, PyObject *other, int op) {")
+            println(io, "    if (op != Py_EQ && op != Py_NE) Py_RETURN_NOTIMPLEMENTED;")
+            println(io, "    if (Py_TYPE(other) != (PyTypeObject *)_PtType_$tname) Py_RETURN_NOTIMPLEMENTED;")
+            println(io, "    PtHandle h_s = { ((_PtObj_$tname *)self)->_data };")
+            println(io, "    PtHandle h_o = { ((_PtObj_$tname *)other)->_data };")
+            println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+            println(io, "    int8_t r;")
+            if !isnothing(eq_idx) && !isnothing(ne_idx)
+                # Both registered: dispatch on op.
+                eq_sym = cabi_symbol(tmeths[eq_idx])
+                ne_sym = cabi_symbol(tmeths[ne_idx])
+                println(io, "    if (op == Py_EQ) {")
+                println(io, "        r = $eq_sym(h_s, h_o, &_err, &_errmsg);")
+                println(io, "    } else {")
+                println(io, "        r = $ne_sym(h_s, h_o, &_err, &_errmsg);")
+                println(io, "    }")
+                println(io, "    if (_err) {")
+                println(io, "        const char *_msg = op == Py_EQ ? \"error in __eq__\" : \"error in __ne__\";")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError, _errmsg ? _errmsg : _msg);")
+                println(io, "        free(_errmsg);")
+                println(io, "        return NULL;")
+                println(io, "    }")
+            elseif !isnothing(eq_idx)
+                # Only __eq__: __ne__ is its negation.
+                eq_sym = cabi_symbol(tmeths[eq_idx])
+                println(io, "    r = $eq_sym(h_s, h_o, &_err, &_errmsg);")
+                println(io, "    if (_err) {")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError, _errmsg ? _errmsg : \"error in __eq__\");")
+                println(io, "        free(_errmsg);")
+                println(io, "        return NULL;")
+                println(io, "    }")
+                println(io, "    if (op == Py_NE) r = !r;")
+            else
+                # Only __ne__: __eq__ is its negation.
+                ne_sym = cabi_symbol(tmeths[ne_idx])
+                println(io, "    r = $ne_sym(h_s, h_o, &_err, &_errmsg);")
+                println(io, "    if (_err) {")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError, _errmsg ? _errmsg : \"error in __ne__\");")
+                println(io, "        free(_errmsg);")
+                println(io, "        return NULL;")
+                println(io, "    }")
+                println(io, "    if (op == Py_EQ) r = !r;")
+            end
+            println(io, "    return PyBool_FromLong((long)r);")
+            println(io, "}")
+        end
+
         # Default repr (used when no @pymethod __repr__ is registered).
         has_repr = any(m -> m.dunder === :__repr__, tmeths)
         if !has_repr
@@ -1202,10 +1261,14 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             println(io, "    {Py_tp_repr,    (void *)_pt_repr_$tname},")
         end
         for m in tmeths
-            m.dunder === :__repr__ && continue  # already emitted above
+            m.dunder === :__repr__ && continue           # already emitted above
+            m.dunder ∈ (:__eq__, :__ne__) && continue   # handled by richcmp below
             clean = replace(replace(string(m.dunder), r"^__" => ""), r"__$" => "")
             slot  = _PYMETHOD_SLOTS[m.dunder].slot
             println(io, "    {$slot, (void *)_pt_slot_$(tname)_$(clean)},")
+        end
+        if has_richcmp
+            println(io, "    {Py_tp_richcompare, (void *)_pt_richcmp_$(tname)},")
         end
         if has_getattr
             println(io, "    {Py_tp_getattro, (void *)_pt_getattr_$tname},")

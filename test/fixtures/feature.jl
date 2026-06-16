@@ -21,6 +21,9 @@ end
 @pymethod __getitem__ pt2d_getitem(p::Pt2D, i::Int64)::Float64 =
     i == 0 ? p.x : i == 1 ? p.y : error("Pt2D index out of range: $i")
 
+# __eq__ (item O3): value equality; __ne__ is auto-negated.
+@pymethod __eq__ pt2d_eq(p::Pt2D, other::Pt2D)::Bool = p.x == other.x && p.y == other.y
+
 # Exercises every v1.x boundary kind in one extension: scalars, strings, complex,
 # 1-D and N-D arrays (both policies), in-place mutation + void, tuple returns,
 # and opaque handles.

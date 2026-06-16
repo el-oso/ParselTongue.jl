@@ -201,10 +201,23 @@ function emit_ccallable_method(m::PtMethod; errors::Vector{PtError}=PtError[])
     self_c = _type_src(c_abi_type(T))          # e.g. "ParselTongue.PtHandle{Pt2D}"
     from   = string("ParselTongue.from_c(", _type_src(T), ", _self)")
 
-    # __getitem__ receives an extra Int64 index from the C slot (Py_ssize_t → int64_t).
-    # from_c(Int64, _idx) == _idx (Int64 is its own carrier), so pass it directly.
-    extra_params = m.dunder === :__getitem__ ? ", _idx::Int64" : ""
-    extra_call   = m.dunder === :__getitem__ ? ", _idx"        : ""
+    # __getitem__ receives an extra Int64 index; __eq__/__ne__ receive a second handle
+    # of the same type. from_c converts each carrier to the native Julia value.
+    T_src = _type_src(T)
+    extra_params = if m.dunder === :__getitem__
+        ", _idx::Int64"
+    elseif m.dunder ∈ (:__eq__, :__ne__)
+        ", _other::$self_c"
+    else
+        ""
+    end
+    extra_call = if m.dunder === :__getitem__
+        ", _idx"
+    elseif m.dunder ∈ (:__eq__, :__ne__)
+        string(", ParselTongue.from_c(", T_src, ", _other)")
+    else
+        ""
+    end
     call   = string(m.jl_func, "(", from, extra_call, ")")
 
     # Catch block: identical to emit_ccallable (RuntimeError only; method bodies
