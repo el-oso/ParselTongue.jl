@@ -6,14 +6,29 @@ using ParselTongue
 # Julia test process). A successful --trim=safe build is itself the trim-cleanliness
 # proof — juliac errors on any dynamic dispatch in an exported path.
 
-# On Windows, Julia DLLs live in Sys.BINDIR (no rpaths). os.add_dll_directory
-# registers the directory for DLL search before extension module loading.
-_win_dll_preamble() = Sys.iswindows() ?
-    "import os; os.add_dll_directory($(repr(Sys.BINDIR)))\n" : ""
+# On Windows, Python 3.8+ ignores PATH for extension DLL resolution; every
+# required directory must be registered via os.add_dll_directory. Add:
+#   • Sys.BINDIR  — libjulia.dll, libjulia-internal.dll
+#   • dirname(gcc) — MinGW runtime DLLs (libgcc_s_seh-1, libwinpthread-1, …)
+function _win_dll_preamble()
+    Sys.iswindows() || return ""
+    dirs = String[Sys.BINDIR]
+    gcc = Sys.which("gcc")
+    gcc !== nothing && push!(dirs, dirname(gcc))
+    calls = join(["os.add_dll_directory($(repr(d)))" for d in unique(dirs)], "; ")
+    "import os; $calls\n"
+end
 
 function _py_run(script::AbstractString)
     py = Sys.which("python3")
-    read(`$py -c $script`, String)
+    buf = IOBuffer()
+    try
+        run(pipeline(`$py -c $script`, stdout=buf, stderr=buf))
+    catch e
+        out = String(take!(buf))
+        error("Python process failed:\n$out\nCaused by: $e")
+    end
+    String(take!(buf))
 end
 
 function _have_tools()

@@ -22,13 +22,13 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: julia-actions/setup-julia@v2
+      - uses: julia-actions/setup-julia@v3
         with:
           version: ${{ matrix.julia-version }}
 
-      - uses: julia-actions/cache@v2
+      - uses: julia-actions/cache@v3
 
       # On Windows, MinGW-w64 is pre-installed at C:\msys64\mingw64\bin but is not
       # on PATH. Add it so that _find_cc() finds gcc and objdump is available for
