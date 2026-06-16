@@ -6,16 +6,14 @@ using ParselTongue
 # Julia test process). A successful --trim=safe build is itself the trim-cleanliness
 # proof — juliac errors on any dynamic dispatch in an exported path.
 
-# On Windows, Julia DLLs live in Sys.BINDIR (no rpaths). Add it to PATH so the
-# Python subprocess can load the .pyd extension.
+# On Windows, Julia DLLs live in Sys.BINDIR (no rpaths). os.add_dll_directory
+# registers the directory for DLL search before extension module loading.
+_win_dll_preamble() = Sys.iswindows() ?
+    "import os; os.add_dll_directory($(repr(Sys.BINDIR)))\n" : ""
+
 function _py_run(script::AbstractString)
     py = Sys.which("python3")
-    cmd = `$py -c $script`
-    if Sys.iswindows()
-        path = string(Sys.BINDIR, ";", get(ENV, "PATH", ""))
-        cmd = addenv(cmd, "PATH" => path)
-    end
-    read(cmd, String)
+    read(`$py -c $script`, String)
 end
 
 function _have_tools()
@@ -37,7 +35,7 @@ end
 
         # Drive the extension from a clean subprocess and report pass/fail.
         script = """
-        import sys, array, cmath
+        $(_win_dll_preamble())import sys, array, cmath
         sys.path.insert(0, $(repr(outdir)))
         import feature
         assert feature.add(40, 2) == 42
@@ -156,7 +154,7 @@ end
         @test occursin("abi3", basename(so))
 
         script = """
-        import sys
+        $(_win_dll_preamble())import sys
         sys.path.insert(0, $(repr(outdir)))
         import feature
         assert feature.add(40, 2) == 42,         "add"
