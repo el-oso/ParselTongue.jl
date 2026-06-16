@@ -84,6 +84,9 @@ function build_extension(user_path::AbstractString;
                          strip_abs_rpath::Bool=false,
                          keep_build::Bool=false,
                          verbose::Bool=false,
+                         # Internal: extra source files to `include` in the juliac entry
+                         # (multi-module wheels aggregate several sources into one image).
+                         _extra_includes::Vector{String}=String[],
                          # Internal: pass (exports, errors, handle_types, methods) from
                          # build_wheel to skip the second include of the user source (the
                          # first is in build_wheel).
@@ -124,7 +127,8 @@ function build_extension(user_path::AbstractString;
     # Use invokelatest: @pyhandle definitions in the sandbox bump the world counter,
     # so c_abi_type dispatch inside the codegen must use the current latest world.
     entry_path = joinpath(builddir, "_pt_entry.jl")
-    write(entry_path, Base.invokelatest(emit_entry, exports, user_path; errors, methods))
+    write(entry_path, Base.invokelatest(emit_entry, exports, user_path; errors, methods,
+                                        extra_includes=_extra_includes))
 
     # 3. Run juliac --trim to produce the trimmed object archive.
     img = joinpath(builddir, "img.a")

@@ -11,14 +11,21 @@ cannot coexist.
 
 ```python
 import mathx     # ok
-import strx      # abort: a second libjulia is loaded
+import strx      # abort: a second libjulia re-runs jl_init and aborts the process
 ```
 
-Build the functions you need to use together into a **single** module — and use
-[`@pymodule pkg.sub`](/examples/scientific#Submodules) to split one extension's API
-across Python submodules (`pkg.linalg`, `pkg.dsp`, …), all backed by one image, so
-`import pkg.linalg` and `import pkg.dsp` coexist fine. A shared-runtime mode (one
-libjulia across *separate* extensions) is future work.
+Each separately compiled extension embeds its own trimmed system image and runs
+`jl_init` on first use; a second one aborts in `jl_init_threadtls`, even if both
+link the same `libjulia`. The fix is to keep everything behind **one** compiled
+extension and split the API at the Python level:
+
+- **Within one source file:** use [`@pymodule pkg.sub`](/examples/scientific#Submodules)
+  to expose submodules (`pkg.linalg`, `pkg.dsp`, …), all backed by one image, so
+  `import pkg.linalg` and `import pkg.dsp` coexist fine.
+- **Across several source files:** [`build_multi_wheel(["a.jl", "b.jl"], "pkg")`](/reference/api#Building)
+  aggregates them into one extension and exposes each file as a submodule
+  (`pkg.a`, `pkg.b`) — they import and run together in one process. Function names
+  must be unique across the files (they share one C method table).
 
 ## Wheel size (~100 MB)
 

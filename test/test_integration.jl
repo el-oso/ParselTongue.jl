@@ -243,3 +243,73 @@ end
         @test occursin(r"feature/_feature\..*\.so", names)
     end
 end
+
+# Item N: build_multi_wheel aggregates several @pymodule files into ONE extension
+# (one jl_init) exposed as submodules, so they co-import in one process. Two
+# separately-trimmed .so's cannot — each re-runs jl_init and aborts. Uses
+# runtime=:system (no vendoring) for speed; on Linux the loader needs
+# LD_LIBRARY_PATH set in the *environment* before launch (setting it from inside
+# __init__.py does not affect the already-initialised loader), so the import check
+# sets JULIA_BINDIR + LD_LIBRARY_PATH explicitly here.
+@testset "integration: build_multi_wheel (item N)" begin
+    if !_have_tools()
+        @info "skipping build_multi_wheel integration test (need python3, a C compiler, and juliac)"
+        @test_skip true
+    else
+        geo = joinpath(@__DIR__, "fixtures", "multi", "geo.jl")
+        num = joinpath(@__DIR__, "fixtures", "multi", "num.jl")
+        dup = joinpath(@__DIR__, "fixtures", "multi", "dup.jl")
+
+        # Duplicate function name across sources is rejected (before any juliac run).
+        @test_throws ErrorException build_multi_wheel([geo, dup], "bad"; runtime=:system,
+                                                      outdir=mktempdir())
+
+        outdir = mktempdir()
+        whl = build_multi_wheel([geo, num], "mathpkg"; runtime=:system,
+                                outdir=outdir, version="0.2.0")
+        @test isfile(whl)
+        # One extension; two submodule re-export files.
+        names = _py_run("""
+        import zipfile
+        with zipfile.ZipFile($(repr(whl))) as z:
+            print("\\n".join(z.namelist()))
+        """)
+        @test occursin("mathpkg/__init__.py", names)
+        @test occursin("mathpkg/geo.py", names)
+        @test occursin("mathpkg/num.py", names)
+        @test occursin(r"mathpkg/_mathpkg\..*\.so", names)
+
+        if Sys.iswindows()
+            @info "Windows: multi-wheel built (co-import check skipped — see build_wheel notes)"
+        else
+            extract = joinpath(outdir, "x")
+            _py_run("""
+            import zipfile
+            zipfile.ZipFile($(repr(whl))).extractall($(repr(extract)))
+            """)
+            libdir = abspath(joinpath(Sys.BINDIR, "..", "lib"))
+            script = """
+            import sys; sys.path.insert(0, $(repr(extract)))
+            import mathpkg
+            assert mathpkg.geo.area(3.0, 4.0) == 12.0, "geo.area"
+            assert mathpkg.num.gcd_(12, 18) == 6, "num.gcd_"
+            # interleave both submodules in one process (shared runtime)
+            assert mathpkg.geo.area(2.0, 5.0) == 10.0 and mathpkg.num.gcd_(9, 6) == 3
+            print("MULTI_OK")
+            """
+            py = Sys.which("python3")
+            buf = IOBuffer()
+            cmd = setenv(`$py -c $script`,
+                         "JULIA_BINDIR" => Sys.BINDIR,
+                         "LD_LIBRARY_PATH" => "$libdir:$(joinpath(libdir, "julia"))",
+                         "HOME" => get(ENV, "HOME", ""),
+                         "PATH" => get(ENV, "PATH", ""))
+            try
+                run(pipeline(cmd, stdout=buf, stderr=buf))
+            catch e
+                error("multi-wheel co-import failed:\n$(String(take!(buf)))\n$e")
+            end
+            @test occursin("MULTI_OK", String(take!(buf)))
+        end
+    end
+end

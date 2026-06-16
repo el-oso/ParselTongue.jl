@@ -34,6 +34,7 @@ dunder (`__repr__` or `__str__`) implemented by a Julia function.
 ```@docs
 build_extension
 build_wheel
+build_multi_wheel
 build_runtime_wheel
 ```
 

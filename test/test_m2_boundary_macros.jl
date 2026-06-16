@@ -162,6 +162,16 @@ end
     @test occursin("include(", entry)
     @test occursin("pt_add", entry)
     @test Meta.parseall(entry) isa Expr
+
+    # Multi-module (item N): extra_includes adds more include()s, each preceded by
+    # a _MODULE_NAME reset so every source can use its own bare @pymodule name.
+    extra = tempname() * ".jl"
+    write(extra, "mul(a,b) = a * b\n")
+    entry2 = emit_entry(_EXPORTS, tmp; extra_includes=[extra])
+    @test occursin(repr(abspath(tmp)), entry2)
+    @test occursin(repr(abspath(extra)), entry2)
+    @test occursin("ParselTongue._MODULE_NAME[] = nothing", entry2)
+    @test Meta.parseall(entry2) isa Expr
 end
 
 # ── Scientific-computing type expansion (Phases A–F) ──────────────────

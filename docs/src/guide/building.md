@@ -66,6 +66,26 @@ the `parseltongue-runtime` dependency. The wheel itself is still produced by
 juliac — the `pyproject.toml` documents project metadata for publishing tools.
 On the CLI: `pt wheel mymod.jl --emit-pyproject`.
 
+### Multi-module wheels
+
+To ship several modules that import together in one Python process, aggregate
+their source files into a single extension with
+[`build_multi_wheel`](/reference/api#Building):
+
+```julia
+# geo.jl:  @pymodule geo begin … end
+# num.jl:  @pymodule num begin … end
+build_multi_wheel(["geo.jl", "num.jl"], "mathpkg"; outdir="dist")
+# python -c "import mathpkg; mathpkg.geo.area(3,4); mathpkg.num.gcd_(12,18)"
+```
+
+Each file's bare `@pymodule <name>` becomes a submodule `mathpkg.<name>`. They
+share **one** Julia runtime image (one `jl_init`), which is required — two
+separately compiled extensions cannot coexist in a process (see
+[Limitations](/guide/limitations#One-extension-per-Python-process)). Function
+names must be unique across the files (they share one C method table). All the
+`runtime`, `slim`, `abi3`, and `emit_pyproject` options work as in `build_wheel`.
+
 ### Trim modes
 
 `--trim=safe` (the default) makes juliac **error at build time** if an exported

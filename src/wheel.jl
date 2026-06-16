@@ -158,6 +158,23 @@ function build_wheel(user_path::AbstractString;
                          strip_abs_rpath=true, keep_build, verbose,
                          _preloaded=preloaded)
 
+    return _assemble_wheel(so, pkgdir, stage, mod, ext_name, exports, handle_types;
+                           runtime, slim, abi3, python, manylinux, version,
+                           emit_pyproject, outdir, verbose)
+end
+
+# Steps 2–6 of wheel assembly, shared by build_wheel and build_multi_wheel:
+# vendor the runtime, write package __init__/submodule files, dist-info metadata,
+# zip the .whl, and optionally emit a pyproject.toml. `so` is the compiled
+# extension already placed in `pkgdir`; `exports`/`handle_types` describe its API.
+function _assemble_wheel(so::AbstractString, pkgdir::AbstractString, stage::AbstractString,
+                         mod::AbstractString, ext_name::AbstractString,
+                         exports::AbstractVector{PtExport},
+                         handle_types::AbstractVector{<:Type};
+                         runtime::Symbol, slim::Bool, abi3::Bool,
+                         python::AbstractString, manylinux::Union{Bool,AbstractString},
+                         version::AbstractString, emit_pyproject::Bool,
+                         outdir::AbstractString, verbose::Bool)
     # 2. Vendor the Julia runtime (bundled only).
     if runtime === :bundled
         if Sys.iswindows()
@@ -229,6 +246,111 @@ function build_wheel(user_path::AbstractString;
         verbose && @info "ParselTongue: wrote $pyproj"
     end
     return whl_path
+end
+
+"""
+    build_multi_wheel(sources, mod_name; version="0.1.0", outdir="dist",
+                      python="python3", trim=:safe, abi3=false,
+                      manylinux=true, runtime=:bundled, slim=false,
+                      emit_pyproject=false, keep_build=false, verbose=false) -> String
+
+Package several `@pymodule` source files into **one** wheel that shares a single
+Julia runtime image, so the modules can be imported together in one Python process.
+
+Two separately `--trim`-compiled extensions cannot coexist — each embeds a trimmed
+system image and re-runs `jl_init`, which aborts on the second import. Instead this
+aggregates every source into **one** compiled extension (`_<mod_name>`) and exposes
+each source file as a Python **submodule** of the top-level package `mod_name`.
+
+Each `source` must declare a bare top-level `@pymodule <name>`; `<name>` becomes the
+submodule name (`mod_name.<name>`). Function (Python) names must be unique across all
+sources — they share one C method table. Example:
+
+```julia
+# aa.jl:  @pymodule aa begin … end
+# bb.jl:  @pymodule bb begin … end
+build_multi_wheel(["aa.jl", "bb.jl"], "mypkg")
+# → mypkg/{__init__.py, aa.py, bb.py, _mypkg.<ext>.so [, julia/…]}
+#   python -c "import mypkg; mypkg.aa.f(); mypkg.bb.g()"
+```
+
+The `runtime`, `slim`, `abi3`, `manylinux`, and `emit_pyproject` options behave as in
+[`build_wheel`](@ref).
+"""
+function build_multi_wheel(sources::AbstractVector{<:AbstractString},
+                           mod_name::AbstractString;
+                           version::AbstractString="0.1.0",
+                           outdir::AbstractString="dist",
+                           python::AbstractString="python3",
+                           trim::Symbol=:safe,
+                           abi3::Bool=false,
+                           manylinux::Union{Bool,AbstractString}=true,
+                           runtime::Symbol=:bundled,
+                           slim::Bool=false,
+                           emit_pyproject::Bool=false,
+                           keep_build::Bool=false,
+                           verbose::Bool=false)
+    runtime in (:bundled, :shared, :system) ||
+        error("ParselTongue: runtime must be :bundled, :shared, or :system, got :$runtime")
+    isempty(sources) && error("ParselTongue: build_multi_wheel needs at least one source.")
+    _is_valid_modname(mod_name) || error("ParselTongue: invalid module name '$mod_name'.")
+    paths = String[abspath(s) for s in sources]
+    for p in paths
+        isfile(p) || error("ParselTongue: source file not found: $p")
+    end
+
+    # Include each source in isolation; its top-level @pymodule name becomes a
+    # submodule of `mod_name`, and its exports are re-tagged with that submodule.
+    all_exports = PtExport[]; all_errors = PtError[]
+    all_handles = Type[];     all_methods = PtMethod[]
+    seen_names = Dict{String,String}()   # export_name → submodule (for collision report)
+    for p in paths
+        clear_exports!(); _MODULE_NAME[] = nothing
+        sandbox = Module(:ParselTongueMultiSandbox)
+        Core.eval(sandbox, :(using ParselTongue))
+        Base.include(sandbox, p)
+        isempty(_EXPORTS) &&
+            error("ParselTongue: no @pyfunc exports found in $p.")
+        sub = _MODULE_NAME[]
+        sub === nothing &&
+            error("ParselTongue: $p must declare a top-level `@pymodule <name>` " *
+                  "(its name becomes the submodule).")
+        _is_valid_modname(sub) || error("ParselTongue: invalid submodule name '$sub' in $p.")
+        any(!isempty(e.submodule) for e in _EXPORTS) &&
+            error("ParselTongue: $p uses a nested `@pymodule pkg.sub`; build_multi_wheel " *
+                  "expects each file to use one bare `@pymodule <name>`.")
+        for e in _EXPORTS
+            if haskey(seen_names, e.export_name)
+                error("ParselTongue: duplicate function name '$(e.export_name)' in " *
+                      "submodules '$(seen_names[e.export_name])' and '$sub' — names must " *
+                      "be unique across all sources (they share one C method table).")
+            end
+            seen_names[e.export_name] = sub
+            push!(all_exports, PtExport(e.jl_func, e.export_name, e.args, e.ret, e.mod, sub))
+        end
+        append!(all_errors, _ERRORS)
+        for T in _HANDLE_TYPES; T in all_handles || push!(all_handles, T); end
+        append!(all_methods, _METHODS)
+    end
+
+    mkpath(outdir)
+    stage = mktempdir(; prefix="ptmwheel_", cleanup=!keep_build)
+    pkgdir = joinpath(stage, mod_name); mkpath(pkgdir)
+
+    ext_name = string("_", mod_name)
+    origin = Sys.isapple() ? "@loader_path" : "\$ORIGIN"
+    rpaths = (runtime === :bundled && !Sys.iswindows()) ?
+        ["$origin/julia/lib", "$origin/julia/lib/julia"] : String[]
+    preloaded = (all_exports, all_errors, all_handles, all_methods)
+    # One extension from all sources: the first is user_path, the rest extra_includes.
+    so = build_extension(paths[1];
+                         mod_name=ext_name, outdir=pkgdir, trim, python, abi3,
+                         runtime_rpaths=rpaths, strip_abs_rpath=true, keep_build, verbose,
+                         _extra_includes=paths[2:end], _preloaded=preloaded)
+
+    return _assemble_wheel(so, pkgdir, stage, mod_name, ext_name, all_exports, all_handles;
+                           runtime, slim, abi3, python, manylinux, version,
+                           emit_pyproject, outdir, verbose)
 end
 
 # Emit a minimal PEP 621 pyproject.toml describing the (prebuilt) wheel project.
@@ -536,16 +658,23 @@ _preload()
 del _preload, _ilu, _os
 $(imports_str)$(submod_str)$(all_str)"""
     else
+        # NB: build these as explicit \n-joined single-line literals, NOT a
+        # triple-quoted block — Julia dedents `"""…"""` literals and would strip
+        # the leading indentation off the 2nd+ lines, moving them out of _preload().
         preload_body = if _os_kernel === :apple
             # ctypes global-load every *.dylib in the runtime package's lib dirs.
-            """    import ctypes as _ct, glob as _gl
-    for _lib in sorted(_gl.glob(_os.path.join(_l1, '*.dylib'))) + \\
-                sorted(_gl.glob(_os.path.join(_l2, '*.dylib'))):
-        try: _ct.CDLL(_lib, _ct.RTLD_GLOBAL)
-        except OSError: pass"""
+            join([
+                "    import ctypes as _ct, glob as _gl",
+                "    for _lib in sorted(_gl.glob(_os.path.join(_l1, '*.dylib'))) + \\",
+                "                sorted(_gl.glob(_os.path.join(_l2, '*.dylib'))):",
+                "        try: _ct.CDLL(_lib, _ct.RTLD_GLOBAL)",
+                "        except OSError: pass",
+            ], "\n")
         else
-            """    _prev = _os.environ.get('LD_LIBRARY_PATH', '')
-    _os.environ['LD_LIBRARY_PATH'] = ':'.join(x for x in (_l1, _l2, _prev) if x)"""
+            join([
+                "    _prev = _os.environ.get('LD_LIBRARY_PATH', '')",
+                "    _os.environ['LD_LIBRARY_PATH'] = ':'.join(x for x in (_l1, _l2, _prev) if x)",
+            ], "\n")
         end
         """\"\"\"$mod — built with ParselTongue. Requires parseltongue-runtime.\"\"\"
 import importlib.util as _ilu, os as _os
@@ -630,15 +759,21 @@ _preload()
 del _preload, _os, _sh
 $(imports_str)$(submod_str)$(all_str)"""
     else
+        # See note in _write_shared_pkg_pyfiles: \n-joined literals avoid the
+        # triple-quote dedent that would unindent the preload body.
         preload_body = if _os_kernel === :apple
-            """    import ctypes as _ct, glob as _gl
-    for _lib in sorted(_gl.glob(_os.path.join(_l1, '*.dylib'))) + \\
-                sorted(_gl.glob(_os.path.join(_l2, '*.dylib'))):
-        try: _ct.CDLL(_lib, _ct.RTLD_GLOBAL)
-        except OSError: pass"""
+            join([
+                "    import ctypes as _ct, glob as _gl",
+                "    for _lib in sorted(_gl.glob(_os.path.join(_l1, '*.dylib'))) + \\",
+                "                sorted(_gl.glob(_os.path.join(_l2, '*.dylib'))):",
+                "        try: _ct.CDLL(_lib, _ct.RTLD_GLOBAL)",
+                "        except OSError: pass",
+            ], "\n")
         else
-            """    _prev = _os.environ.get('LD_LIBRARY_PATH', '')
-    _os.environ['LD_LIBRARY_PATH'] = ':'.join(x for x in (_l1, _l2, _prev) if x)"""
+            join([
+                "    _prev = _os.environ.get('LD_LIBRARY_PATH', '')",
+                "    _os.environ['LD_LIBRARY_PATH'] = ':'.join(x for x in (_l1, _l2, _prev) if x)",
+            ], "\n")
         end
         """\"\"\"$mod — built with ParselTongue. Requires Julia ≥ 1.12 on the system.\"\"\"
 import os as _os, shutil as _sh

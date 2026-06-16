@@ -325,13 +325,29 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   `twine upload` / PyPI. Also exposed as `pt wheel … --emit-pyproject`.
   Files: `src/wheel.jl` (`_write_pyproject`), `src/cli.jl`. **Done v0.12.0.**
 
-- [ ] **N. Multi-module wheels** — package several `@pymodule` source files into one wheel so
-  they share a single Julia runtime image and can be imported together in one Python process.
-  Avoids the one-extension-per-process limitation for same-runtime extensions. Approach:
-  one `juliac --trim` invocation per module (or a single combined entry file); one
-  `_<mod>.<ext>.so` per module; a top-level `__init__.py` that loads them all. Significant
-  rpath / runtime-vendoring complexity — spike first.
-  Files: `src/build.jl`, `src/wheel.jl`. Effort L · Risk M.
+- [x] **N. Multi-module wheels** — `build_multi_wheel(sources, mod_name; …)` packages several
+  `@pymodule` source files into one wheel that shares a single Julia runtime image and can be
+  imported together in one Python process.
+  **Spike finding** (`spike/multi/run_spike.jl`): two *separately* `--trim`-compiled `.so`s
+  cannot coexist — each embeds a trimmed system image and re-runs `jl_init`, aborting in
+  `jl_init_threadtls` (SIGABRT) on the second import, even when both link the same libjulia.
+  So multi-module is implemented as **one** compiled extension (one `jl_init`) with
+  **Python-level submodules**: all sources are `include`d into a single juliac entry, each
+  file's bare `@pymodule <name>` becomes submodule `mod_name.<name>`, and the proven
+  submodule re-export machinery (`_write_pkg_pyfiles`) exposes them. Function names must be
+  unique across sources (one C method table). The entry resets `_MODULE_NAME` between
+  includes so each file keeps its own bare name. Reuses all runtime/vendoring options via the
+  extracted `_assemble_wheel` helper.
+  Files: `src/ccallable_gen.jl` (`extra_includes`), `src/build.jl` (`_extra_includes`),
+  `src/wheel.jl` (`build_multi_wheel`, `_assemble_wheel`). **Done v0.13.0.**
+
+  Also fixed in passing: the `:system`/`:shared` runtime `__init__.py` preload body was
+  emitted via a triple-quoted literal that Julia *dedents*, unindenting the 2nd+ lines out
+  of the `_preload()` function (a `NameError`/`IndentationError` at import). Now built from
+  explicit `\n`-joined line literals. (Note: setting `LD_LIBRARY_PATH` from inside
+  `__init__.py` does not affect glibc's already-initialised loader on Linux — a separate
+  known limitation of `runtime=:system`/`:shared`; `runtime=:bundled` uses baked rpaths and
+  is unaffected.)
 
 ## Audit findings — 2026-06-16 (open)
 
