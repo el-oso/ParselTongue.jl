@@ -15,7 +15,12 @@ using ParselTongue
 # lib/julia contains additional support DLLs (OpenBLAS, etc.).
 function _win_dll_preamble()
     Sys.iswindows() || return ""
-    dirs = String[Sys.BINDIR, joinpath(Sys.LIBDIR, "julia")]
+    # Sys.BINDIR holds libjulia*.dll plus Julia's bundled MinGW-w64 runtime
+    # DLLs. lib/julia has OpenBLAS and other support DLLs.
+    # Do NOT add a system MinGW bin/ — version conflicts break libjulia-codegen.
+    julia_prefix = dirname(Sys.BINDIR)
+    dirs = filter(isdir, String[Sys.BINDIR,
+                                joinpath(julia_prefix, "lib", "julia")])
     calls = join(["os.add_dll_directory($(repr(d)))" for d in unique(dirs)], "; ")
     "import os; $calls\n"
 end
