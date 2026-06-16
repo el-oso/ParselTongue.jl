@@ -81,7 +81,7 @@ const _EXPORTS = PtExport[]
 
 Reset the export registry. Called at the start of each `build_extension`.
 """
-clear_exports!() = (empty!(_EXPORTS); empty!(_ERRORS); _MODULE_NAME[] = nothing; _CURRENT_SUBMODULE[] = ""; nothing)
+clear_exports!() = (empty!(_EXPORTS); empty!(_ERRORS); empty!(_HANDLE_TYPES); _MODULE_NAME[] = nothing; _CURRENT_SUBMODULE[] = ""; nothing)
 
 # Distinct, ordered submodule names among `exports` (excluding the "" top level).
 function submodule_names(exports::AbstractVector{PtExport})

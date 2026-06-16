@@ -3,9 +3,10 @@ using ParselTongue
 # Opaque-handle example: a 2-D point stored on the C heap.
 #
 # @pyhandle T requires T to be an isbitstype (immutable struct with all-isbits
-# fields). Python sees a PyCapsule; free() is called when the capsule is GC'd.
-# Mutation is functional: each "update" returns a new handle (old one is freed
-# when Python drops its reference).
+# fields). Each handle type becomes a real Python class (isinstance, repr, and
+# tab-completion all work). free() is called automatically by tp_dealloc when
+# Python GC's the object.  Mutation is functional: each "update" returns a new
+# handle; the old one is freed when Python drops its reference.
 
 struct Point2D
     x::Float64

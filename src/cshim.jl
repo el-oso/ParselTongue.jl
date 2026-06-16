@@ -108,7 +108,8 @@ const _ELTINFO = Dict{Type,EltInfo}(
 
 isarray(@nospecialize(C::Type)) = C isa DataType && C.name === PtArray.body.body.name
 isstrarr(@nospecialize(C::Type)) = C === PtStrArray
-ishandle(@nospecialize(C::Type)) = C === PtHandle
+ishandle(@nospecialize(C::Type)) = C isa DataType && C.name === PtHandle.body.name
+_handle_julia_name(@nospecialize(C::Type)) = string(C.parameters[1].name.name)
 ispycallable(@nospecialize(C::Type)) = C === Ptr{Cvoid}
 _elt(@nospecialize(C::Type)) = _ELTINFO[C.parameters[1]]      # T from PtArray{T,N}
 _ndims(@nospecialize(C::Type)) = C.parameters[2]::Int         # N from PtArray{T,N}
@@ -133,7 +134,7 @@ function _carrier_tag(@nospecialize(C::Type))
         GuardBy(==(Cstring))  => "str"
         GuardBy(isarray)      => _structname(C)
         GuardBy(isstrarr)     => "stra"
-        GuardBy(ishandle)     => "handle"
+        GuardBy(ishandle)     => string("handle_", _handle_julia_name(C))
         GuardBy(ispycallable) => "pycallable"
         GuardBy(isopt)        => string("opt_", _carrier_tag(_opt_inner_c(C)))
         GuardBy(isdict)       => string("dict_", _carrier_tag(_dict_val_c(C)))
@@ -328,18 +329,16 @@ function _ap_array(tmp::String, @nospecialize(C::Type), logical::Bool, mutable::
             [string("PyBuffer_Release(&", buf, ");")])
 end
 
-function _ap_handle(tmp::String)
-    obj = string(tmp, "_obj"); ptr = string(tmp, "_ptr")
+function _ap_handle(tmp::String, tname::String)
+    obj = string(tmp, "_obj")
     decls = [
         string("PyObject *", obj, " = NULL;"),
-        string("void *", ptr, ";"),
         string("PtHandle ", tmp, ";"),
     ]
     setup = [
-        string("if (!PyCapsule_CheckExact(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"expected a PtHandle capsule\"); return NULL; }"),
-        string(ptr, " = PyCapsule_GetPointer(", obj, ", NULL);"),
-        string("if (!", ptr, ") return NULL;"),
-        string(tmp, ".ptr = ", ptr, ";"),
+        string("if (!PyObject_TypeCheck(", obj, ", (PyTypeObject *)_PtType_", tname, ")) {"),
+        string("    PyErr_SetString(PyExc_TypeError, \"expected ", tname, " object\"); return NULL; }"),
+        string(tmp, ".ptr = ((_PtObj_", tname, " *)", obj, ")->_data;"),
     ]
     ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
 end
@@ -454,7 +453,7 @@ function _arg_plan(@nospecialize(C::Type), i::Int; logical::Bool=false, mutable:
         GuardBy(==(Cstring))  => _ap_str(tmp)
         GuardBy(isstrarr)     => _ap_stra(tmp)
         GuardBy(isarray)      => _ap_array(tmp, C, logical, mutable)
-        GuardBy(ishandle)     => _ap_handle(tmp)
+        GuardBy(ishandle)     => _ap_handle(tmp, _handle_julia_name(C))
         GuardBy(isopt)        => _ap_opt(tmp, C, abi3)
         GuardBy(isdict)       => _ap_dict(tmp, C)
         GuardBy(ispycallable) => _ap_pycallable(tmp)
@@ -484,8 +483,9 @@ function _bp_stra(val::AbstractString, out::AbstractString)
     [string("PyObject *", out, " = _pt_strarray_to_list(", val, ".data, ", val, ".len);")]
 end
 
-function _bp_handle(val::AbstractString, out::AbstractString)
-    [string("PyObject *", out, " = PyCapsule_New(", val, ".ptr, NULL, _pt_capsule_free);")]
+function _bp_handle(@nospecialize(C::Type), val::AbstractString, out::AbstractString)
+    tname = _handle_julia_name(C)
+    [string("PyObject *", out, " = _pt_make_obj_", tname, "(", val, ");")]
 end
 
 function _bp_pycallable(val::AbstractString, out::AbstractString)
@@ -566,7 +566,7 @@ function _build_pyobject(@nospecialize(C::Type), val::AbstractString, out::Abstr
         GuardBy(iscomplex)    => _bp_complex(val, out)
         GuardBy(==(Cstring))  => _bp_str(val, out)
         GuardBy(isstrarr)     => _bp_stra(val, out)
-        GuardBy(ishandle)     => _bp_handle(val, out)
+        GuardBy(ishandle)     => _bp_handle(C, val, out)
         GuardBy(ispycallable) => _bp_pycallable(val, out)
         GuardBy(isarray)      => _bp_array(C, val, out)
         GuardBy(isopt)        => _bp_opt(C, val, out)
@@ -1033,16 +1033,58 @@ static PyObject *_pt_strarray_to_list(char **data, int64_t len) {
 }
 """
 
-const _WRAP_HANDLE_HELPER = """
-/* PtHandle: carrier for opaque-handle types (@pyhandle).  The handle is a
-   malloc'd copy of an isbitstype Julia struct on the C heap.  Python sees a
-   PyCapsule whose destructor calls free() when Python GC collects it.
-   Constructor @pyfuncs return PtHandle; method @pyfuncs receive it as arg. */
+const _PTHANDLE_TYPEDEF = """
+/* PtHandle: C-ABI carrier for @pyhandle types (parameterized in Julia, type-erased in C). */
 typedef struct { void *ptr; } PtHandle;
-static void _pt_capsule_free(PyObject *cap) {
-    free(PyCapsule_GetPointer(cap, NULL));
-}
 """
+
+# Emit per-type C structs, destructors, PyType_Spec, make-object helpers.
+# Each @pyhandle T gets a proper PyTypeObject so Python sees `mod.T` as a real class.
+function _emit_handle_type_defs(io::IO, mod_name::AbstractString, handle_types::AbstractVector{<:Type})
+    isempty(handle_types) && return
+    println(io, "/* @pyhandle types: each becomes a real Python class (isinstance, repr, etc.) */")
+    for T in handle_types
+        tname = string(T.name.name)
+        println(io, "typedef struct { PyObject_HEAD void *_data; } _PtObj_$tname;")
+        println(io, "static void _pt_dealloc_$tname(PyObject *self) {")
+        println(io, "    free(((_PtObj_$tname *)self)->_data);")
+        println(io, "    PyObject_Free(self);")
+        println(io, "}")
+        println(io, "static PyObject *_pt_repr_$tname(PyObject *self) {")
+        println(io, "    return PyUnicode_FromString(\"<$tname>\");")
+        println(io, "}")
+        println(io, "static PyType_Slot _pt_slots_$tname[] = {")
+        println(io, "    {Py_tp_dealloc, (void *)_pt_dealloc_$tname},")
+        println(io, "    {Py_tp_repr,    (void *)_pt_repr_$tname},")
+        println(io, "    {0, NULL}")
+        println(io, "};")
+        println(io, "static PyType_Spec _pt_spec_$tname = {")
+        println(io, "    \"$mod_name.$tname\", sizeof(_PtObj_$tname), 0,")
+        println(io, "    Py_TPFLAGS_DEFAULT, _pt_slots_$tname")
+        println(io, "};")
+        println(io, "static PyObject *_PtType_$tname = NULL;")
+        println(io, "static PyObject *_pt_make_obj_$tname(PtHandle h) {")
+        println(io, "    _PtObj_$tname *obj = (_PtObj_$tname *)")
+        println(io, "        PyType_GenericAlloc((PyTypeObject *)_PtType_$tname, 0);")
+        println(io, "    if (!obj) { free(h.ptr); return NULL; }")
+        println(io, "    obj->_data = h.ptr;")
+        println(io, "    return (PyObject *)obj;")
+        println(io, "}")
+    end
+    println(io)
+end
+
+# Emit PyInit_<mod> lines that create and register each handle type.
+function _emit_handle_type_inits(io::IO, mod_name::AbstractString, handle_types::AbstractVector{<:Type})
+    for T in handle_types
+        tname = string(T.name.name)
+        println(io, "    _PtType_$tname = PyType_FromSpec(&_pt_spec_$tname);")
+        println(io, "    if (!_PtType_$tname) { Py_DECREF(m); return NULL; }")
+        println(io, "    Py_INCREF(_PtType_$tname);")
+        println(io, "    if (PyModule_AddObject(m, \"$tname\", _PtType_$tname) < 0) {")
+        println(io, "        Py_DECREF(_PtType_$tname); Py_DECREF(m); return NULL; }")
+    end
+end
 
 const _WRAP_ARRAY_HELPER = """
 /* _PtBuf: a minimal Python object that owns a malloc'd byte buffer and exposes it
@@ -1108,17 +1150,21 @@ static PyObject *_pt_wrap_ndarray(void *data, Py_ssize_t nbytes, const char *dty
 """
 
 """
-    emit_cshim(mod_name, exports; doc="", abi3=false) -> String
+    emit_cshim(mod_name, exports, errors, handle_types; doc="", abi3=false) -> String
 
 Return the full C source of the CPython extension module `mod_name` exporting
 `exports`. Compile + link with the trimmed `img.a` to get an importable extension.
+
+`handle_types` is the list of Julia types registered with `@pyhandle`; each gets
+a proper `PyTypeObject` so Python sees `mod.T` as a real class.
 
 When `abi3=true` the shim defines `Py_LIMITED_API 0x030B0000` (Python 3.11 floor —
 the version that added `PyObject_GetBuffer` to the stable ABI) and emits only
 stable-ABI calls. The resulting `.abi3.so` is compatible with any CPython ≥ 3.11.
 """
 function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
-                    errors::Vector{PtError}=PtError[];
+                    errors::Vector{PtError}=PtError[],
+                    handle_types::Vector{<:Type}=Type[];
                     doc::AbstractString="", abi3::Bool=false)
     isempty(doc) && (doc = "ParselTongue extension (Julia via juliac --trim)")
     io = IOBuffer()
@@ -1153,8 +1199,9 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
         print(io, _WRAP_STRARR_HELPER)
     end
     if _uses_handles(exports)
-        print(io, _WRAP_HANDLE_HELPER)
+        print(io, _PTHANDLE_TYPEDEF)
     end
+    _emit_handle_type_defs(io, mod_name, handle_types)
     structs = _array_structs(exports)
     if !isempty(structs)
         println(io, "/* C-ABI carriers for N-D arrays (match Julia PtArray{T,N}) */")
@@ -1220,11 +1267,12 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
         println(io, "    if (!_PtBufType) return NULL;")
     end
     println(io, "    /* trimmed Julia lib self-initializes on first @ccallable call */")
-    if isempty(errors)
+    if isempty(errors) && isempty(handle_types)
         println(io, "    return PyModule_Create(&", mod_name, "_module);")
     else
         println(io, "    PyObject *m = PyModule_Create(&", mod_name, "_module);")
         println(io, "    if (!m) return NULL;")
+        _emit_handle_type_inits(io, mod_name, handle_types)
         for s in _error_inits(mod_name, errors)
             println(io, "    ", s)
         end

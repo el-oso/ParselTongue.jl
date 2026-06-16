@@ -14,7 +14,7 @@ the Python object graph you can reach from native code.
 | Annotation | `@pyfunc` / `@pymodule` | `#[pyfunction]` / `#[pymodule]` |
 | Build command | `build_wheel("file.jl")` | `maturin build` |
 | Type mapping | Explicit boundary contract | Derive macros + `FromPyObject` / `IntoPyObject` |
-| Classes | `@pyhandle` (isbits structs only) | `#[pyclass]` (full object protocol) |
+| Classes | `@pyhandle` (isbits structs → real Python types; `isinstance` / `repr` work) | `#[pyclass]` (full object protocol) |
 | Custom exceptions | `@pyerror MyError <: ValueError` | `create_exception!` |
 | Python callables | `PyCallable` (Float64→Float64 now) | `Py<PyAny>` / `PyCallable` (any signature) |
 | GIL release during call | Yes (automatic) | Yes (opt-in with `py.allow_threads`) |
@@ -112,9 +112,10 @@ impl Counter {
 
 **ParselTongue** has `@pyhandle`, which is deliberately more restricted:
 only `isbitstype` structs (no heap-allocated fields, no Julia GC interaction).
-A handle is allocated on the C heap and returned as a `PyCapsule`; Julia
-"methods" are ordinary `@pyfunc`s that receive and return handles. Mutation is
-**functional** (return a new handle):
+Each handle type becomes a real Python class via `PyType_FromSpec`, so
+`isinstance`, `repr`, and tab-completion all work. Julia "methods" are ordinary
+`@pyfunc`s that receive and return handles. Mutation is **functional** (return a
+new handle); `tp_dealloc` frees the C-heap allocation automatically:
 
 ```julia
 struct Point; x::Float64; y::Float64; end
@@ -125,10 +126,16 @@ struct Point; x::Float64; y::Float64; end
 @pyfunc norm(p::Point)::Float64 = sqrt(p.x^2 + p.y^2)
 ```
 
-The `@pyhandle` restriction exists because full Python object protocol (GC roots,
-`__del__`, `__repr__`, attribute access) requires dynamic dispatch that
-`--trim=safe` would reject. If you need Python-level classes, `@pyhandle` won't
-cover it.
+```python
+import mymod
+p = mymod.make_point(3.0, 4.0)
+isinstance(p, mymod.Point)   # True
+repr(p)                      # '<Point>'
+```
+
+The `@pyhandle` restriction exists because GC rooting and arbitrary dunder
+protocols require dynamic dispatch that `--trim=safe` would reject. User-defined
+dunders and Python inheritance are not supported.
 
 ## Error handling
 

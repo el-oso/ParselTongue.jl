@@ -118,8 +118,9 @@ metadata. The boundary type system reuses
 
 v0.16 — full build pipeline shipping: scalars, strings, N-D numeric arrays,
 `ComplexF64`, `Vector{String}`, `Dict{String,V}`, `Vector{UInt8}` (bytes),
-`Union{T,Nothing}` (Optional), `NamedTuple`, `Tuple`, opaque handles
-(`@pyhandle`), custom Python exception types (`@pyerror`), keyword/default
+`Union{T,Nothing}` (Optional), `NamedTuple`, `Tuple`, real-Python-class opaque
+handles (`@pyhandle` — `isinstance` and `repr` work), custom Python exception
+types (`@pyerror`), keyword/default
 arguments, manylinux tagging, abi3 stable-ABI wheels, shared-runtime wheels,
 slim bundling, startup benchmarking, and a compiled `pt` CLI binary.
 See `examples/`, `app/`, and `ROADMAP.md`.

@@ -94,14 +94,18 @@ end
         d = feature.describe(_array.array("d", [1.0, 3.0, 2.0]))
         assert isinstance(d, dict), f"describe() must return dict, got {type(d)}"
         assert d["min"] == 1.0 and d["max"] == 3.0 and d["n"] == 3, f"wrong describe: {d}"
-        # Opaque handle types (item 12): PyCapsule lifecycle
+        # Opaque handle types (item 12): real Python classes (isinstance, repr)
         p = feature.make_point(3.0, 4.0)
+        assert isinstance(p, feature.Pt2D), f"expected Pt2D instance, got {type(p)}"
+        assert type(p).__name__ == "Pt2D", f"type name: {type(p).__name__}"
+        assert repr(p) == "<Pt2D>", f"repr: {repr(p)}"
         assert feature.point_x(p) == 3.0, "point_x"
         assert feature.point_y(p) == 4.0, "point_y"
         assert feature.point_norm(p) == 5.0, "point_norm 3-4-5"
         p2 = feature.point_scale(p, 2.0)
+        assert isinstance(p2, feature.Pt2D), "scaled result is Pt2D"
         assert feature.point_x(p2) == 6.0 and feature.point_y(p2) == 8.0, "point_scale"
-        del p, p2   # capsule destructors call free()
+        del p, p2   # tp_dealloc calls free()
         # Python callables as arguments (item F)
         assert feature.apply(lambda x: x * 2.0, 3.0) == 6.0,    "apply: identity"
         assert feature.apply(abs, -5.0) == 5.0,                  "apply: builtin"

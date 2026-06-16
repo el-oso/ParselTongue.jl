@@ -135,24 +135,28 @@ end
 # fields). This guarantees safe `unsafe_store!`/`unsafe_load` on C-heap memory.
 
 """
-    PtHandle
+    PtHandle{T}
 
 C-ABI carrier for opaque-handle boundary types registered with [`@pyhandle`](@ref).
 Wraps a `void *` pointing to a heap-allocated copy of the Julia struct. On the Python
-side the handle appears as a `PyCapsule`; `free` is called automatically when the
-capsule is garbage-collected.
+side the handle appears as an instance of a proper Python class (`mod.T`); the C heap
+memory is freed automatically when the Python object is garbage-collected.
 """
-struct PtHandle
+struct PtHandle{T}
     ptr::Ptr{Cvoid}
 end
+
+# Build-host registry for @pyhandle types, in registration order.
+const _HANDLE_TYPES = Type[]
 
 """
     @pyhandle T
 
 Mark the immutable, isbits struct `T` as an opaque-handle boundary type.
 After this annotation, `T` can be used as a `@pyfunc` argument or return type.
-The Python side sees a `PyCapsule`; `free` is called automatically when the
-capsule is garbage-collected.
+On the Python side `T` appears as a real Python class (`mod.T`); `isinstance`
+checks, `repr`, and tab-completion all work. The C heap allocation is freed
+automatically when the Python object is garbage-collected.
 
 `T` must satisfy `isbitstype(T)`.
 """
@@ -160,14 +164,15 @@ macro pyhandle(T_expr)
     T = Core.eval(__module__, T_expr)
     isbitstype(T) || error(
         "@pyhandle: `$T` must be an isbitstype (immutable struct with all-isbits fields).")
+    T in _HANDLE_TYPES || push!(_HANDLE_TYPES, T)
     quote
-        ParselTongue.c_abi_type(::Type{$T}) = ParselTongue.PtHandle
-        function ParselTongue.to_c(obj::$T)::ParselTongue.PtHandle
+        ParselTongue.c_abi_type(::Type{$T}) = ParselTongue.PtHandle{$T}
+        function ParselTongue.to_c(obj::$T)::ParselTongue.PtHandle{$T}
             p = Ptr{$T}(Libc.malloc(sizeof($T)))
             unsafe_store!(p, obj)
-            ParselTongue.PtHandle(Ptr{Cvoid}(p))
+            ParselTongue.PtHandle{$T}(Ptr{Cvoid}(p))
         end
-        function ParselTongue.from_c(::Type{$T}, h::ParselTongue.PtHandle)::$T
+        function ParselTongue.from_c(::Type{$T}, h::ParselTongue.PtHandle{$T})::$T
             unsafe_load(Ptr{$T}(h.ptr))
         end
         nothing

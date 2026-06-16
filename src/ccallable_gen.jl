@@ -21,7 +21,7 @@ function _zero_cval(@nospecialize(C::Type))
     iscomplex(C)  && return string("zero(", _type_src(C), ")")
     C === Cstring && return "Cstring(Ptr{UInt8}(0))"
     C === ParselTongue.PtStrArray && return "ParselTongue.PtStrArray(Ptr{Ptr{UInt8}}(0), Int64(0))"
-    C === ParselTongue.PtHandle && return "ParselTongue.PtHandle(Ptr{Cvoid}(0))"
+    ishandle(C) && return "ParselTongue.PtHandle{$(_type_src(C.parameters[1]))}(Ptr{Cvoid}(0))"
     C === Ptr{Cvoid} && return "Ptr{Cvoid}(0)"
     if ParselTongue.isopt(C)
         inner_C = ParselTongue._opt_inner_c(C)
@@ -48,8 +48,8 @@ function _type_src(@nospecialize(T::Type))
         # caller has `using ParselTongue: PtStrArray` in scope (which causes
         # string(PtStrArray) to drop the module prefix in the current session).
         return "ParselTongue.PtStrArray"
-    elseif T === PtHandle
-        return "ParselTongue.PtHandle"
+    elseif ishandle(T)
+        return "ParselTongue.PtHandle{$(_type_src(T.parameters[1]))}"
     elseif T isa DataType && T.name === PtVarArgs.body.name
         return string("ParselTongue.PtVarArgs{", _type_src(T.parameters[1]), "}")
     elseif T isa DataType && isopt(T)

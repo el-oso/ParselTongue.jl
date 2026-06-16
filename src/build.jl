@@ -84,9 +84,9 @@ function build_extension(user_path::AbstractString;
                          strip_abs_rpath::Bool=false,
                          keep_build::Bool=false,
                          verbose::Bool=false,
-                         # Internal: pass (exports, errors) from build_wheel to skip the
-                         # second include of the user source (the first is in build_wheel).
-                         _preloaded::Union{Nothing,Tuple{Vector{PtExport},Vector{PtError}}}=nothing)
+                         # Internal: pass (exports, errors, handle_types) from build_wheel to skip
+                         # the second include of the user source (the first is in build_wheel).
+                         _preloaded::Union{Nothing,Tuple{Vector{PtExport},Vector{PtError},Vector{<:Type}}}=nothing)
     user_path = abspath(user_path)
     isfile(user_path) || error("ParselTongue: source file not found: $user_path")
     trim in (:safe, :unsafe, :unsafe_warn) ||
@@ -95,7 +95,7 @@ function build_extension(user_path::AbstractString;
     # 1. Populate the export registry by including the user source in a sandbox.
     #    When called from build_wheel, the caller already included the file and passes
     #    pre-populated exports/errors to avoid a redundant second include.
-    exports, errors = if _preloaded !== nothing
+    exports, errors, handle_types = if _preloaded !== nothing
         _preloaded
     else
         clear_exports!()
@@ -103,7 +103,7 @@ function build_extension(user_path::AbstractString;
         sandbox = Module(:ParselTongueUserSandbox)
         Core.eval(sandbox, :(using ParselTongue))
         Base.include(sandbox, user_path)
-        copy(_EXPORTS), copy(_ERRORS)
+        copy(_EXPORTS), copy(_ERRORS), copy(_HANDLE_TYPES)
     end
     isempty(exports) && error(
         "ParselTongue: no @pyfunc exports found in $user_path. " *
@@ -132,7 +132,7 @@ function build_extension(user_path::AbstractString;
 
     # 4. Generate the C PyInit shim.
     cpath = joinpath(builddir, string("_", mod, "module.c"))
-    write(cpath, Base.invokelatest(emit_cshim, mod, exports, errors; abi3))
+    write(cpath, Base.invokelatest(emit_cshim, mod, exports, errors, handle_types; abi3))
 
     # 5. Link the shim + archive into the extension module.
     so_path = joinpath(outdir, string(mod, ext_suffix))

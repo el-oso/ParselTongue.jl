@@ -129,8 +129,9 @@ function build_wheel(user_path::AbstractString;
           _MODULE_NAME[] !== nothing ? _MODULE_NAME[] :
           _default_mod_name(user_path)
     _is_valid_modname(mod) || error("ParselTongue: invalid module name '$mod'.")
-    preloaded = (copy(_EXPORTS), copy(_ERRORS))
-    exports   = preloaded[1]
+    preloaded    = (copy(_EXPORTS), copy(_ERRORS), copy(_HANDLE_TYPES))
+    exports      = preloaded[1]
+    handle_types = preloaded[3]
 
     mkpath(outdir)
     stage = mktempdir(; prefix="ptwheel_", cleanup=!keep_build)
@@ -186,11 +187,11 @@ function build_wheel(user_path::AbstractString;
     os_k = _current_os_kernel()
     # 3. __init__.py + per-submodule re-export files.
     if runtime === :bundled
-        _write_pkg_pyfiles(pkgdir, ext_name, exports; _os_kernel=os_k)
+        _write_pkg_pyfiles(pkgdir, ext_name, exports, handle_types; _os_kernel=os_k)
     elseif runtime === :shared
-        _write_shared_pkg_pyfiles(pkgdir, ext_name, exports, mod; _os_kernel=os_k)
+        _write_shared_pkg_pyfiles(pkgdir, ext_name, exports, mod, handle_types; _os_kernel=os_k)
     else  # :system
-        _write_system_pkg_pyfiles(pkgdir, ext_name, exports, mod; _os_kernel=os_k)
+        _write_system_pkg_pyfiles(pkgdir, ext_name, exports, mod, handle_types; _os_kernel=os_k)
     end
 
     # 4. dist-info metadata.
@@ -214,10 +215,12 @@ end
 # single compiled extension `ext_name` (which holds every function). Top-level
 # functions (no submodule) are exposed on the package itself.
 function _write_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractString,
-                            exports::AbstractVector{PtExport};
+                            exports::AbstractVector{PtExport},
+                            handle_types::AbstractVector{<:Type}=Type[];
                             _os_kernel::Symbol=_current_os_kernel())
     subs = submodule_names(exports)
-    toplevel = [e.export_name for e in exports if isempty(e.submodule)]
+    handle_names = [string(T.name.name) for T in handle_types]
+    toplevel = vcat([e.export_name for e in exports if isempty(e.submodule)], handle_names)
 
     io = IOBuffer()
     println(io, "\"\"\"Built with ParselTongue (juliac --trim).\"\"\"")
@@ -446,10 +449,12 @@ end
 # macOS: uses ctypes.CDLL to preload Julia dylibs globally before import
 #   (DYLD_LIBRARY_PATH is not re-read after process start, so env-var trick fails).
 function _write_shared_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractString,
-                                   exports::AbstractVector{PtExport}, mod::AbstractString;
+                                   exports::AbstractVector{PtExport}, mod::AbstractString,
+                                   handle_types::AbstractVector{<:Type}=Type[];
                                    _os_kernel::Symbol=_current_os_kernel())
     subs = submodule_names(exports)
-    toplevel = [e.export_name for e in exports if isempty(e.submodule)]
+    handle_names = [string(T.name.name) for T in handle_types]
+    toplevel = vcat([e.export_name for e in exports if isempty(e.submodule)], handle_names)
     allnames = vcat(toplevel, subs)
 
     imports_str = isempty(toplevel) ? "" :
@@ -523,10 +528,12 @@ end
 # Locates Julia on the target machine at import time via env vars or PATH.
 # Linux: sets LD_LIBRARY_PATH; macOS: ctypes.CDLL preload (same as :shared).
 function _write_system_pkg_pyfiles(pkgdir::AbstractString, ext_name::AbstractString,
-                                   exports::AbstractVector{PtExport}, mod::AbstractString;
+                                   exports::AbstractVector{PtExport}, mod::AbstractString,
+                                   handle_types::AbstractVector{<:Type}=Type[];
                                    _os_kernel::Symbol=_current_os_kernel())
     subs = submodule_names(exports)
-    toplevel = [e.export_name for e in exports if isempty(e.submodule)]
+    handle_names = [string(T.name.name) for T in handle_types]
+    toplevel = vcat([e.export_name for e in exports if isempty(e.submodule)], handle_names)
     allnames = vcat(toplevel, subs)
 
     imports_str = isempty(toplevel) ? "" :

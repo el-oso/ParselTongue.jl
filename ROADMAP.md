@@ -19,8 +19,8 @@ Code map: `src/boundary.jl` (carriers + `c_abi_type`/`from_c`/`to_c`),
 
 ## Non-goals (explicit — keep the niche)
 
-- Full `#[pyclass]`-style objects with inheritance / dunder protocols (a *scoped*
-  opaque-handle track is optional — Phase 4).
+- Full `#[pyclass]`-style objects with inheritance / dunder protocols (basic
+  real-Python-type handles shipped in Phase 4; inheritance and dunder injection deferred).
 - `async`, free-threading, sub-interpreters.
 - Windows ARM64 (x86-64 shipped v0.25.0 via MinGW-w64; ARM64 depends on Julia Windows arm64 support).
 - Removing one-extension-per-process (inherent to the trim-image model; mitigated
@@ -268,13 +268,15 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
 
 ## Phase 4 — optional capability track (stateful objects)
 
-- [x] **12. Opaque-handle types (~scoped `#[pyclass]`)** — `@pyhandle T` for isbitstype
-  (immutable, all-isbits fields) structs stored on the C heap. A constructor `@pyfunc`
-  returns a `PyCapsule`; method `@pyfunc`s receive/return handles. Mutation is
-  functional (return new handles). `free` is called automatically by the capsule
-  destructor. GC-root complexity avoided by restricting to isbitstype. `build.jl` uses
-  `Base.invokelatest` so `c_abi_type` dispatch sees `@pyhandle`-registered methods.
-  `_type_src` strips sandbox module qualifiers for user-defined types. Effort L · Risk M.
+- [x] **12. Opaque-handle types → real Python classes (`@pyhandle`)** — `@pyhandle T`
+  for isbitstype (immutable, all-isbits fields) structs stored on the C heap. Each handle
+  type becomes a proper `PyTypeObject` (via `PyType_Spec`/`PyType_FromSpec`, stable-ABI
+  compatible), so `isinstance(p, mod.Point2D)`, `repr(p)` → `<Point2D>`, and tab
+  completion all work. Constructor `@pyfunc`s return handles; method `@pyfunc`s
+  receive/return handles. Mutation is functional (return new handles). `free` is called
+  automatically by the type's `tp_dealloc`. GC-root complexity avoided by restricting to
+  isbitstype. `PtHandle{T}` parameterized carrier encodes the Julia type through the
+  pipeline. No user-facing syntax change. Effort L · Risk M.
 
 ## Known correctness issues (audit findings — fix opportunistically)
 
