@@ -161,11 +161,29 @@ automatically when the Python object is garbage-collected.
 
 `T` must satisfy `isbitstype(T)`.
 """
-macro pyhandle(T_expr)
+macro pyhandle(T_expr, opts...)
+    mutable = false
+    for opt in opts
+        if opt isa Expr && opt.head === :(=) && opt.args[1] === :mutable
+            mutable = opt.args[2] === true ||
+                      (opt.args[2] isa Bool && opt.args[2])
+        end
+    end
     T = Core.eval(__module__, T_expr)
     isbitstype(T) || error(
         "@pyhandle: `$T` must be an isbitstype (immutable struct with all-isbits fields).")
     T in _HANDLE_TYPES || push!(_HANDLE_TYPES, T)
+    if mutable
+        T in _MUTABLE_HANDLE_TYPES || push!(_MUTABLE_HANDLE_TYPES, T)
+    end
+    # Whether to also register as a mutable type at evaluation time (in quote).
+    # This handles the case where clear_exports!() empties the registry between
+    # macro expansion (parse time) and the point where the registry is read.
+    mutable_push_expr = mutable ?
+        :( $T in ParselTongue._MUTABLE_HANDLE_TYPES ||
+           push!(ParselTongue._MUTABLE_HANDLE_TYPES, $T) ) :
+        :(nothing)
+
     quote
         ParselTongue.c_abi_type(::Type{$T}) = ParselTongue.PtHandle{$T}
         function ParselTongue.to_c(obj::$T)::ParselTongue.PtHandle{$T}
@@ -182,6 +200,7 @@ macro pyhandle(T_expr)
         # PyBoundary this is a no-op today. TypeContracts would need a structural form
         # (@verify T for_contract=PyBoundary trim_compat=true) to cover this case.
         TypeContracts.check_trim_compat($T)
+        $mutable_push_expr
         nothing
     end
 end

@@ -24,7 +24,7 @@ include("wheel.jl")
 # CLI (pt): also exposes julia_main() so `julia -m ParselTongue` works (Pkg Apps).
 include("cli.jl")
 
-export @pyfunc, @pymodule, @pyhandle, @pymethod, @pyerror, @boundary, build_extension, build_wheel, build_multi_wheel, build_runtime_wheel
+export @pyfunc, @pymodule, @pyhandle, @pymethod, @pyerror, @boundary, @pyproperty, build_extension, build_wheel, build_multi_wheel, build_runtime_wheel
 export bundle_size_report, startup_benchmark
 export PyBoundary, Mut, PtHandle, PtVarArgs, PyCallable, c_abi_type, from_c, to_c
 export julia_main

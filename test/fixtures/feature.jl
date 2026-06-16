@@ -1,13 +1,12 @@
 using ParselTongue
 
-# Opaque-handle type (item 12): immutable isbits struct on C heap.
-# Constructor @pyfunc returns a PyCapsule; method @pyfuncs receive/return handles.
-# Mutation is functional — each "update" returns a new handle.
+# Opaque-handle type (item 12): isbits struct on C heap.
+# mutable=true adds Py_tp_setattro so scalar fields are writable in-place (O6).
 struct Pt2D
     x::Float64
     y::Float64
 end
-@pyhandle Pt2D
+@pyhandle Pt2D mutable=true
 
 # Custom repr via @pymethod (item J): overrides the generated "<Pt2D>" default.
 @pymethod __repr__ pt2d_repr(p::Pt2D)::String = string("<Pt2D: x=", p.x, ", y=", p.y, ">")
@@ -30,6 +29,30 @@ end
 
 # __new__ (item O5): constructor syntax Pt2D(x, y) instead of make_point(x, y).
 @pymethod __new__ pt2d_new(x::Float64, y::Float64)::Pt2D = Pt2D(x, y)
+
+# __setitem__ (O6): write back a new Pt2D via unsafe_store! (mutates in-place from Python).
+@pymethod __setitem__ pt2d_setitem(p::Pt2D, i::Int64, val::Float64)::Pt2D =
+    i == 0 ? Pt2D(val, p.y) : i == 1 ? Pt2D(p.x, val) : error("Pt2D index out of range: $i")
+
+# __iter__ (O8a): self-iterator — C emits Py_INCREF(self); return self.
+@pymethod __iter__ pt2d_iter(p::Pt2D)::Pt2D = p
+
+# __contains__ (O8a): membership test (float in point).
+@pymethod __contains__ pt2d_contains(p::Pt2D, val::Float64)::Bool = p.x == val || p.y == val
+
+# @pyproperty (O10): computed read-only property.
+@pyproperty Pt2D norm::Float64 (p -> sqrt(p.x^2 + p.y^2))
+
+# LinearModel: callable handle (O8a __call__) + context manager (O9).
+struct LinearModel
+    w::Float64
+    b::Float64
+end
+@pyhandle LinearModel
+@pymethod __new__   lm_new(w::Float64, b::Float64)::LinearModel = LinearModel(w, b)
+@pymethod __call__  lm_call(m::LinearModel, x::Float64)::Float64 = m.w * x + m.b
+@pymethod __enter__ lm_enter(m::LinearModel)::LinearModel = m
+@pymethod __exit__  lm_exit(m::LinearModel)::Bool = false
 
 # Exercises every v1.x boundary kind in one extension: scalars, strings, complex,
 # 1-D and N-D arrays (both policies), in-place mutation + void, tuple returns,

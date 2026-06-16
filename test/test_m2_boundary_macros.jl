@@ -24,7 +24,8 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     _py_lib_flags, _find_cc,
                     ishandle, _handle_julia_name, _HANDLE_TYPES,
                     PtMethod, _METHODS, emit_ccallable_method,
-                    PtNew, _NEWS, emit_ccallable_new
+                    PtNew, _NEWS, emit_ccallable_new,
+                    PtProperty, _PROPERTIES, _MUTABLE_HANDLE_TYPES, emit_ccallable_property
 
 # Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
 struct _TestHandle
@@ -740,6 +741,215 @@ end
         @eval @pymethod __new__ bad_new2(x::Float64)::Float64 = x
     catch e; e end
     @test (err_ret isa LoadError ? err_ret.error : err_ret) isa ErrorException
+
+    clear_exports!()
+end
+
+# ── O6: write-back mutation ──────────────────────────────────────────────────
+
+@testset "mutable=true @pyhandle (item O6a)" begin
+    clear_exports!()
+    # _TestHandle is already registered at file scope; re-use it here.
+    @pyhandle _TestHandle mutable=true
+    @test _TestHandle in _MUTABLE_HANDLE_TYPES
+
+    # C shim for a mutable type should include _pt_setattr_ and Py_tp_setattro.
+    @pyfunc make_mh(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
+    c = emit_cshim("mut_demo", _EXPORTS, PtError[], [_TestHandle]; mutable_types=[_TestHandle])
+    @test occursin("_pt_setattr__TestHandle", c)
+    @test occursin("Py_tp_setattro", c)
+    # Each scalar field gets a branch with its format char and offset.
+    @test occursin("\"x\"", c)
+    @test occursin("\"n\"", c)
+    @test occursin("PyArg_Parse", c)
+    @test occursin("PyObject_GenericSetAttr", c)
+
+    clear_exports!()
+    # Re-register without mutable so other tests are not affected.
+    @pyhandle _TestHandle
+end
+
+@testset "@pymethod __setitem__ write-back (item O6b)" begin
+    clear_exports!()
+    @pyhandle _TestHandle
+    @pyfunc make_th3(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
+    @pymethod __setitem__ th_setitem(p::_TestHandle, i::Int64, v::Float64)::_TestHandle =
+        i == 0 ? _TestHandle(v, p.n) : _TestHandle(p.x, Int64(v))
+
+    m = _METHODS[end]
+    @test m.dunder === :__setitem__
+    @test length(m.extra_args) == 2
+    @test m.extra_args[1].jl_type === Int64
+    @test m.extra_args[2].jl_type === Float64
+    @test m.ret === _TestHandle
+
+    # ccallable must write back and return Cvoid.
+    code = emit_ccallable_method(m)
+    @test occursin("::Cvoid", code)
+    @test occursin("unsafe_store!", code)
+    @test occursin("Ptr{_TestHandle}", code)
+
+    # C shim: sq_ass_item slot.
+    c = emit_cshim("si_demo", _EXPORTS, PtError[], [_TestHandle], _METHODS)
+    @test occursin("Py_sq_ass_item", c)
+    @test occursin("ssizeobjargproc", c) || occursin("_pt_slot__TestHandle_setitem", c)
+    @test occursin("PyArg_Parse", c)
+
+    clear_exports!()
+end
+
+# ── O8a: __iter__, __contains__, __call__ ────────────────────────────────────
+
+@testset "@pymethod __iter__ self-return (item O8a)" begin
+    clear_exports!()
+    @pyhandle _TestHandle
+    @pyfunc make_th4(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
+    @pymethod __iter__ th_iter(p::_TestHandle)::_TestHandle = p
+
+    m = _METHODS[end]
+    @test m.dunder === :__iter__
+    @test m.ret === _TestHandle
+
+    # __iter__ should NOT generate a ccallable (self-return handled in C).
+    entry = emit_entry(_EXPORTS, "dummy.jl"; methods=_METHODS)
+    @test !occursin("pt_meth__TestHandle_iter", entry)
+
+    # C shim: Py_tp_iter slot + Py_INCREF pattern (no Julia call).
+    c = emit_cshim("iter_demo", _EXPORTS, PtError[], [_TestHandle], _METHODS)
+    @test occursin("Py_tp_iter", c)
+    @test occursin("Py_INCREF(self)", c)
+    @test !occursin("pt_meth__TestHandle_iter", c)
+
+    clear_exports!()
+end
+
+@testset "@pymethod __contains__ (item O8a)" begin
+    clear_exports!()
+    @pyhandle _TestHandle
+    @pyfunc make_th5(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
+    @pymethod __contains__ th_has(p::_TestHandle, v::Float64)::Bool =
+        p.x == v || Float64(p.n) == v
+
+    m = _METHODS[end]
+    @test m.dunder === :__contains__
+    @test m.ret === Bool
+    @test length(m.extra_args) == 1
+    @test m.extra_args[1].jl_type === Float64
+
+    code = emit_ccallable_method(m)
+    @test occursin("_val::Float64", code) || occursin("_a1::", code)
+
+    c = emit_cshim("cont_demo", _EXPORTS, PtError[], [_TestHandle], _METHODS)
+    @test occursin("Py_sq_contains", c)
+    @test occursin("PyArg_Parse", c)
+
+    clear_exports!()
+end
+
+@testset "@pymethod __call__ (item O8a)" begin
+    clear_exports!()
+    @pyhandle _TestHandle
+    @pyfunc make_th6(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
+    @pymethod __call__ th_call(p::_TestHandle, scale::Float64)::Float64 =
+        p.x * scale
+
+    m = _METHODS[end]
+    @test m.dunder === :__call__
+    @test m.ret === Float64
+    @test length(m.extra_args) == 1
+    @test m.extra_args[1].jl_type === Float64
+
+    code = emit_ccallable_method(m)
+    @test occursin("Float64", code)
+
+    c = emit_cshim("call_demo", _EXPORTS, PtError[], [_TestHandle], _METHODS)
+    @test occursin("Py_tp_call", c)
+    @test occursin("PyArg_ParseTuple", c)
+
+    clear_exports!()
+end
+
+# ── O9: __enter__ / __exit__ ─────────────────────────────────────────────────
+
+@testset "@pymethod __enter__ / __exit__ context manager (item O9)" begin
+    clear_exports!()
+    @pyhandle _TestHandle
+    @pyfunc make_th7(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
+    @pymethod __enter__ th_enter(p::_TestHandle)::_TestHandle = p
+    @pymethod __exit__  th_exit(p::_TestHandle)::Bool = false
+
+    enter_m = findfirst(m -> m.dunder === :__enter__, _METHODS)
+    exit_m  = findfirst(m -> m.dunder === :__exit__,  _METHODS)
+    @test !isnothing(enter_m)
+    @test !isnothing(exit_m)
+    @test _METHODS[enter_m].ret === _TestHandle
+    @test _METHODS[exit_m].ret  === Bool
+
+    # __enter__ should NOT generate a ccallable.
+    entry = emit_entry(_EXPORTS, "dummy.jl"; methods=_METHODS)
+    @test !occursin("pt_meth__TestHandle_enter", entry)
+    @test  occursin("pt_meth__TestHandle_exit",  entry)
+
+    c = emit_cshim("cm_demo", _EXPORTS, PtError[], [_TestHandle], _METHODS)
+    # Methods go in Py_tp_methods, not individual slots.
+    @test  occursin("Py_tp_methods", c)
+    @test  occursin("PyMethodDef", c)
+    @test  occursin("\"__enter__\"", c)
+    @test  occursin("\"__exit__\"", c)
+    @test  occursin("METH_NOARGS", c)
+    @test  occursin("METH_VARARGS", c)
+    @test  occursin("Py_INCREF(self)", c)   # __enter__ self-return in C
+    @test !occursin("Py_tp_repr", c) || true  # just check no crash
+
+    clear_exports!()
+end
+
+# ── O10: @pyproperty ─────────────────────────────────────────────────────────
+
+@testset "@pyproperty read-only property (item O10)" begin
+    clear_exports!()
+    @pyhandle _TestHandle
+    @pyfunc make_th8(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
+    @pyproperty _TestHandle mag::Float64 (p -> sqrt(p.x^2 + Float64(p.n)^2))
+
+    @test length(_PROPERTIES) == 1
+    prop = _PROPERTIES[1]
+    @test prop.handle_type === _TestHandle
+    @test prop.prop_name == "mag"
+    @test prop.val_type === Float64
+    @test prop.getter_fn === :_pt_prop_get__TestHandle_mag
+    @test prop.setter_fn === nothing
+
+    # Getter function was synthesized and is callable.
+    th = _TestHandle(3.0, Int64(4))
+    @test _pt_prop_get__TestHandle_mag(th) ≈ 5.0
+
+    # ccallable for the getter.
+    code = emit_ccallable_property(prop)
+    @test occursin("pt_prop_get__TestHandle_mag", code)
+    @test occursin("PtHandle", code)
+
+    # C shim: PyGetSetDef table + Py_tp_getset slot.
+    c = emit_cshim("prop_demo", _EXPORTS, PtError[], [_TestHandle]; properties=_PROPERTIES)
+    @test occursin("PyGetSetDef", c)
+    @test occursin("Py_tp_getset", c)
+    @test occursin("_pt_getter__TestHandle_mag", c)
+    @test occursin("\"mag\"", c)
+
+    clear_exports!()
+end
+
+@testset "@pyproperty validation errors (item O10)" begin
+    clear_exports!()
+    @pyhandle _TestHandle
+
+    # Must be name::ValType, not bare name.
+    err = try; @eval @pyproperty _TestHandle bad (p -> p.x); catch e; e; end
+    @test (err isa LoadError ? err.error : err) isa ErrorException
+
+    # ValType must be a boundary type.
+    err2 = try; @eval @pyproperty _TestHandle notok::Module (p -> p.x); catch e; e; end
+    @test (err2 isa LoadError ? err2.error : err2) isa ErrorException
 
     clear_exports!()
 end

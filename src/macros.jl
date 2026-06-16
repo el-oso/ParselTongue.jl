@@ -64,39 +64,57 @@ const _ERRORS = PtError[]
 # Supported dunder slots: symbol → (C slot constant, required Julia return type).
 # ret_type=nothing means any boundary return type is accepted (validated via c_abi_type).
 const _PYMETHOD_SLOTS = Dict{Symbol,NamedTuple}(
-    :__repr__    => (slot="Py_tp_repr",      ret_type=String),
-    :__str__     => (slot="Py_tp_str",       ret_type=String),
-    :__len__     => (slot="Py_sq_length",    ret_type=Int64),
-    :__hash__    => (slot="Py_tp_hash",      ret_type=Int64),
-    :__bool__    => (slot="Py_nb_bool",      ret_type=Bool),
-    :__getitem__ => (slot="Py_sq_item",      ret_type=nothing),
-    :__eq__      => (slot="Py_tp_richcompare", ret_type=Bool),
-    :__ne__      => (slot="Py_tp_richcompare", ret_type=Bool),
-    :__lt__      => (slot="Py_tp_richcompare", ret_type=Bool),
-    :__le__      => (slot="Py_tp_richcompare", ret_type=Bool),
-    :__gt__      => (slot="Py_tp_richcompare", ret_type=Bool),
-    :__ge__      => (slot="Py_tp_richcompare", ret_type=Bool),
+    :__repr__     => (slot="Py_tp_repr",      ret_type=String),
+    :__str__      => (slot="Py_tp_str",       ret_type=String),
+    :__len__      => (slot="Py_sq_length",    ret_type=Int64),
+    :__hash__     => (slot="Py_tp_hash",      ret_type=Int64),
+    :__bool__     => (slot="Py_nb_bool",      ret_type=Bool),
+    :__getitem__  => (slot="Py_sq_item",      ret_type=nothing),
+    # Write-back mutation: Julia fn returns new T, ccallable stores it back.
+    :__setitem__  => (slot="Py_sq_ass_item",  ret_type=:writeback),
+    # Extra args from parsed tuple (parse_args sentinel).
+    :__call__     => (slot="Py_tp_call",      ret_type=nothing),
+    # Single value unboxed from PyObject*.
+    :__contains__ => (slot="Py_sq_contains",  ret_type=Bool),
+    # Self-return iterator: Py_INCREF(self); return self — no Julia call.
+    :__iter__     => (slot="Py_tp_iter",      ret_type=:same_handle_type),
+    # Context managers: registered via Py_tp_methods (PyMethodDef), not type slots.
+    :__enter__    => (slot="Py_tp_methods",   ret_type=:same_handle_type),
+    :__exit__     => (slot="Py_tp_methods",   ret_type=Bool),
+    :__eq__       => (slot="Py_tp_richcompare", ret_type=Bool),
+    :__ne__       => (slot="Py_tp_richcompare", ret_type=Bool),
+    :__lt__       => (slot="Py_tp_richcompare", ret_type=Bool),
+    :__le__       => (slot="Py_tp_richcompare", ret_type=Bool),
+    :__gt__       => (slot="Py_tp_richcompare", ret_type=Bool),
+    :__ge__       => (slot="Py_tp_richcompare", ret_type=Bool),
 )
 
 # Extra positional argument types (after self) for dunders that take more than self.
-# :same_handle means the extra arg must be the same @pyhandle type as self.
+# :same_handle    — second arg must be the same @pyhandle type as self (comparisons).
+# :setitem_val    — two extra args: idx::Int64 + val::<boundary>. Return must equal T (writeback).
+# :parse_args     — any number of extra boundary args (for __call__).
+# :pyobj_val      — single extra boundary arg unboxed from PyObject* (for __contains__).
 const _PYMETHOD_EXTRA_ARGS = Dict{Symbol,Any}(
-    :__getitem__ => Type[Int64],
-    :__eq__      => :same_handle,
-    :__ne__      => :same_handle,
-    :__lt__      => :same_handle,
-    :__le__      => :same_handle,
-    :__gt__      => :same_handle,
-    :__ge__      => :same_handle,
+    :__getitem__  => Type[Int64],
+    :__setitem__  => :setitem_val,
+    :__call__     => :parse_args,
+    :__contains__ => :pyobj_val,
+    :__eq__       => :same_handle,
+    :__ne__       => :same_handle,
+    :__lt__       => :same_handle,
+    :__le__       => :same_handle,
+    :__gt__       => :same_handle,
+    :__ge__       => :same_handle,
 )
 
 """
-    PtMethod(handle_type, dunder, jl_func, self_arg, ret)
+    PtMethod(handle_type, dunder, jl_func, self_arg, ret[, extra_args])
 
 Metadata for one Python dunder method registered via [`@pymethod`](@ref).
 `handle_type` is the `@pyhandle` type; `dunder` the Python slot symbol
 (e.g. `:__repr__`); `jl_func` the user's Julia function name; `self_arg`
-the self `PtArg`; `ret` the Julia return type.
+the self `PtArg`; `ret` the Julia return type; `extra_args` the extra
+positional args beyond self (empty for most dunders).
 """
 struct PtMethod
     handle_type::Type
@@ -104,7 +122,9 @@ struct PtMethod
     jl_func::Symbol
     self_arg::PtArg
     ret::Type
+    extra_args::Vector{PtArg}
 end
+PtMethod(ht, d, jf, sa, r) = PtMethod(ht, d, jf, sa, r, PtArg[])
 
 # C-ABI symbol for the @ccallable wrapper: pt_meth_<TypeName>_<clean>.
 # <clean> strips the leading/trailing __ from the dunder name.
@@ -130,6 +150,25 @@ cabi_symbol(n::PtNew) = string("pt_new_", n.handle_type.name.name)
 
 const _NEWS = PtNew[]
 
+"""
+    PtProperty(handle_type, prop_name, getter_fn, setter_fn, val_type)
+
+A Python property registered via `@pyproperty`. `getter_fn` is the Julia
+function symbol for the getter; `setter_fn` is `nothing` for read-only properties.
+`val_type` is the Julia type of the property value (must be a boundary type).
+"""
+struct PtProperty
+    handle_type::Type
+    prop_name::String
+    getter_fn::Symbol
+    setter_fn::Union{Symbol,Nothing}
+    val_type::Type
+end
+
+# Build-host registries for mutable handle types and properties.
+const _MUTABLE_HANDLE_TYPES = Type[]
+const _PROPERTIES = PtProperty[]
+
 function _register_new!(n::PtNew)
     T = n.handle_type
     ishandle(c_abi_type(T)) ||
@@ -149,8 +188,14 @@ function _register_method!(m::PtMethod)
         error("@pymethod: type `$T` is not registered with @pyhandle.")
     T in _HANDLE_TYPES || push!(_HANDLE_TYPES, T)
     spec = _PYMETHOD_SLOTS[m.dunder]
-    if spec.ret_type === nothing
-        # Polymorphic return (e.g. __getitem__): any non-Nothing boundary type.
+
+    # Validate return type.
+    if spec.ret_type === :writeback || spec.ret_type === :same_handle_type
+        # Write-back (__setitem__) and self-return (__iter__, __enter__) require ret == T.
+        m.ret === T ||
+            error("@pymethod $(m.dunder): return type must equal the handle type `$T`, got `$(m.ret)`.")
+    elseif spec.ret_type === nothing
+        # Polymorphic return (__getitem__, __call__): any non-Nothing boundary type.
         m.ret === Nothing &&
             error("@pymethod $(m.dunder): return type must not be Nothing.")
         try
@@ -159,10 +204,36 @@ function _register_method!(m::PtMethod)
             error("@pymethod $(m.dunder): return type `$(m.ret)` is not a boundary type: $e")
         end
     else
-        # Fixed return type (e.g. __repr__ → String, __len__ → Int64).
+        # Fixed return type (__repr__ → String, __len__ → Int64, etc.).
         m.ret === spec.ret_type ||
             error("@pymethod $(m.dunder): return type must be `$(spec.ret_type)`, got `$(m.ret)`.")
     end
+
+    # Validate extra args based on dunder.
+    if m.dunder === :__setitem__
+        length(m.extra_args) == 2 ||
+            error("@pymethod __setitem__: need exactly 2 extra args (idx::Int64, val::<T>), got $(length(m.extra_args)).")
+        m.extra_args[1].jl_type === Int64 ||
+            error("@pymethod __setitem__: first extra arg must be ::Int64 (index), got $(m.extra_args[1].jl_type).")
+        try; c_abi_type(m.extra_args[2].jl_type); catch e
+            error("@pymethod __setitem__: value type `$(m.extra_args[2].jl_type)` is not a boundary type: $e")
+        end
+    elseif m.dunder === :__contains__
+        length(m.extra_args) == 1 ||
+            error("@pymethod __contains__: need exactly 1 extra arg (the value), got $(length(m.extra_args)).")
+        try; c_abi_type(m.extra_args[1].jl_type); catch e
+            error("@pymethod __contains__: value type `$(m.extra_args[1].jl_type)` is not a boundary type: $e")
+        end
+    elseif m.dunder === :__call__
+        isempty(m.extra_args) &&
+            error("@pymethod __call__: need at least 1 extra arg (in addition to self).")
+        for a in m.extra_args
+            try; c_abi_type(a.jl_type); catch e
+                error("@pymethod __call__: arg `$(a.name)::$(a.jl_type)` is not a boundary type: $e")
+            end
+        end
+    end
+
     filter!(x -> !(x.handle_type === T && x.dunder === m.dunder), _METHODS)
     push!(_METHODS, m)
     return m
@@ -190,7 +261,7 @@ const _EXPORTS = PtExport[]
 
 Reset the export registry. Called at the start of each `build_extension`.
 """
-clear_exports!() = (empty!(_EXPORTS); empty!(_ERRORS); empty!(_HANDLE_TYPES); empty!(_METHODS); empty!(_NEWS); _MODULE_NAME[] = nothing; _CURRENT_SUBMODULE[] = ""; nothing)
+clear_exports!() = (empty!(_EXPORTS); empty!(_ERRORS); empty!(_HANDLE_TYPES); empty!(_METHODS); empty!(_NEWS); empty!(_MUTABLE_HANDLE_TYPES); empty!(_PROPERTIES); _MODULE_NAME[] = nothing; _CURRENT_SUBMODULE[] = ""; nothing)
 
 # Distinct, ordered submodule names among `exports` (excluding the "" top level).
 function submodule_names(exports::AbstractVector{PtExport})
@@ -568,15 +639,25 @@ macro pymethod(dunder, fundef)
     end
 
     _extra_spec = get(_PYMETHOD_EXTRA_ARGS, dunder, nothing)
-    n_extra    = _extra_spec isa AbstractVector ? length(_extra_spec) :
-                 _extra_spec === :same_handle ? 1 : 0
-    n_expected = 1 + n_extra
+    # n_extra_fixed: exact extra arg count for fixed-arity dunders.
+    # n_flex=true: any number ≥1 of extra args (__call__ with :parse_args).
+    n_extra_fixed = _extra_spec isa AbstractVector ? length(_extra_spec) :
+                    _extra_spec ∈ (:same_handle, :pyobj_val) ? 1 :
+                    _extra_spec === :setitem_val ? 2 :
+                    0
+    n_flex = _extra_spec === :parse_args
 
     fname, rawargs, ret_expr = _parse_fundef(fundef)
-    length(rawargs) == n_expected || error(
-        "@pymethod $dunder: must have exactly $n_expected argument(s) " *
-        "(self" * (n_extra > 0 ? " + $n_extra extra" : "") *
-        "), got $(length(rawargs)).")
+    if n_flex
+        length(rawargs) >= 2 || error(
+            "@pymethod $dunder: needs self + at least 1 extra arg, got $(length(rawargs)).")
+    else
+        n_expected = 1 + n_extra_fixed
+        length(rawargs) == n_expected || error(
+            "@pymethod $dunder: must have exactly $n_expected argument(s) " *
+            "(self" * (n_extra_fixed > 0 ? " + $n_extra_fixed extra" : "") *
+            "), got $(length(rawargs)).")
+    end
 
     # Parse and validate self (always rawargs[1]).
     (sname, stype_expr, smut, sdefault, skw) = rawargs[1]
@@ -584,12 +665,14 @@ macro pymethod(dunder, fundef)
     sdefault !== nothing && error("@pymethod $dunder: self argument cannot have a default value.")
     skw       && error("@pymethod $dunder: self argument cannot be a keyword argument.")
 
-    # Parse extra args (rawargs[2:end]); collect their type expressions for runtime validation.
+    # Parse extra args (rawargs[2:end]); collect name/type exprs for validation.
+    extra_name_exprs = Any[]
     extra_type_exprs = Any[]
-    for (_, etype_expr, emut, edefault, ekw) in rawargs[2:end]
-        emut    && error("@pymethod $dunder: extra argument cannot be Mut{…}.")
+    for (ename, etype_expr, emut, edefault, ekw) in rawargs[2:end]
+        emut     && error("@pymethod $dunder: extra argument cannot be Mut{…}.")
         edefault !== nothing && error("@pymethod $dunder: extra argument cannot have a default value.")
-        ekw     && error("@pymethod $dunder: extra argument cannot be a keyword argument.")
+        ekw      && error("@pymethod $dunder: extra argument cannot be a keyword argument.")
+        push!(extra_name_exprs, ename)
         push!(extra_type_exprs, etype_expr)
     end
 
@@ -605,25 +688,107 @@ macro pymethod(dunder, fundef)
               error(string("@pymethod ", $dunder_sym, ": extra argument ", $i,
                            " must be typed ::", $(expected_extra[i]),
                            ", got ::", $(esc(extra_type_exprs[i])))))
-            for i in 1:n_extra
+            for i in 1:n_extra_fixed
         ]
     elseif _extra_spec === :same_handle
-        # __eq__ / __ne__: second arg must be the same @pyhandle type as self.
+        # __eq__ / __ne__ / __lt__ / __le__ / __gt__ / __ge__: second arg == self type.
         Expr[:($(esc(extra_type_exprs[1])) === _T ||
                error(string("@pymethod ", $dunder_sym,
                             ": second argument type must match self type (", _T,
                             "), got ", $(esc(extra_type_exprs[1])))))]
+    elseif _extra_spec === :setitem_val
+        # __setitem__: first extra arg must be Int64 (index).
+        Expr[:($(esc(extra_type_exprs[1])) === Int64 ||
+               error(string("@pymethod __setitem__: first extra arg (index) must be ::Int64, got ::",
+                            $(esc(extra_type_exprs[1])))))]
     else
         Expr[]
     end
+
+    # Build the extra_args PtArg vector (passed to PtMethod for ccallable/cshim use).
+    extra_arg_exprs = [
+        :(ParselTongue.PtArg($(QuoteNode(extra_name_exprs[i])), $(esc(extra_type_exprs[i])), false, nothing, false))
+        for i in eachindex(extra_name_exprs)
+    ]
 
     quote
         $(esc(fundef))
         let _T = $(esc(stype_expr)), _ret = $(esc(ret_expr))
             $(extra_checks...)
             _self_arg = ParselTongue.PtArg($sname_sym, _T, false, nothing, false)
+            _extra_args = ParselTongue.PtArg[$(extra_arg_exprs...)]
             ParselTongue._register_method!(
-                ParselTongue.PtMethod(_T, $dunder_sym, $fname_sym, _self_arg, _ret))
+                ParselTongue.PtMethod(_T, $dunder_sym, $fname_sym, _self_arg, _ret, _extra_args))
+        end
+        nothing
+    end
+end
+
+"""
+    @pyproperty T propname::ValType (p -> getter_body)
+
+Register a read-only Python property on the `@pyhandle` type `T`. The property
+`propname` appears on Python instances as `obj.propname`; it evaluates
+`getter_body` with `p` bound to the Julia value.
+
+`ValType` must be a scalar boundary type.
+
+```julia
+struct Pt2D; x::Float64; y::Float64; end
+@pyhandle Pt2D
+
+@pyproperty Pt2D norm::Float64 (p -> sqrt(p.x^2 + p.y^2))
+```
+"""
+macro pyproperty(T_expr, name_type_expr, getter_lambda)
+    name_type_expr isa Expr && name_type_expr.head === :(::) && length(name_type_expr.args) == 2 ||
+        error("@pyproperty: second argument must be `propname::ValType` (e.g. norm::Float64), got: $name_type_expr")
+    name_sym = name_type_expr.args[1]
+    name_sym isa Symbol ||
+        error("@pyproperty: property name must be a plain symbol, got: $name_sym")
+    val_type_expr = name_type_expr.args[2]
+
+    getter_lambda isa Expr && getter_lambda.head === :-> && length(getter_lambda.args) == 2 ||
+        error("@pyproperty: getter must be a lambda (e.g., p -> expr), got: $getter_lambda")
+    lambda_arg  = getter_lambda.args[1]
+    lambda_body = getter_lambda.args[2]
+
+    # Extract the self symbol from the lambda arg (bare symbol, or symbol::Type).
+    self_sym = if lambda_arg isa Symbol
+        lambda_arg
+    elseif lambda_arg isa Expr && lambda_arg.head === :(::)
+        lambda_arg.args[1]
+    else
+        error("@pyproperty: getter lambda arg must be a symbol (e.g., p -> ...), got: $lambda_arg")
+    end
+
+    # Derive a function name from T and the property name.
+    T = Core.eval(__module__, T_expr)
+    tname = string(T.name.name)
+    get_fname = Symbol("_pt_prop_get_$(tname)_$(name_sym)")
+    get_fname_sym = QuoteNode(get_fname)
+    prop_str = string(name_sym)
+
+    quote
+        # Generate the getter function in the user module.
+        # esc on the parameter name ensures it binds to the same `p` used in lambda_body.
+        function $(esc(get_fname))($(esc(self_sym))::$(esc(T_expr)))::$(esc(val_type_expr))
+            $(esc(lambda_body))
+        end
+        # Register the property.
+        let _T = $(esc(T_expr)), _vt = $(esc(val_type_expr))
+            ParselTongue.ishandle(ParselTongue.c_abi_type(_T)) ||
+                error(string("@pyproperty: type `", _T, "` is not registered with @pyhandle."))
+            _vt === Nothing &&
+                error("@pyproperty: value type must not be Nothing.")
+            try; ParselTongue.c_abi_type(_vt); catch _e
+                error(string("@pyproperty: value type `", _vt, "` is not a boundary type: ", _e))
+            end
+            _T in ParselTongue._HANDLE_TYPES || push!(ParselTongue._HANDLE_TYPES, _T)
+            filter!(p -> !(p.handle_type === _T && p.prop_name == $prop_str),
+                    ParselTongue._PROPERTIES)
+            push!(ParselTongue._PROPERTIES,
+                  ParselTongue.PtProperty(_T, $prop_str, $get_fname_sym, nothing, _vt))
         end
         nothing
     end

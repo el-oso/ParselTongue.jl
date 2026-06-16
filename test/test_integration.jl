@@ -212,6 +212,53 @@ end
         assert feature.point_y(p_c) == 4.0, "constructor y"
         assert repr(p_c) == "<Pt2D: x=3.0, y=4.0>", "constructor repr"
         del p_c
+        # Item O6: mutable setattr (p.x = ...) and __setitem__ write-back (p[i] = ...).
+        p_mut = feature.Pt2D(3.0, 4.0)
+        p_mut.x = 10.0
+        assert p_mut.x == 10.0, f"setattr x: {p_mut.x}"
+        p_mut.y = 20.0
+        assert p_mut.y == 20.0, f"setattr y: {p_mut.y}"
+        p_mut[0] = 1.0
+        assert p_mut[0] == 1.0, f"setitem[0]: {p_mut[0]}"
+        p_mut[1] = 2.0
+        assert p_mut[1] == 2.0, f"setitem[1]: {p_mut[1]}"
+        try:
+            p_mut[2] = 99.0
+            assert False, "__setitem__[2] should raise"
+        except RuntimeError:
+            pass
+        del p_mut
+        # Item O8a: __contains__ membership test.
+        p_has = feature.Pt2D(3.0, 4.0)
+        assert 3.0 in p_has, "__contains__ x"
+        assert 4.0 in p_has, "__contains__ y"
+        assert 5.0 not in p_has, "__contains__ absent"
+        del p_has
+        # Item O8a: __iter__ self-return (tp_iter slot; iter() needs __next__ too, so
+        # call __iter__ directly to verify the slot returns self without TypeError).
+        p_it = feature.Pt2D(3.0, 4.0)
+        it = p_it.__iter__()
+        assert isinstance(it, feature.Pt2D), f"__iter__() returns Pt2D: {type(it)}"
+        assert it is p_it, "__iter__ returns self"
+        del p_it
+        # Item O8a: __call__ via LinearModel.
+        lm = feature.LinearModel(2.0, 1.0)
+        assert isinstance(lm, feature.LinearModel), "LinearModel instance"
+        assert lm(3.0) == 7.0, f"__call__ lm(3) = 7: {lm(3.0)}"
+        assert lm(0.0) == 1.0, f"__call__ lm(0) = 1: {lm(0.0)}"
+        del lm
+        # Item O9: context manager __enter__ / __exit__.
+        lm2 = feature.LinearModel(3.0, 0.0)
+        with lm2 as m:
+            assert isinstance(m, feature.LinearModel), "__enter__ returns LinearModel"
+            assert m is lm2, "__enter__ returns self"
+            assert m(2.0) == 6.0, f"LinearModel inside with: {m(2.0)}"
+        del lm2
+        # Item O10: @pyproperty computed read-only property.
+        p_prop = feature.Pt2D(3.0, 4.0)
+        assert abs(p_prop.norm - 5.0) < 1e-10, f"@pyproperty norm 3-4-5: {p_prop.norm}"
+        assert feature.Pt2D(0.0, 0.0).norm == 0.0, "@pyproperty norm zero"
+        del p_prop
         # Python callables as arguments (item F)
         assert feature.apply(lambda x: x * 2.0, 3.0) == 6.0,    "apply: identity"
         assert feature.apply(abs, -5.0) == 5.0,                  "apply: builtin"

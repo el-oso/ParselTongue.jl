@@ -201,13 +201,20 @@ function emit_ccallable_method(m::PtMethod; errors::Vector{PtError}=PtError[])
     self_c = _type_src(c_abi_type(T))          # e.g. "ParselTongue.PtHandle{Pt2D}"
     from   = string("ParselTongue.from_c(", _type_src(T), ", _self)")
 
-    # __getitem__ receives an extra Int64 index; __eq__/__ne__ receive a second handle
-    # of the same type. from_c converts each carrier to the native Julia value.
+    # Build extra params/call args from the dunder-specific semantics.
     T_src = _type_src(T)
     extra_params = if m.dunder === :__getitem__
         ", _idx::Int64"
     elseif m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__)
         ", _other::$self_c"
+    elseif m.dunder === :__setitem__
+        # idx::Int64 + val carrier (extra_args[1]=Int64, extra_args[2]=val type)
+        val_c = _type_src(c_abi_type(m.extra_args[2].jl_type))
+        ", _idx::Int64, _val::$val_c"
+    elseif m.dunder ∈ (:__contains__, :__call__)
+        # One or more extra boundary args.
+        join([string(", _a", i, "::", _type_src(c_abi_type(a.jl_type)))
+              for (i, a) in enumerate(m.extra_args)])
     else
         ""
     end
@@ -215,10 +222,16 @@ function emit_ccallable_method(m::PtMethod; errors::Vector{PtError}=PtError[])
         ", _idx"
     elseif m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__)
         string(", ParselTongue.from_c(", T_src, ", _other)")
+    elseif m.dunder === :__setitem__
+        val_T_src = _type_src(m.extra_args[2].jl_type)
+        ", _idx, ParselTongue.from_c($val_T_src, _val)"
+    elseif m.dunder ∈ (:__contains__, :__call__)
+        join([string(", ParselTongue.from_c(", _type_src(a.jl_type), ", _a", i, ")")
+              for (i, a) in enumerate(m.extra_args)])
     else
         ""
     end
-    call   = string(m.jl_func, "(", from, extra_call, ")")
+    call = string(m.jl_func, "(", from, extra_call, ")")
 
     # Catch block: identical to emit_ccallable (RuntimeError only; method bodies
     # can throw, but custom @pyerror types are not expected in dunders for now).
@@ -239,8 +252,28 @@ function emit_ccallable_method(m::PtMethod; errors::Vector{PtError}=PtError[])
     print(io_catch, "        unsafe_store!(_pt_errmsg, _buf)\n")
     catch_stmts = String(take!(io_catch))
 
-    sig     = string("Base.@ccallable function ", sym, "(_self::", self_c,
-                     extra_params, ", _pt_err::Ptr{Int32}, _pt_errmsg::Ptr{Ptr{UInt8}})")
+    sig = string("Base.@ccallable function ", sym, "(_self::", self_c,
+                 extra_params, ", _pt_err::Ptr{Int32}, _pt_errmsg::Ptr{Ptr{UInt8}})")
+
+    # __setitem__ write-back: Julia fn returns new T, ccallable stores it back and
+    # returns Cvoid. The C slot signature is int (*)(PyObject*, Py_ssize_t, PyObject*).
+    if m.dunder === :__setitem__
+        T_src = _type_src(T)
+        return string(
+            sig, "::Cvoid\n",
+            "    try\n",
+            "        local _result::", T_src, " = ", call, "\n",
+            "        unsafe_store!(Ptr{", T_src, "}(_self.ptr), _result)\n",
+            "        unsafe_store!(_pt_err, Int32(0))\n",
+            "        unsafe_store!(_pt_errmsg, Ptr{UInt8}(0))\n",
+            "    catch _e\n",
+            catch_stmts,
+            "    end\n",
+            "    return\n",
+            "end\n",
+        )
+    end
+
     ret_src = _type_src(ret_c)
     zero    = _zero_cval(ret_c)
     to_c_expr = isopt(ret_c) ?
@@ -275,8 +308,65 @@ function emit_ccallable_new(n::PtNew; errors::Vector{PtError}=PtError[])
 end
 
 """
+    emit_ccallable_property(p::PtProperty; errors=PtError[]) -> String
+
+Return the Julia source for the getter (and optional setter) `Base.@ccallable`
+wrapper for property `p`. The getter is `pt_prop_get_T_name`; the setter (when
+present) is `pt_prop_set_T_name` (Cvoid return with write-back for isbits types).
+"""
+function emit_ccallable_property(p::PtProperty; errors::Vector{PtError}=PtError[])
+    T     = p.handle_type
+    tname = string(T.name.name)
+    vt    = p.val_type
+    vc    = c_abi_type(vt)
+    get_sym = string("pt_prop_get_$(tname)_$(p.prop_name)")
+    self_c  = _type_src(c_abi_type(T))
+    vc_src  = _type_src(vc)
+    T_src   = _type_src(T)
+
+    # Getter: (self::PtHandle{T}, _pt_err, _pt_errmsg) -> c_val
+    io_catch = IOBuffer()
+    print(io_catch, "        local _buf::Ptr{UInt8} = Ptr{UInt8}(0)\n")
+    print(io_catch, "        unsafe_store!(_pt_err, Int32(1))\n")
+    print(io_catch, "        if _e isa ErrorException\n")
+    print(io_catch, "            local _m = _e.msg\n")
+    print(io_catch, "            if _m isa String\n")
+    print(io_catch, "                local _n::Int = sizeof(_m)\n")
+    print(io_catch, "                _buf = Ptr{UInt8}(Libc.malloc(_n + 1))\n")
+    print(io_catch, "                if _buf != C_NULL\n")
+    print(io_catch, "                    unsafe_copyto!(_buf, pointer(_m), _n)\n")
+    print(io_catch, "                    unsafe_store!(_buf, UInt8(0), _n + 1)\n")
+    print(io_catch, "                end\n")
+    print(io_catch, "            end\n")
+    print(io_catch, "        end\n")
+    print(io_catch, "        unsafe_store!(_pt_errmsg, _buf)\n")
+    catch_stmts = String(take!(io_catch))
+
+    to_c_expr = isopt(vc) ?
+        string("ParselTongue._to_c_opt(", vc_src, ", $(p.getter_fn)(ParselTongue.from_c($T_src, _self)))") :
+        string("ParselTongue.to_c($(p.getter_fn)(ParselTongue.from_c($T_src, _self)))")
+    zero = _zero_cval(vc)
+
+    get_code = string(
+        "Base.@ccallable function ", get_sym,
+        "(_self::", self_c, ", _pt_err::Ptr{Int32}, _pt_errmsg::Ptr{Ptr{UInt8}})::", vc_src, "\n",
+        "    local _result::", vc_src, " = ", zero, "\n",
+        "    try\n",
+        "        _result = ", to_c_expr, "\n",
+        "        unsafe_store!(_pt_err, Int32(0))\n",
+        "        unsafe_store!(_pt_errmsg, Ptr{UInt8}(0))\n",
+        "    catch _e\n",
+        catch_stmts,
+        "    end\n",
+        "    return _result\n",
+        "end\n",
+    )
+    return get_code
+end
+
+"""
     emit_entry(exports, user_path; errors=PtError[], methods=PtMethod[],
-               news=PtNew[], extra_includes=String[]) -> String
+               news=PtNew[], properties=PtProperty[], extra_includes=String[]) -> String
 
 Return the full source of the juliac entry file: load ParselTongue, `include`
 the user's source (and any `extra_includes`, for multi-module wheels), then define
@@ -287,6 +377,7 @@ function emit_entry(exports::AbstractVector{PtExport}, user_path::AbstractString
                     errors::Vector{PtError}=PtError[],
                     methods::Vector{PtMethod}=PtMethod[],
                     news::Vector{PtNew}=PtNew[],
+                    properties::Vector{PtProperty}=PtProperty[],
                     extra_includes::AbstractVector{<:AbstractString}=String[])
     io = IOBuffer()
     println(io, "# Generated by ParselTongue — do not edit.")
@@ -305,10 +396,16 @@ function emit_entry(exports::AbstractVector{PtExport}, user_path::AbstractString
         println(io, emit_ccallable(e; errors))
     end
     for m in methods
+        # __iter__ and __enter__ with self-return are handled entirely in C
+        # (Py_INCREF(self); return self) — no Julia ccallable needed.
+        m.dunder ∈ (:__iter__, :__enter__) && continue
         println(io, emit_ccallable_method(m; errors))
     end
     for n in news
         println(io, emit_ccallable_new(n; errors))
+    end
+    for p in properties
+        println(io, emit_ccallable_property(p; errors))
     end
     return String(take!(io))
 end

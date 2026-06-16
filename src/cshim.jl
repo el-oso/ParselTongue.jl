@@ -1106,7 +1106,9 @@ end
 function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                                 handle_types::AbstractVector{<:Type},
                                 methods::AbstractVector{PtMethod}=PtMethod[],
-                                news::AbstractVector{PtNew}=PtNew[])
+                                news::AbstractVector{PtNew}=PtNew[];
+                                mutable_types::AbstractVector{<:Type}=Type[],
+                                properties::AbstractVector{PtProperty}=PtProperty[])
     isempty(handle_types) && return
     println(io, "/* @pyhandle types: each becomes a real Python class (isinstance, repr, etc.) */")
     for T in handle_types
@@ -1126,21 +1128,17 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         println(io, "}")
 
         # For each @pymethod, emit a C slot wrapper. The wrapper kind is
-        # determined by the Julia return type declared in the slot registry:
-        #   String  → char* extern; PyObject* slot (repr/str pattern)
-        #   Int64   → int64_t extern; Py_ssize_t/Py_hash_t slot (len/hash pattern)
-        #   Bool    → int8_t extern; int slot (bool/inquiry pattern)
+        # determined by the dunder and/or its Julia return type.
         for m in tmeths
-            # Comparison dunders are handled together below as a single tp_richcompare slot.
+            # These are handled via separate code paths below.
             m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__) && continue
+            m.dunder ∈ (:__enter__, :__exit__) && continue  # PyMethodDef table
             clean = replace(replace(string(m.dunder), r"^__" => ""), r"__$" => "")
             sym   = cabi_symbol(m)
             dname = string(m.dunder)
-            # Dispatch on dunder FIRST so __getitem__ is handled before the
-            # ret-type dispatch below (it can have any return type).
+
             if m.dunder === :__getitem__
-                # ssizeargfunc: PyObject* (*)(PyObject*, Py_ssize_t).
-                # The Julia ccallable returns c_abi_type(m.ret); box it with _build_pyobject.
+                # ssizeargfunc: PyObject* (*)(PyObject*, Py_ssize_t)
                 ret_c = c_abi_type(m.ret)
                 c_ret_type = _c_ctype(ret_c)
                 box_stmts  = _build_pyobject(ret_c, "r", "_result")
@@ -1159,6 +1157,108 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                 for s in box_stmts; println(io, "    ", s); end
                 println(io, "    return _result;")
                 println(io, "}")
+
+            elseif m.dunder === :__setitem__
+                # ssizeobjargproc: int (*)(PyObject*, Py_ssize_t, PyObject*)
+                # Unbox the value using PyArg_Parse with the format char from _CSCALARS.
+                val_T  = m.extra_args[2].jl_type
+                val_cs = _CSCALARS[val_T]
+                println(io, "extern void $(sym)(PtHandle, int64_t, $(val_cs.ctype), int32_t *, char **);")
+                println(io, "static int _pt_slot_$(tname)_$(clean)(PyObject *self, Py_ssize_t idx, PyObject *val) {")
+                println(io, "    if (val == NULL) {")
+                println(io, "        PyErr_SetString(PyExc_TypeError, \"$tname does not support item deletion\");")
+                println(io, "        return -1;")
+                println(io, "    }")
+                println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)self;")
+                println(io, "    PtHandle h = { obj->_data };")
+                println(io, "    $(val_cs.tmptype) _tmp;")
+                println(io, "    if (!PyArg_Parse(val, \"$(val_cs.fmt)\", &_tmp)) return -1;")
+                println(io, "    $(val_cs.ctype) _v = ($(val_cs.ctype))_tmp;")
+                println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+                println(io, "    $(sym)(h, (int64_t)idx, _v, &_err, &_errmsg);")
+                println(io, "    if (_err) {")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError,")
+                println(io, "            _errmsg ? _errmsg : \"error in $dname\");")
+                println(io, "        free(_errmsg);")
+                println(io, "        return -1;")
+                println(io, "    }")
+                println(io, "    return 0;")
+                println(io, "}")
+
+            elseif m.dunder === :__contains__
+                # objobjproc: int (*)(PyObject*, PyObject*)
+                val_T  = m.extra_args[1].jl_type
+                val_cs = _CSCALARS[val_T]
+                println(io, "extern int8_t $(sym)(PtHandle, $(val_cs.ctype), int32_t *, char **);")
+                println(io, "static int _pt_slot_$(tname)_$(clean)(PyObject *self, PyObject *other) {")
+                println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)self;")
+                println(io, "    PtHandle h = { obj->_data };")
+                println(io, "    $(val_cs.tmptype) _tmp;")
+                println(io, "    if (!PyArg_Parse(other, \"$(val_cs.fmt)\", &_tmp)) return -1;")
+                println(io, "    $(val_cs.ctype) _v = ($(val_cs.ctype))_tmp;")
+                println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+                println(io, "    int8_t r = $(sym)(h, _v, &_err, &_errmsg);")
+                println(io, "    if (_err) {")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError,")
+                println(io, "            _errmsg ? _errmsg : \"error in $dname\");")
+                println(io, "        free(_errmsg);")
+                println(io, "        return -1;")
+                println(io, "    }")
+                println(io, "    return r ? 1 : 0;")
+                println(io, "}")
+
+            elseif m.dunder === :__call__
+                # ternaryfunc: PyObject* (*)(PyObject*, PyObject*, PyObject*)
+                # Parse extra args from the positional args tuple.
+                plans = [_arg_plan(c_abi_type(a.jl_type), i) for (i, a) in enumerate(m.extra_args)]
+                arg_ctypes = [_c_ctype(c_abi_type(a.jl_type)) for a in m.extra_args]
+                all_extern_params = join(["PtHandle", arg_ctypes..., "int32_t *", "char **"], ", ")
+                ret_c = c_abi_type(m.ret)
+                c_ret_type = _c_ctype(ret_c)
+                box_stmts  = _build_pyobject(ret_c, "r", "_result")
+                println(io, "extern $c_ret_type $(sym)($all_extern_params);")
+                println(io, "static PyObject *_pt_slot_$(tname)_$(clean)(PyObject *self, PyObject *args, PyObject *kw) {")
+                println(io, "    (void)kw;")
+                println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)self;")
+                println(io, "    PtHandle h = { obj->_data };")
+                for plan in plans
+                    for d in plan.decls; println(io, "    ", d); end
+                end
+                fmt = join([p.fmt for p in plans])
+                addrs_list = vcat([p.addrs for p in plans]...)
+                if isempty(plans)
+                    println(io, "    if (!PyArg_ParseTuple(args, \"\")) return NULL;")
+                else
+                    println(io, "    if (!PyArg_ParseTuple(args, \"$(fmt)\", ",
+                            join(addrs_list, ", "), ")) return NULL;")
+                end
+                for plan in plans
+                    for s in plan.setup; println(io, "    ", s); end
+                end
+                callargs = join([p.callarg for p in plans], ", ")
+                err_sep  = isempty(plans) ? "" : ", "
+                println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+                println(io, "    $c_ret_type r = $(sym)(h$(err_sep)$(callargs), &_err, &_errmsg);")
+                for plan in plans
+                    for s in plan.cleanup; println(io, "    ", s); end
+                end
+                println(io, "    if (_err) {")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError,")
+                println(io, "            _errmsg ? _errmsg : \"error in $dname\");")
+                println(io, "        free(_errmsg);")
+                println(io, "        return NULL;")
+                println(io, "    }")
+                for s in box_stmts; println(io, "    ", s); end
+                println(io, "    return _result;")
+                println(io, "}")
+
+            elseif m.dunder === :__iter__
+                # getiterfunc: PyObject* (*)(PyObject*) — self-return (Py_INCREF + return self).
+                println(io, "static PyObject *_pt_slot_$(tname)_$(clean)(PyObject *self) {")
+                println(io, "    Py_INCREF(self);")
+                println(io, "    return self;")
+                println(io, "}")
+
             elseif m.ret === String
                 # String return (repr/str pattern): char* → PyUnicode_FromString.
                 println(io, "extern char *$(sym)(PtHandle, int32_t *, char **);")
@@ -1177,6 +1277,7 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                 println(io, "    free(r);")
                 println(io, "    return result;")
                 println(io, "}")
+
             elseif m.ret === Int64
                 # Integer return (len/hash pattern): int64_t → Py_ssize_t / Py_hash_t.
                 cret = m.dunder === :__len__ ? "Py_ssize_t" : "Py_hash_t"
@@ -1194,8 +1295,9 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                 println(io, "    }")
                 println(io, "    return ($cret)r;")
                 println(io, "}")
+
             elseif m.ret === Bool
-                # Bool return (bool pattern): int8_t → int.
+                # Bool return (bool/contains pattern): int8_t → int.
                 println(io, "extern int8_t $(sym)(PtHandle, int32_t *, char **);")
                 println(io, "static int _pt_slot_$(tname)_$(clean)(PyObject *self) {")
                 println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)self;")
@@ -1297,6 +1399,106 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             println(io, "}")
         end
 
+        # Mutable setattr: when @pyhandle T mutable=true, generate a setattrofunc
+        # that writes each scalar field directly to the heap memory at its offset.
+        has_setattr = T in mutable_types
+        if has_setattr
+            mutable_scalar_fields = [(string(fieldname(T, i)), fieldtype(T, i), fieldoffset(T, i))
+                                     for i in 1:fieldcount(T) if isscalar(fieldtype(T, i))]
+            println(io, "static int _pt_setattr_$(tname)(PyObject *self, PyObject *name, PyObject *value) {")
+            println(io, "    if (value == NULL) {")
+            println(io, "        PyErr_SetString(PyExc_TypeError, \"cannot delete $tname attribute\");")
+            println(io, "        return -1;")
+            println(io, "    }")
+            println(io, "    void *_d = ((_PtObj_$(tname) *)self)->_data;")
+            for (fname, ftype, off) in mutable_scalar_fields
+                cs = _CSCALARS[ftype]
+                println(io, "    if (PyUnicode_CompareWithASCIIString(name, \"$fname\") == 0) {")
+                println(io, "        $(cs.tmptype) _tmp;")
+                println(io, "        if (!PyArg_Parse(value, \"$(cs.fmt)\", &_tmp)) return -1;")
+                println(io, "        *($(cs.ctype) *)((char *)_d + $off) = ($(cs.ctype))_tmp;")
+                println(io, "        return 0;")
+                println(io, "    }")
+            end
+            println(io, "    return PyObject_GenericSetAttr(self, name, value);")
+            println(io, "}")
+        end
+
+        # Context manager methods (__enter__ / __exit__) go in a PyMethodDef table.
+        # __enter__ is a self-return (Py_INCREF + return self, METH_NOARGS).
+        # __exit__ calls the Julia ccallable and ignores the exception args (METH_VARARGS).
+        enter_m = findfirst(m -> m.dunder === :__enter__, tmeths)
+        exit_m  = findfirst(m -> m.dunder === :__exit__,  tmeths)
+        has_tp_methods = !isnothing(enter_m) || !isnothing(exit_m)
+        if has_tp_methods
+            if !isnothing(enter_m)
+                println(io, "static PyObject *_pt_meth_$(tname)_enter(PyObject *self, PyObject *_unused) {")
+                println(io, "    (void)_unused;")
+                println(io, "    Py_INCREF(self);")
+                println(io, "    return self;")
+                println(io, "}")
+            end
+            if !isnothing(exit_m)
+                exit_sym = cabi_symbol(tmeths[exit_m])
+                println(io, "extern int8_t $(exit_sym)(PtHandle, int32_t *, char **);")
+                println(io, "static PyObject *_pt_meth_$(tname)_exit(PyObject *self, PyObject *args) {")
+                println(io, "    (void)args;")
+                println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)self;")
+                println(io, "    PtHandle h = { obj->_data };")
+                println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+                println(io, "    int8_t r = $(exit_sym)(h, &_err, &_errmsg);")
+                println(io, "    if (_err) {")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError,")
+                println(io, "            _errmsg ? _errmsg : \"error in __exit__\");")
+                println(io, "        free(_errmsg);")
+                println(io, "        return NULL;")
+                println(io, "    }")
+                println(io, "    return PyBool_FromLong((long)r);")
+                println(io, "}")
+            end
+            println(io, "static PyMethodDef _pt_methods_$(tname)[] = {")
+            !isnothing(enter_m) && println(io,
+                "    {\"__enter__\", (PyCFunction)_pt_meth_$(tname)_enter, METH_NOARGS, NULL},")
+            !isnothing(exit_m) && println(io,
+                "    {\"__exit__\", (PyCFunction)_pt_meth_$(tname)_exit, METH_VARARGS, NULL},")
+            println(io, "    {NULL, NULL, 0, NULL}")
+            println(io, "};")
+        end
+
+        # Properties: emit getter C functions and a PyGetSetDef table.
+        tprops = filter(p -> p.handle_type === T, properties)
+        has_getset = !isempty(tprops)
+        if has_getset
+            for p in tprops
+                get_sym = string("pt_prop_get_$(tname)_$(p.prop_name)")
+                vc = c_abi_type(p.val_type)
+                c_vt = _c_ctype(vc)
+                box_stmts = _build_pyobject(vc, "r", "_result")
+                println(io, "extern $c_vt $(get_sym)(PtHandle, int32_t *, char **);")
+                println(io, "static PyObject *_pt_getter_$(tname)_$(p.prop_name)(PyObject *self, void *closure) {")
+                println(io, "    (void)closure;")
+                println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)self;")
+                println(io, "    PtHandle h = { obj->_data };")
+                println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+                println(io, "    $c_vt r = $(get_sym)(h, &_err, &_errmsg);")
+                println(io, "    if (_err) {")
+                println(io, "        PyErr_SetString(PyExc_RuntimeError,")
+                println(io, "            _errmsg ? _errmsg : \"error in property $(p.prop_name)\");")
+                println(io, "        free(_errmsg);")
+                println(io, "        return NULL;")
+                println(io, "    }")
+                for s in box_stmts; println(io, "    ", s); end
+                println(io, "    return _result;")
+                println(io, "}")
+            end
+            println(io, "static PyGetSetDef _pt_getset_$(tname)[] = {")
+            for p in tprops
+                println(io, "    {\"$(p.prop_name)\", _pt_getter_$(tname)_$(p.prop_name), NULL, \"$(p.prop_name) (property)\", NULL},")
+            end
+            println(io, "    {NULL, NULL, NULL, NULL, NULL}")
+            println(io, "};")
+        end
+
         # tp_new slot: emitted before the slot array (needs the extern declaration).
         if tnew !== nothing
             _emit_tp_new_slot(io, tname, tnew)
@@ -1315,8 +1517,9 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             println(io, "    {Py_tp_repr,    (void *)_pt_repr_$tname},")
         end
         for m in tmeths
-            m.dunder === :__repr__ && continue                                          # already emitted above
-            m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__) && continue  # handled by richcmp below
+            m.dunder === :__repr__ && continue                       # already emitted above
+            m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__) && continue  # richcmp
+            m.dunder ∈ (:__enter__, :__exit__) && continue           # tp_methods
             clean = replace(replace(string(m.dunder), r"^__" => ""), r"__$" => "")
             slot  = _PYMETHOD_SLOTS[m.dunder].slot
             println(io, "    {$slot, (void *)_pt_slot_$(tname)_$(clean)},")
@@ -1326,6 +1529,15 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         end
         if has_getattr
             println(io, "    {Py_tp_getattro, (void *)_pt_getattr_$tname},")
+        end
+        if has_setattr
+            println(io, "    {Py_tp_setattro, (void *)_pt_setattr_$tname},")
+        end
+        if has_tp_methods
+            println(io, "    {Py_tp_methods, (void *)_pt_methods_$tname},")
+        end
+        if has_getset
+            println(io, "    {Py_tp_getset, (void *)_pt_getset_$tname},")
         end
         println(io, "    {0, NULL}")
         println(io, "};")
@@ -1443,6 +1655,8 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
                     handle_types::Vector{<:Type}=Type[],
                     methods::Vector{PtMethod}=PtMethod[],
                     news::Vector{PtNew}=PtNew[];
+                    mutable_types::Vector{<:Type}=Type[],
+                    properties::Vector{PtProperty}=PtProperty[],
                     doc::AbstractString="", abi3::Bool=false)
     isempty(doc) && (doc = "ParselTongue extension (Julia via juliac --trim)")
     io = IOBuffer()
@@ -1479,7 +1693,8 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
     if _uses_handles(exports) || !isempty(handle_types) || !isempty(methods)
         print(io, _PTHANDLE_TYPEDEF)
     end
-    _emit_handle_type_defs(io, mod_name, handle_types, methods, news)
+    _emit_handle_type_defs(io, mod_name, handle_types, methods, news;
+                           mutable_types, properties)
     structs = _array_structs(exports)
     if !isempty(structs)
         println(io, "/* C-ABI carriers for N-D arrays (match Julia PtArray{T,N}) */")
