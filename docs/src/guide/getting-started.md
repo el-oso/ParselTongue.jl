@@ -10,9 +10,21 @@ backed by compiled Julia.
   ```bash
   juliaup add 1.12
   ```
-- A **C compiler** (`cc`, `gcc`, or `clang`) on your `PATH`.
-- **`python3`** with development headers (the `Python.h` from `python3-dev` /
+- A **C compiler** on your `PATH` (see platform table below).
+- **`python3`** with development headers (`Python.h` from `python3-dev` /
   `python3-devel`).
+
+### Platform support
+
+| Platform | Supported | Compiler |
+|---|---|---|
+| Linux x86_64 | ✅ | `cc` / `gcc` / `clang` |
+| macOS arm64, x86_64 | ✅ | `cc` (Xcode clang) |
+| Windows x86_64 | ✅ | MinGW-w64 `gcc` (MSVC not supported) |
+
+**Windows:** install [MSYS2](https://www.msys2.org/) and ensure
+`C:\msys64\mingw64\bin` is on your `PATH`, or set the `JULIA_CC` environment
+variable to the full path of your `gcc.exe`.
 
 ## Install ParselTongue
 

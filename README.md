@@ -71,8 +71,20 @@ Pkg.add(url="https://github.com/el-oso/parseltongue.git")
 
 ## Requirements
 
-- Julia ≥ 1.12 with bundled `juliac` (e.g. via `juliaup`).
-- A C compiler (`cc`/`gcc`/`clang`) and `python3`.
+- Julia ≥ 1.12 with bundled `juliac` (available via `juliaup`).
+- A C compiler: `cc`/`gcc`/`clang` on Linux/macOS; MinGW-w64 `gcc` on Windows.
+- `python3` on the build host (any recent CPython 3.x).
+
+## Platform support
+
+| Platform | `build_extension` | `build_wheel` | Compiler required |
+|---|---|---|---|
+| Linux x86_64 | ✅ | ✅ | `cc` / `gcc` / `clang` |
+| macOS arm64, x86_64 | ✅ | ✅ | `cc` (Xcode clang) |
+| Windows x86_64 | ✅ | ✅ | MinGW-w64 `gcc` (MSVC not supported) |
+
+**Windows:** install [MSYS2](https://www.msys2.org/) and add
+`C:\msys64\mingw64\bin` to `PATH`, or point `JULIA_CC` at your `gcc.exe`.
 
 ## Known limitations (v1)
 
