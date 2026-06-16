@@ -7,14 +7,15 @@ using ParselTongue
 # proof — juliac errors on any dynamic dispatch in an exported path.
 
 # On Windows, Python 3.8+ ignores PATH for extension DLL resolution; every
-# required directory must be registered via os.add_dll_directory. Add:
-#   • Sys.BINDIR  — libjulia.dll, libjulia-internal.dll
-#   • dirname(gcc) — MinGW runtime DLLs (libgcc_s_seh-1, libwinpthread-1, …)
+# required directory must be registered via os.add_dll_directory.
+# Sys.BINDIR holds libjulia.dll, libjulia-internal.dll, libjulia-codegen.dll,
+# AND the MinGW-w64 runtime DLLs that Julia ships (libgcc_s_seh-1.dll,
+# libstdc++-6.dll, libwinpthread-1.dll).  We must NOT add a separate MinGW
+# bin/ because different DLL versions conflict and break Julia's codegen init.
+# lib/julia contains additional support DLLs (OpenBLAS, etc.).
 function _win_dll_preamble()
     Sys.iswindows() || return ""
-    dirs = String[Sys.BINDIR]
-    gcc = Sys.which("gcc")
-    gcc !== nothing && push!(dirs, dirname(gcc))
+    dirs = String[Sys.BINDIR, joinpath(Sys.LIBDIR, "julia")]
     calls = join(["os.add_dll_directory($(repr(d)))" for d in unique(dirs)], "; ")
     "import os; $calls\n"
 end
