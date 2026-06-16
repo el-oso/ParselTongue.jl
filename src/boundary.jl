@@ -138,7 +138,7 @@ end
 """
     PtHandle{T}
 
-C-ABI carrier for opaque-handle boundary types registered with [`@pyhandle`](@ref).
+C-ABI carrier for opaque-handle boundary types registered with `@pyhandle`.
 Wraps a `void *` pointing to a heap-allocated copy of the Julia struct. On the Python
 side the handle appears as an instance of a proper Python class (`mod.T`); the C heap
 memory is freed automatically when the Python object is garbage-collected.
