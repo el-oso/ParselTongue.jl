@@ -276,6 +276,11 @@ end
         except TypeError:
             pass
         del na, nb, s, d, ng
+        # Bound named method on an immutable @pyhandle: returns a new handle.
+        pt_b = feature.Pt2D(1.0, 2.0)
+        pt_t = pt_b.translated(3.0, 4.0)
+        assert isinstance(pt_t, feature.Pt2D) and pt_t.x == 4.0 and pt_t.y == 6.0, "Pt2D.translated"
+        del pt_b, pt_t
         # Item O7: @pymutable — mutable struct with a String field, backed by a GC registry.
         acc = feature.Accumulator("temps")
         assert isinstance(acc, feature.Accumulator), "Accumulator instance"
@@ -289,9 +294,15 @@ end
         assert acc.total == 100.0 and feature.acc_total(acc) == 100.0, "field write"
         acc.label = "renamed"
         assert acc.label == "renamed", f"String field write: {acc.label}"
+        # Bound named methods on @pymutable: mutate the live object, persist, read fields.
+        acc.total = 0.0
+        assert acc.add(1.5) == 1.5, "bound method acc.add"
+        assert acc.add(2.5) == 4.0, "bound method mutation persists"
+        assert acc.total == 4.0, "field reflects bound-method mutation"
+        assert acc.describe() == "renamed", "bound method returning String"
         acc2 = feature.Accumulator("other")   # independent instance
         feature.acc_add(acc2, 7.0)
-        assert acc2.total == 7.0 and acc.total == 100.0, "instances independent"
+        assert acc2.total == 7.0 and acc.total == 4.0, "instances independent"
         del acc, acc2
         import gc as _gc2; _gc2.collect()      # dealloc drops registry refs (no crash)
         # Item O8b: @pymutable + __next__ stateful iterator.

@@ -387,6 +387,52 @@ function _pt_catch_stmts()
     String(take!(io))
 end
 
+"""
+    emit_ccallable_named_method(m::PtNamedMethod; errors=PtError[]) -> String
+
+Return the Julia source for the `Base.@ccallable` wrapper of a bound named method
+`obj.name(args)`. Shape mirrors a `@pyfunc` whose first arg is the handle: self is a
+`PtHandle{T}` carrier (`from_c` extracts the value/live object); extra args are
+boundary carriers. A `Nothing` return compiles to `Cvoid`.
+"""
+function emit_ccallable_named_method(m::PtNamedMethod; errors::Vector{PtError}=PtError[])
+    sym    = cabi_symbol(m)
+    T      = m.handle_type
+    self_c = _type_src(c_abi_type(T))
+    T_src  = _type_src(T)
+    extra_params = join([string(", _a", i, "::", _type_src(c_abi_type(a.jl_type)))
+                         for (i, a) in enumerate(m.extra_args)])
+    extra_call = join([string(", ParselTongue.from_c(", _type_src(a.jl_type), ", _a", i, ")")
+                       for (i, a) in enumerate(m.extra_args)])
+    call = string(m.jl_func, "(ParselTongue.from_c(", T_src, ", _self)", extra_call, ")")
+    catch_stmts = _pt_catch_stmts()
+    sig_head = string("Base.@ccallable function ", sym, "(_self::", self_c, extra_params,
+                      ", _pt_err::Ptr{Int32}, _pt_errmsg::Ptr{Ptr{UInt8}})")
+    if m.ret === Nothing
+        return string(sig_head, "::Cvoid\n",
+            "    try\n",
+            "        ", call, "\n",
+            "        unsafe_store!(_pt_err, Int32(0))\n",
+            "        unsafe_store!(_pt_errmsg, Ptr{UInt8}(0))\n",
+            "    catch _e\n", catch_stmts, "    end\n",
+            "    return\n", "end\n")
+    end
+    ret_c     = c_abi_type(m.ret)
+    ret_src   = _type_src(ret_c)
+    zero      = _zero_cval(ret_c)
+    to_c_expr = isopt(ret_c) ?
+        string("ParselTongue._to_c_opt(", ret_src, ", ", call, ")") :
+        string("ParselTongue.to_c(", call, ")")
+    return string(sig_head, "::", ret_src, "\n",
+        "    local _result::", ret_src, " = ", zero, "\n",
+        "    try\n",
+        "        _result = ", to_c_expr, "\n",
+        "        unsafe_store!(_pt_err, Int32(0))\n",
+        "        unsafe_store!(_pt_errmsg, Ptr{UInt8}(0))\n",
+        "    catch _e\n", catch_stmts, "    end\n",
+        "    return _result\n", "end\n")
+end
+
 # Field types of a @pymutable struct that are exposed as Python attributes:
 # the scalar boundary types plus String. Returns [(fieldname::String, FieldType)].
 function _pymut_accessor_fields(T::Type)
@@ -464,6 +510,7 @@ function emit_entry(exports::AbstractVector{PtExport}, user_path::AbstractString
                     methods::Vector{PtMethod}=PtMethod[],
                     news::Vector{PtNew}=PtNew[],
                     properties::Vector{PtProperty}=PtProperty[],
+                    named_methods::Vector{PtNamedMethod}=PtNamedMethod[],
                     mutable_struct_types::AbstractVector{<:Type}=Type[],
                     extra_includes::AbstractVector{<:AbstractString}=String[])
     io = IOBuffer()
@@ -493,6 +540,9 @@ function emit_entry(exports::AbstractVector{PtExport}, user_path::AbstractString
     end
     for p in properties
         println(io, emit_ccallable_property(p; errors))
+    end
+    for m in named_methods
+        println(io, emit_ccallable_named_method(m; errors))
     end
     for T in mutable_struct_types
         # The dealloc @ccallable is emitted by the @pymutable macro in the user

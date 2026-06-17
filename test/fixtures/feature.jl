@@ -43,6 +43,9 @@ end
 # @pyproperty (O10): computed read-only property.
 @pyproperty Pt2D norm::Float64 (p -> sqrt(p.x^2 + p.y^2))
 
+# Bound named method on an immutable @pyhandle: returns a new handle.
+@pymethod translated(p::Pt2D, dx::Float64, dy::Float64)::Pt2D = Pt2D(p.x + dx, p.y + dy)
+
 # Numeric dunders: binary ops (same-handle other) + unary ops.
 @pymethod __add__ pt2d_add(p::Pt2D, q::Pt2D)::Pt2D = Pt2D(p.x + q.x, p.y + q.y)
 @pymethod __sub__ pt2d_sub(p::Pt2D, q::Pt2D)::Pt2D = Pt2D(p.x - q.x, p.y - q.y)
@@ -69,6 +72,9 @@ mutable struct Accumulator
 end
 @pymutable Accumulator
 @pymethod __new__ acc_new(label::String)::Accumulator = Accumulator(0.0, label)
+# Bound named methods: `acc.add(x)` mutates the live object; `acc.describe()` reads it.
+@pymethod add!(a::Accumulator, x::Float64)::Float64 = (a.total += x; a.total)
+@pymethod describe(a::Accumulator)::String = a.label
 
 # O8b stateful iterator: @pymutable + __next__ advancing state in place.
 mutable struct CountUp

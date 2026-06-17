@@ -201,9 +201,35 @@ struct PtProperty
     val_type::Type
 end
 
-# Build-host registries for mutable handle types and properties.
+"""
+    PtNamedMethod(handle_type, py_name, jl_func, self_arg, extra_args, ret)
+
+A bound, named instance method registered via `@pymethod name f(self::T, …) = …`
+(name is a plain identifier, not a dunder). Exposed as `obj.name(args)` via the
+type's `PyMethodDef` table (`Py_tp_methods`). Like a `@pyfunc` whose first argument
+is the handle, but invoked as a method on the Python object.
+"""
+struct PtNamedMethod
+    handle_type::Type
+    py_name::String
+    jl_func::Symbol
+    self_arg::PtArg
+    extra_args::Vector{PtArg}
+    ret::Type
+end
+
+cabi_symbol(m::PtNamedMethod) = string("pt_namedmeth_", m.handle_type.name.name, "_", m.py_name)
+
+# Build-host registries for mutable handle types, properties, and named methods.
 const _MUTABLE_HANDLE_TYPES = Type[]
 const _PROPERTIES = PtProperty[]
+const _NAMED_METHODS = PtNamedMethod[]
+
+# Opt-in subclassing flags (mirror PyO3 #[pyclass(subclass)] / #[pyclass(dict)]).
+# _SUBCLASS_TYPES: Py_TPFLAGS_BASETYPE + subclass-aware tp_new (abi3-safe).
+# _DICT_TYPES: instance __dict__ via managed dict (CPython ≥ 3.12; incompatible with abi3).
+const _SUBCLASS_TYPES = Type[]
+const _DICT_TYPES = Type[]
 
 # Build-host registry for @pymutable types: non-isbits `mutable struct`s backed by
 # a per-type Julia GC registry (Dict{Int64,T}). Distinct from _MUTABLE_HANDLE_TYPES,
@@ -289,6 +315,26 @@ function _register_method!(m::PtMethod)
     return m
 end
 
+function _register_named_method!(m::PtNamedMethod)
+    T = m.handle_type
+    ishandle(c_abi_type(T)) ||
+        error("@pymethod $(m.py_name): type `$T` is not registered with @pyhandle/@pymutable.")
+    T in _HANDLE_TYPES || push!(_HANDLE_TYPES, T)
+    m.ret === Nothing || try
+        c_abi_type(m.ret)
+    catch e
+        error("@pymethod $(m.py_name): return type `$(m.ret)` is not a boundary type: $e")
+    end
+    for a in m.extra_args
+        try; c_abi_type(a.jl_type); catch e
+            error("@pymethod $(m.py_name): arg `$(a.name)::$(a.jl_type)` is not a boundary type: $e")
+        end
+    end
+    filter!(x -> !(x.handle_type === T && x.py_name == m.py_name), _NAMED_METHODS)
+    push!(_NAMED_METHODS, m)
+    return m
+end
+
 # A valid Python / C identifier (also the C-ABI symbol name).
 _is_py_ident(s::AbstractString) = occursin(r"^[A-Za-z_][A-Za-z0-9_]*$", s)
 
@@ -311,7 +357,28 @@ const _EXPORTS = PtExport[]
 
 Reset the export registry. Called at the start of each `build_extension`.
 """
-clear_exports!() = (empty!(_EXPORTS); empty!(_ERRORS); empty!(_HANDLE_TYPES); empty!(_METHODS); empty!(_NEWS); empty!(_MUTABLE_HANDLE_TYPES); empty!(_PROPERTIES); empty!(_MUTABLE_STRUCT_TYPES); _MODULE_NAME[] = nothing; _CURRENT_SUBMODULE[] = ""; nothing)
+clear_exports!() = (empty!(_EXPORTS); empty!(_ERRORS); empty!(_HANDLE_TYPES); empty!(_METHODS); empty!(_NEWS); empty!(_MUTABLE_HANDLE_TYPES); empty!(_PROPERTIES); empty!(_MUTABLE_STRUCT_TYPES); empty!(_NAMED_METHODS); empty!(_SUBCLASS_TYPES); empty!(_DICT_TYPES); _MODULE_NAME[] = nothing; _CURRENT_SUBMODULE[] = ""; nothing)
+
+"""
+    _registry_snapshot() -> NamedTuple
+
+Copy all build-host registries into a NamedTuple — the `_preloaded` payload passed
+from `build_wheel`/`build_multi_wheel` to `build_extension` to skip a second include.
+Named fields let the pipeline grow without reshuffling a positional tuple.
+"""
+_registry_snapshot() = (
+    exports              = copy(_EXPORTS),
+    errors               = copy(_ERRORS),
+    handle_types         = copy(_HANDLE_TYPES),
+    methods              = copy(_METHODS),
+    news                 = copy(_NEWS),
+    mutable_types        = copy(_MUTABLE_HANDLE_TYPES),
+    properties           = copy(_PROPERTIES),
+    mutable_struct_types = copy(_MUTABLE_STRUCT_TYPES),
+    named_methods        = copy(_NAMED_METHODS),
+    subclass_types       = copy(_SUBCLASS_TYPES),
+    dict_types           = copy(_DICT_TYPES),
+)
 
 # Distinct, ordered submodule names among `exports` (excluding the "" top level).
 function submodule_names(exports::AbstractVector{PtExport})
@@ -658,7 +725,46 @@ want. Cross-type comparison always returns `NotImplemented`. Note that Python ma
 a type unhashable when `__eq__` is defined without `__hash__`; register
 `@pymethod __hash__` as well to retain hashability.
 """
-macro pymethod(dunder, fundef)
+# Named bound-method form: `@pymethod name(self::T, args...)::R = body` (one argument,
+# the method name is the function name). Registered in the type's PyMethodDef table so
+# Python calls `obj.name(args)`. Returns the macro-expansion Expr.
+function _pymethod_named_impl(fundef)
+    fname, rawargs, ret_expr = _parse_fundef(fundef)
+    (haskey(_PYMETHOD_SLOTS, fname) || fname === :__new__) && error(
+        "@pymethod: `$fname` is a dunder — use the two-arg form `@pymethod $fname impl(...)`.")
+    isempty(rawargs) && error("@pymethod $fname: needs a `self` argument (self::T).")
+    py_name = _default_py_name(string(fname))
+    (sname, stype_expr, smut, sdefault, skw) = rawargs[1]
+    smut && error("@pymethod $fname: self argument cannot be Mut{…}.")
+    sdefault === nothing || error("@pymethod $fname: self argument cannot have a default value.")
+    skw && error("@pymethod $fname: self argument cannot be a keyword argument.")
+    extra_arg_exprs = Any[]
+    for (ename, etype_expr, emut, edefault, ekw) in rawargs[2:end]
+        emut && error("@pymethod $fname: argument `$ename` cannot be Mut{…}.")
+        edefault === nothing || error("@pymethod $fname: argument `$ename` cannot have a default value.")
+        ekw && error("@pymethod $fname: argument `$ename` cannot be a keyword argument.")
+        push!(extra_arg_exprs,
+              :(ParselTongue.PtArg($(QuoteNode(ename)), $(esc(etype_expr)), false, nothing, false)))
+    end
+    fname_sym = QuoteNode(fname)
+    sname_sym = QuoteNode(sname)
+    quote
+        $(esc(fundef))
+        let _T = $(esc(stype_expr)), _ret = $(esc(ret_expr))
+            _self_arg = ParselTongue.PtArg($sname_sym, _T, false, nothing, false)
+            _extra = ParselTongue.PtArg[$(extra_arg_exprs...)]
+            ParselTongue._register_named_method!(
+                ParselTongue.PtNamedMethod(_T, $py_name, $fname_sym, _self_arg, _extra, _ret))
+        end
+        nothing
+    end
+end
+
+macro pymethod(arg1, arg2=nothing)
+    # One-arg form is a named bound method; two-arg form is a dunder.
+    arg2 === nothing && return _pymethod_named_impl(arg1)
+    dunder = arg1
+    fundef = arg2
     dunder isa Symbol || error(
         "@pymethod: first argument must be a dunder symbol (e.g. __repr__), got: $dunder")
 

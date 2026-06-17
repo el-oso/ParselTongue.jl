@@ -135,10 +135,9 @@ function build_wheel(user_path::AbstractString;
           _MODULE_NAME[] !== nothing ? _MODULE_NAME[] :
           _default_mod_name(user_path)
     _is_valid_modname(mod) || error("ParselTongue: invalid module name '$mod'.")
-    preloaded    = (copy(_EXPORTS), copy(_ERRORS), copy(_HANDLE_TYPES), copy(_METHODS), copy(_NEWS),
-                    copy(_MUTABLE_HANDLE_TYPES), copy(_PROPERTIES), copy(_MUTABLE_STRUCT_TYPES))
-    exports      = preloaded[1]
-    handle_types = preloaded[3]
+    preloaded    = _registry_snapshot()
+    exports      = preloaded.exports
+    handle_types = preloaded.handle_types
 
     mkpath(outdir)
     stage = mktempdir(; prefix="ptwheel_", cleanup=!keep_build)
@@ -305,6 +304,7 @@ function build_multi_wheel(sources::AbstractVector{<:AbstractString},
     all_exports = PtExport[]; all_errors = PtError[]
     all_handles = Type[];     all_methods = PtMethod[]; all_news = PtNew[]
     all_mutable_types = Type[];  all_properties = PtProperty[]; all_mutable_structs = Type[]
+    all_named = PtNamedMethod[]; all_subclass = Type[]; all_dict = Type[]
     seen_names = Dict{String,String}()   # export_name → submodule (for collision report)
     for p in paths
         clear_exports!(); _MODULE_NAME[] = nothing
@@ -336,7 +336,10 @@ function build_multi_wheel(sources::AbstractVector{<:AbstractString},
         append!(all_news, _NEWS)
         for T in _MUTABLE_HANDLE_TYPES; T in all_mutable_types || push!(all_mutable_types, T); end
         for T in _MUTABLE_STRUCT_TYPES; T in all_mutable_structs || push!(all_mutable_structs, T); end
+        for T in _SUBCLASS_TYPES; T in all_subclass || push!(all_subclass, T); end
+        for T in _DICT_TYPES; T in all_dict || push!(all_dict, T); end
         append!(all_properties, _PROPERTIES)
+        append!(all_named, _NAMED_METHODS)
     end
 
     mkpath(outdir)
@@ -347,8 +350,10 @@ function build_multi_wheel(sources::AbstractVector{<:AbstractString},
     origin = Sys.isapple() ? "@loader_path" : "\$ORIGIN"
     rpaths = (runtime === :bundled && !Sys.iswindows()) ?
         ["$origin/julia/lib", "$origin/julia/lib/julia"] : String[]
-    preloaded = (all_exports, all_errors, all_handles, all_methods, all_news,
-                 all_mutable_types, all_properties, all_mutable_structs)
+    preloaded = (exports=all_exports, errors=all_errors, handle_types=all_handles,
+                 methods=all_methods, news=all_news, mutable_types=all_mutable_types,
+                 properties=all_properties, mutable_struct_types=all_mutable_structs,
+                 named_methods=all_named, subclass_types=all_subclass, dict_types=all_dict)
     # One extension from all sources: the first is user_path, the rest extra_includes.
     so = build_extension(paths[1];
                          mod_name=ext_name, outdir=pkgdir, trim, python, abi3,

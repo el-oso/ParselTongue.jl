@@ -26,7 +26,8 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     PtMethod, _METHODS, emit_ccallable_method,
                     PtNew, _NEWS, emit_ccallable_new,
                     PtProperty, _PROPERTIES, _MUTABLE_HANDLE_TYPES, emit_ccallable_property,
-                    _MUTABLE_STRUCT_TYPES, emit_ccallable_field_accessors
+                    _MUTABLE_STRUCT_TYPES, emit_ccallable_field_accessors,
+                    PtNamedMethod, _NAMED_METHODS, emit_ccallable_named_method
 
 # Defined at file scope so Core.eval can resolve it during @pyhandle macro expansion.
 struct _TestHandle
@@ -1038,6 +1039,49 @@ end
     # __next__ must return Union{V,Nothing}; a plain scalar return is rejected.
     err = try
         @eval @pymethod __next__ bad_next(m::_TestMutable)::Int64 = 1
+        nothing
+    catch e; e; end
+    @test (err isa LoadError ? err.error : err) isa ErrorException
+
+    clear_exports!()
+end
+
+# ── Bound named methods (obj.method(args)) ───────────────────────────────────
+
+@testset "@pymethod named bound methods" begin
+    clear_exports!()
+    push!(_MUTABLE_STRUCT_TYPES, _TestMutable)
+    push!(_HANDLE_TYPES, _TestMutable)
+    @pymethod bump!(m::_TestMutable)::Int64 = (m.count += 1; m.count)
+    @pymethod tag(m::_TestMutable, n::Int64)::Int64 = m.count + n
+    @pymethod name_of(m::_TestMutable)::String = m.label
+
+    @test length(_NAMED_METHODS) == 3
+    bm = _NAMED_METHODS[findfirst(x -> x.py_name == "bump", _NAMED_METHODS)]
+    @test bm.py_name == "bump"          # trailing ! stripped by _default_py_name
+    @test bm.handle_type === _TestMutable
+    @test bm.ret === Int64 && isempty(bm.extra_args)
+    tm = _NAMED_METHODS[findfirst(x -> x.py_name == "tag", _NAMED_METHODS)]
+    @test length(tm.extra_args) == 1 && tm.extra_args[1].jl_type === Int64
+
+    # ccallable: self is a PtHandle carrier; extra args are boundary carriers.
+    code = emit_ccallable_named_method(bm)
+    @test occursin("pt_namedmeth__TestMutable_bump", code)
+    @test occursin("PtHandle{_TestMutable}", code)
+    code_tag = emit_ccallable_named_method(tm)
+    @test occursin("_a1::Int64", code_tag)
+
+    # C shim: PyMethodDef table entries (METH_VARARGS) routed through Py_tp_methods.
+    c = emit_cshim("nmm", _EXPORTS, PtError[], [_TestMutable], PtMethod[], PtNew[];
+                   named_methods=_NAMED_METHODS, mutable_struct_types=[_TestMutable])
+    @test occursin("Py_tp_methods", c)
+    @test occursin("_pt_namedwrap__TestMutable_bump", c)
+    @test occursin("\"bump\"", c) && occursin("\"tag\"", c) && occursin("\"name_of\"", c)
+    @test occursin("METH_VARARGS", c)
+
+    # The one-arg form rejects dunder names (use the two-arg form for those).
+    err = try
+        @eval @pymethod __len__(m::_TestMutable)::Int64 = 1
         nothing
     catch e; e; end
     @test (err isa LoadError ? err.error : err) isa ErrorException

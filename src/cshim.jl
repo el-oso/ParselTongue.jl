@@ -175,7 +175,8 @@ end
 function _carrier_set(exports::AbstractVector{PtExport},
                       methods::AbstractVector{PtMethod},
                       news::AbstractVector{PtNew},
-                      properties::AbstractVector{PtProperty})
+                      properties::AbstractVector{PtProperty},
+                      named_methods::AbstractVector{PtNamedMethod}=PtNamedMethod[])
     set = _all_carriers(exports)
     for m in methods
         _collect_carriers!(set, c_abi_type(m.ret))
@@ -186,6 +187,10 @@ function _carrier_set(exports::AbstractVector{PtExport},
     end
     for p in properties
         _collect_carriers!(set, c_abi_type(p.val_type))
+    end
+    for m in named_methods
+        m.ret === Nothing || _collect_carriers!(set, c_abi_type(m.ret))
+        for a in m.extra_args; _collect_carriers!(set, c_abi_type(a.jl_type)); end
     end
     return set
 end
@@ -1120,6 +1125,57 @@ function _emit_tp_new_slot(io::IO, tname::String, n::PtNew; abi3::Bool=false)
     println(io, "}")
 end
 
+# Emit the C `PyCFunction` (METH_VARARGS) wrapper for a bound named method
+# `obj.name(args)`. Self handle + tuple-parsed args → Julia ccallable → boxed return.
+function _emit_named_method_wrapper(io::IO, tname::String, m::PtNamedMethod)
+    sym   = cabi_symbol(m)
+    plans = [_arg_plan(c_abi_type(a.jl_type), i) for (i, a) in enumerate(m.extra_args)]
+    arg_ctypes = [_c_ctype(c_abi_type(a.jl_type)) for a in m.extra_args]
+    is_void = m.ret === Nothing
+    ret_c   = is_void ? Cvoid : c_abi_type(m.ret)
+    ret_ct  = is_void ? "void" : _c_ctype(ret_c)
+    extern_params = join(["PtHandle", arg_ctypes..., "int32_t *", "char **"], ", ")
+    println(io, "extern $ret_ct $(sym)($extern_params);")
+    println(io, "static PyObject *_pt_namedwrap_$(tname)_$(m.py_name)(PyObject *self, PyObject *args) {")
+    println(io, "    PtHandle h = { ((_PtObj_$(tname) *)self)->_data };")
+    for plan in plans
+        for d in plan.decls; println(io, "    ", d); end
+    end
+    fmt = join([p.fmt for p in plans])
+    addrs_list = vcat([p.addrs for p in plans]...)
+    if isempty(plans)
+        println(io, "    if (!PyArg_ParseTuple(args, \"\")) return NULL;")
+    else
+        println(io, "    if (!PyArg_ParseTuple(args, \"$(fmt)\", ", join(addrs_list, ", "), ")) return NULL;")
+    end
+    for plan in plans
+        for s in plan.setup; println(io, "    ", s); end
+    end
+    callargs = join([p.callarg for p in plans], ", ")
+    err_sep  = isempty(plans) ? "" : ", "
+    println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+    if is_void
+        println(io, "    $(sym)(h$(err_sep)$(callargs), &_err, &_errmsg);")
+    else
+        println(io, "    $ret_ct r = $(sym)(h$(err_sep)$(callargs), &_err, &_errmsg);")
+    end
+    for plan in plans
+        for s in plan.cleanup; println(io, "    ", s); end
+    end
+    println(io, "    if (_err) {")
+    println(io, "        PyErr_SetString(PyExc_RuntimeError, _errmsg ? _errmsg : \"error in $(m.py_name)\");")
+    println(io, "        free(_errmsg);")
+    println(io, "        return NULL;")
+    println(io, "    }")
+    if is_void
+        println(io, "    Py_RETURN_NONE;")
+    else
+        for s in _build_pyobject(ret_c, "r", "_result"); println(io, "    ", s); end
+        println(io, "    return _result;")
+    end
+    println(io, "}")
+end
+
 # Emit per-type C structs, destructors, PyType_Spec, make-object helpers.
 # Each @pyhandle T gets a proper PyTypeObject so Python sees `mod.T` as a real class.
 # `methods` is the full list of PtMethod registrations; dunders for T are injected
@@ -1131,7 +1187,8 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                                 news::AbstractVector{PtNew}=PtNew[];
                                 mutable_types::AbstractVector{<:Type}=Type[],
                                 mutable_struct_types::AbstractVector{<:Type}=Type[],
-                                properties::AbstractVector{PtProperty}=PtProperty[])
+                                properties::AbstractVector{PtProperty}=PtProperty[],
+                                named_methods::AbstractVector{PtNamedMethod}=PtNamedMethod[])
     isempty(handle_types) && return
     println(io, "/* @pyhandle types: each becomes a real Python class (isinstance, repr, etc.) */")
     for T in handle_types
@@ -1597,12 +1654,12 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             end
         end
 
-        # Context manager methods (__enter__ / __exit__) go in a PyMethodDef table.
-        # __enter__ is a self-return (Py_INCREF + return self, METH_NOARGS).
-        # __exit__ calls the Julia ccallable and ignores the exception args (METH_VARARGS).
+        # PyMethodDef table (Py_tp_methods): context managers (__enter__/__exit__) +
+        # bound named methods (obj.name(args)).
         enter_m = findfirst(m -> m.dunder === :__enter__, tmeths)
         exit_m  = findfirst(m -> m.dunder === :__exit__,  tmeths)
-        has_tp_methods = !isnothing(enter_m) || !isnothing(exit_m)
+        tnamed  = filter(m -> m.handle_type === T, named_methods)
+        has_tp_methods = !isnothing(enter_m) || !isnothing(exit_m) || !isempty(tnamed)
         if has_tp_methods
             if !isnothing(enter_m)
                 println(io, "static PyObject *_pt_meth_$(tname)_enter(PyObject *self, PyObject *_unused) {")
@@ -1629,11 +1686,17 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                 println(io, "    return PyBool_FromLong((long)r);")
                 println(io, "}")
             end
+            for m in tnamed
+                _emit_named_method_wrapper(io, tname, m)
+            end
             println(io, "static PyMethodDef _pt_methods_$(tname)[] = {")
             !isnothing(enter_m) && println(io,
                 "    {\"__enter__\", (PyCFunction)_pt_meth_$(tname)_enter, METH_NOARGS, NULL},")
             !isnothing(exit_m) && println(io,
                 "    {\"__exit__\", (PyCFunction)_pt_meth_$(tname)_exit, METH_VARARGS, NULL},")
+            for m in tnamed
+                println(io, "    {\"$(m.py_name)\", (PyCFunction)_pt_namedwrap_$(tname)_$(m.py_name), METH_VARARGS, NULL},")
+            end
             println(io, "    {NULL, NULL, 0, NULL}")
             println(io, "};")
         end
@@ -1831,6 +1894,7 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
                     mutable_types::Vector{<:Type}=Type[],
                     mutable_struct_types::Vector{<:Type}=Type[],
                     properties::Vector{PtProperty}=PtProperty[],
+                    named_methods::Vector{PtNamedMethod}=PtNamedMethod[],
                     doc::AbstractString="", abi3::Bool=false)
     isempty(doc) && (doc = "ParselTongue extension (Julia via juliac --trim)")
     io = IOBuffer()
@@ -1855,9 +1919,9 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
     # All C-ABI carrier typedefs are emitted up front (before the handle-type defs),
     # because @pymethod slot wrappers — generated inside the handle defs — may
     # reference array/opt/dict/tuple carriers (e.g. __getitem__/__next__ returns).
-    carriers = _carrier_set(exports, methods, news, properties)
+    carriers = _carrier_set(exports, methods, news, properties, named_methods)
     # PtHandle first: tuple carriers may embed it as a field.
-    if _uses_handles(exports) || !isempty(handle_types) || !isempty(methods)
+    if _uses_handles(exports) || !isempty(handle_types) || !isempty(methods) || !isempty(named_methods)
         print(io, _PTHANDLE_TYPEDEF)
     end
     cstructs = _complex_structs(carriers)
@@ -1898,7 +1962,7 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
         println(io)
     end
     _emit_handle_type_defs(io, mod_name, handle_types, methods, news;
-                           mutable_types, mutable_struct_types, properties)
+                           mutable_types, mutable_struct_types, properties, named_methods)
     println(io, "/* C-ABI entry points emitted by juliac --trim */")
     for e in exports
         println(io, _extern_decl(e))

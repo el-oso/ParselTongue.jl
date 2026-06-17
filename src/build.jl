@@ -87,10 +87,9 @@ function build_extension(user_path::AbstractString;
                          # Internal: extra source files to `include` in the juliac entry
                          # (multi-module wheels aggregate several sources into one image).
                          _extra_includes::Vector{String}=String[],
-                         # Internal: pass (exports, errors, handle_types, methods, news,
-                         # mutable_types, properties, mutable_struct_types) from build_wheel
-                         # to skip the second include of the user source.
-                         _preloaded::Union{Nothing,Tuple{Vector{PtExport},Vector{PtError},Vector{<:Type},Vector{PtMethod},Vector{PtNew},Vector{<:Type},Vector{PtProperty},Vector{<:Type}}}=nothing)
+                         # Internal: a registry snapshot NamedTuple (see _registry_snapshot)
+                         # from build_wheel, to skip the second include of the user source.
+                         _preloaded::Union{Nothing,NamedTuple}=nothing)
     user_path = abspath(user_path)
     isfile(user_path) || error("ParselTongue: source file not found: $user_path")
     trim in (:safe, :unsafe, :unsafe_warn) ||
@@ -99,17 +98,26 @@ function build_extension(user_path::AbstractString;
     # 1. Populate the export registry by including the user source in a sandbox.
     #    When called from build_wheel, the caller already included the file and passes
     #    pre-populated exports/errors to avoid a redundant second include.
-    exports, errors, handle_types, methods, news_list, mutable_types, properties, mutable_struct_types =
-        if _preloaded !== nothing
-            _preloaded
-        else
-            clear_exports!()
-            sandbox = Module(:ParselTongueUserSandbox)
-            Core.eval(sandbox, :(using ParselTongue))
-            Base.include(sandbox, user_path)
-            (copy(_EXPORTS), copy(_ERRORS), copy(_HANDLE_TYPES), copy(_METHODS), copy(_NEWS),
-             copy(_MUTABLE_HANDLE_TYPES), copy(_PROPERTIES), copy(_MUTABLE_STRUCT_TYPES))
-        end
+    spec = if _preloaded !== nothing
+        _preloaded
+    else
+        clear_exports!()
+        sandbox = Module(:ParselTongueUserSandbox)
+        Core.eval(sandbox, :(using ParselTongue))
+        Base.include(sandbox, user_path)
+        _registry_snapshot()
+    end
+    exports              = spec.exports
+    errors               = spec.errors
+    handle_types         = spec.handle_types
+    methods              = spec.methods
+    news_list            = spec.news
+    mutable_types        = spec.mutable_types
+    properties           = spec.properties
+    mutable_struct_types = spec.mutable_struct_types
+    named_methods        = spec.named_methods
+    subclass_types       = spec.subclass_types
+    dict_types           = spec.dict_types
     isempty(exports) && error(
         "ParselTongue: no @pyfunc exports found in $user_path. " *
         "Annotate functions with @pyfunc.")
@@ -130,7 +138,7 @@ function build_extension(user_path::AbstractString;
     # so c_abi_type dispatch inside the codegen must use the current latest world.
     entry_path = joinpath(builddir, "_pt_entry.jl")
     write(entry_path, Base.invokelatest(emit_entry, exports, user_path; errors, methods,
-                                        news=news_list, properties, mutable_struct_types,
+                                        news=news_list, properties, named_methods, mutable_struct_types,
                                         extra_includes=_extra_includes))
 
     # 3. Run juliac --trim to produce the trimmed object archive.
@@ -140,7 +148,7 @@ function build_extension(user_path::AbstractString;
     # 4. Generate the C PyInit shim.
     cpath = joinpath(builddir, string("_", mod, "module.c"))
     write(cpath, Base.invokelatest(emit_cshim, mod, exports, errors, handle_types, methods, news_list;
-                                   mutable_types, mutable_struct_types, properties, abi3))
+                                   mutable_types, mutable_struct_types, properties, named_methods, abi3))
 
     # 5. Link the shim + archive into the extension module.
     so_path = joinpath(outdir, string(mod, ext_suffix))
