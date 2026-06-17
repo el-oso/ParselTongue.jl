@@ -105,19 +105,37 @@ const _PYMETHOD_SLOTS = Dict{Symbol,NamedTuple}(
     :__pos__      => (slot="Py_nb_positive",        ret_type=nothing),
     :__abs__      => (slot="Py_nb_absolute",        ret_type=nothing),
     :__invert__   => (slot="Py_nb_invert",          ret_type=nothing),
+    # Reflected binary ops — map to the SAME Py_nb_* slot as the forward op
+    # (the C number protocol uses one slot per operand order). `self` is the
+    # handle operand; `other` is the scalar left operand.
+    :__radd__      => (slot="Py_nb_add",             ret_type=nothing),
+    :__rsub__      => (slot="Py_nb_subtract",        ret_type=nothing),
+    :__rmul__      => (slot="Py_nb_multiply",        ret_type=nothing),
+    :__rtruediv__  => (slot="Py_nb_true_divide",     ret_type=nothing),
+    :__rfloordiv__ => (slot="Py_nb_floor_divide",    ret_type=nothing),
+    :__rmod__      => (slot="Py_nb_remainder",       ret_type=nothing),
+    :__rpow__      => (slot="Py_nb_power",           ret_type=nothing),
+    :__rmatmul__   => (slot="Py_nb_matrix_multiply", ret_type=nothing),
 )
 
-# Numeric dunders: binary (self, other::same handle) and unary (self only).
-# `__pow__` is the only ternaryfunc slot (modulo arg ignored).
+# Numeric dunders: binary (self, other), reflected binary (scalar OP self), and
+# unary (self only). `__pow__`/`__rpow__` are the ternaryfunc slot (modulo ignored).
+# `other` of a binary/reflected op may be the same handle type OR a scalar boundary
+# type, enabling mixed-type operators (vec*2.0, 2.0*vec).
 const _NUMERIC_BINARY_DUNDERS =
     (:__add__, :__sub__, :__mul__, :__truediv__, :__floordiv__,
      :__mod__, :__pow__, :__matmul__)
+const _NUMERIC_REFLECTED_DUNDERS =
+    (:__radd__, :__rsub__, :__rmul__, :__rtruediv__, :__rfloordiv__,
+     :__rmod__, :__rpow__, :__rmatmul__)
 const _NUMERIC_UNARY_DUNDERS = (:__neg__, :__pos__, :__abs__, :__invert__)
-is_numeric_binary(d::Symbol) = d in _NUMERIC_BINARY_DUNDERS
-is_numeric_unary(d::Symbol)  = d in _NUMERIC_UNARY_DUNDERS
+is_numeric_binary(d::Symbol)    = d in _NUMERIC_BINARY_DUNDERS
+is_numeric_reflected(d::Symbol) = d in _NUMERIC_REFLECTED_DUNDERS
+is_numeric_unary(d::Symbol)     = d in _NUMERIC_UNARY_DUNDERS
 
 # Extra positional argument types (after self) for dunders that take more than self.
 # :same_handle    — second arg must be the same @pyhandle type as self (comparisons).
+# :numeric_other  — single extra arg; the same handle type OR a scalar (numeric ops, mixed-type).
 # :setitem_val    — two extra args: idx::Int64 + val::<boundary>. Return must equal T (writeback).
 # :parse_args     — any number of extra boundary args (for __call__).
 # :pyobj_val      — single extra boundary arg unboxed from PyObject* (for __contains__).
@@ -133,14 +151,23 @@ const _PYMETHOD_EXTRA_ARGS = Dict{Symbol,Any}(
     :__gt__       => :same_handle,
     :__ge__       => :same_handle,
     # Binary numeric ops: second operand must be the same handle type.
-    :__add__      => :same_handle,
-    :__sub__      => :same_handle,
-    :__mul__      => :same_handle,
-    :__truediv__  => :same_handle,
-    :__floordiv__ => :same_handle,
-    :__mod__      => :same_handle,
-    :__pow__      => :same_handle,
-    :__matmul__   => :same_handle,
+    :__add__      => :numeric_other,
+    :__sub__      => :numeric_other,
+    :__mul__      => :numeric_other,
+    :__truediv__  => :numeric_other,
+    :__floordiv__ => :numeric_other,
+    :__mod__      => :numeric_other,
+    :__pow__      => :numeric_other,
+    :__matmul__   => :numeric_other,
+    # Reflected ops: `other` is the scalar left operand.
+    :__radd__      => :numeric_other,
+    :__rsub__      => :numeric_other,
+    :__rmul__      => :numeric_other,
+    :__rtruediv__  => :numeric_other,
+    :__rfloordiv__ => :numeric_other,
+    :__rmod__      => :numeric_other,
+    :__rpow__      => :numeric_other,
+    :__rmatmul__   => :numeric_other,
 )
 
 """
@@ -308,6 +335,18 @@ function _register_method!(m::PtMethod)
                 error("@pymethod __call__: arg `$(a.name)::$(a.jl_type)` is not a boundary type: $e")
             end
         end
+    elseif is_numeric_binary(m.dunder) || is_numeric_reflected(m.dunder)
+        length(m.extra_args) == 1 ||
+            error("@pymethod $(m.dunder): need exactly 1 operand arg (in addition to self), got $(length(m.extra_args)).")
+        ot = m.extra_args[1].jl_type
+        try; c_abi_type(ot); catch e
+            error("@pymethod $(m.dunder): operand type `$ot` is not a boundary type: $e")
+        end
+        # Reflected ops are dispatched when `self` is the right operand and the left
+        # operand is a non-handle scalar, so `other` cannot be the handle type.
+        is_numeric_reflected(m.dunder) && ot === T &&
+            error("@pymethod $(m.dunder): reflected operator's operand must be a scalar, " *
+                  "not the handle type `$T` (handle×handle is the forward op).")
     end
 
     filter!(x -> !(x.handle_type === T && x.dunder === m.dunder), _METHODS)
@@ -798,7 +837,7 @@ macro pymethod(arg1, arg2=nothing)
     # n_extra_fixed: exact extra arg count for fixed-arity dunders.
     # n_flex=true: any number ≥1 of extra args (__call__ with :parse_args).
     n_extra_fixed = _extra_spec isa AbstractVector ? length(_extra_spec) :
-                    _extra_spec ∈ (:same_handle, :pyobj_val) ? 1 :
+                    _extra_spec ∈ (:same_handle, :pyobj_val, :numeric_other) ? 1 :
                     _extra_spec === :setitem_val ? 2 :
                     0
     n_flex = _extra_spec === :parse_args

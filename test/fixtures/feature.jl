@@ -52,6 +52,9 @@ end
 @pymethod __mul__ pt2d_dot(p::Pt2D, q::Pt2D)::Float64 = p.x * q.x + p.y * q.y  # dot product
 @pymethod __neg__ pt2d_neg(p::Pt2D)::Pt2D = Pt2D(-p.x, -p.y)
 @pymethod __abs__ pt2d_abs(p::Pt2D)::Float64 = sqrt(p.x^2 + p.y^2)
+# Mixed-type operators: T × scalar (p / k) and scalar × T (k * p, reflected).
+@pymethod __truediv__ pt2d_divk(p::Pt2D, k::Float64)::Pt2D = Pt2D(p.x / k, p.y / k)
+@pymethod __rmul__ pt2d_rscale(p::Pt2D, k::Float64)::Pt2D = Pt2D(p.x * k, p.y * k)
 
 # LinearModel: callable handle (O8a __call__) + context manager (O9).
 struct LinearModel

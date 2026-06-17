@@ -1226,6 +1226,7 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             # These are handled via separate code paths below.
             m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__) && continue
             m.dunder ∈ (:__enter__, :__exit__) && continue  # PyMethodDef table
+            (is_numeric_binary(m.dunder) || is_numeric_reflected(m.dunder)) && continue  # grouped Py_nb_* wrapper
             clean = replace(replace(string(m.dunder), r"^__" => ""), r"__$" => "")
             sym   = cabi_symbol(m)
             dname = string(m.dunder)
@@ -1376,38 +1377,6 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                 println(io, "    return _result;")
                 println(io, "}")
 
-            elseif is_numeric_binary(m.dunder)
-                # Binary number slot: binaryfunc (or ternaryfunc for __pow__). Both
-                # operands must be this handle type, else return NotImplemented so
-                # Python can try the reflected op. Result is boxed via the declared
-                # return carrier (usually the handle type itself).
-                ret_c = c_abi_type(m.ret)
-                c_ret_type = _c_ctype(ret_c)
-                box_stmts  = _build_pyobject(ret_c, "r", "_result")
-                self_c     = _type_src(c_abi_type(T))
-                println(io, "extern $c_ret_type $(sym)(PtHandle, PtHandle, int32_t *, char **);")
-                if m.dunder === :__pow__
-                    println(io, "static PyObject *_pt_slot_$(tname)_$(clean)(PyObject *self, PyObject *other, PyObject *_mod) {")
-                    println(io, "    (void)_mod;")
-                else
-                    println(io, "static PyObject *_pt_slot_$(tname)_$(clean)(PyObject *self, PyObject *other) {")
-                end
-                println(io, "    if (Py_TYPE(self) != (PyTypeObject *)_PtType_$tname ||")
-                println(io, "        Py_TYPE(other) != (PyTypeObject *)_PtType_$tname) Py_RETURN_NOTIMPLEMENTED;")
-                println(io, "    PtHandle h_s = { ((_PtObj_$tname *)self)->_data };")
-                println(io, "    PtHandle h_o = { ((_PtObj_$tname *)other)->_data };")
-                println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
-                println(io, "    $c_ret_type r = $(sym)(h_s, h_o, &_err, &_errmsg);")
-                println(io, "    if (_err) {")
-                println(io, "        PyErr_SetString(PyExc_RuntimeError,")
-                println(io, "            _errmsg ? _errmsg : \"error in $dname\");")
-                println(io, "        free(_errmsg);")
-                println(io, "        return NULL;")
-                println(io, "    }")
-                for s in box_stmts; println(io, "    ", s); end
-                println(io, "    return _result;")
-                println(io, "}")
-
             elseif is_numeric_unary(m.dunder)
                 # Unary number slot: unaryfunc PyObject* (*)(PyObject*).
                 ret_c = c_abi_type(m.ret)
@@ -1532,6 +1501,78 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             println(io, "        Py_RETURN_NOTIMPLEMENTED;")
             println(io, "    }")
             println(io, "    return PyBool_FromLong((long)r);")
+            println(io, "}")
+        end
+
+        # Numeric binary ops (+ reflected) → one combined wrapper per Py_nb_* slot,
+        # dispatching on operand types so `vec*2.0` and `2.0*vec` both work. A forward
+        # op (`__mul__`) may be T×T or T×scalar; a reflected op (`__rmul__`) is scalar×T.
+        # On a scalar-parse failure we PyErr_Clear + fall through → NotImplemented, so
+        # Python can try the other operand's method (correct mixed-type fallback).
+        numbin = filter(m -> is_numeric_binary(m.dunder) || is_numeric_reflected(m.dunder), tmeths)
+        numbin_slots = unique([_PYMETHOD_SLOTS[m.dunder].slot for m in numbin])
+        # Emits: declare _result via the call, err-check, box, return — indented `pad`.
+        _emit_nb_arm = function (sym, mret, callargs, dname, pad)
+            rc = c_abi_type(mret)
+            println(io, pad, _c_ctype(rc), " r = ", sym, "(", callargs, ", &_err, &_errmsg);")
+            println(io, pad, "if (_err) { PyErr_SetString(PyExc_RuntimeError, _errmsg ? _errmsg : \"error in ", dname, "\"); free(_errmsg); return NULL; }")
+            for s in _build_pyobject(rc, "r", "_result"); println(io, pad, s); end
+            println(io, pad, "return _result;")
+        end
+        for slot in numbin_slots
+            nbtag = replace(slot, "Py_" => "")          # e.g. "nb_add"
+            wname = "_pt_$(nbtag)_$(tname)"
+            fwd_i  = findfirst(m -> is_numeric_binary(m.dunder)    && _PYMETHOD_SLOTS[m.dunder].slot == slot, numbin)
+            refl_i = findfirst(m -> is_numeric_reflected(m.dunder) && _PYMETHOD_SLOTS[m.dunder].slot == slot, numbin)
+            fwd  = fwd_i  === nothing ? nothing : numbin[fwd_i]
+            refl = refl_i === nothing ? nothing : numbin[refl_i]
+            is_pow = slot == "Py_nb_power"
+            # extern decls for the registered ccallables (other carrier = handle or scalar).
+            for mm in (fwd, refl)
+                mm === nothing && continue
+                oc = _c_ctype(c_abi_type(mm.extra_args[1].jl_type))
+                println(io, "extern $(_c_ctype(c_abi_type(mm.ret))) $(cabi_symbol(mm))(PtHandle, $oc, int32_t *, char **);")
+            end
+            sig = is_pow ? "(PyObject *a, PyObject *b, PyObject *_mod)" : "(PyObject *a, PyObject *b)"
+            println(io, "static PyObject *$wname$sig {")
+            is_pow && println(io, "    (void)_mod;")
+            println(io, "    int _ah = Py_TYPE(a) == (PyTypeObject *)_PtType_$tname; (void)_ah;")
+            println(io, "    int _bh = Py_TYPE(b) == (PyTypeObject *)_PtType_$tname; (void)_bh;")
+            println(io, "    int32_t _err = 0; char *_errmsg = NULL;")
+            if fwd !== nothing
+                fsym = cabi_symbol(fwd)
+                fother = fwd.extra_args[1].jl_type
+                if fother === T
+                    println(io, "    if (_ah && _bh) {")
+                    println(io, "        PtHandle _ha = { ((_PtObj_$tname *)a)->_data };")
+                    println(io, "        PtHandle _hb = { ((_PtObj_$tname *)b)->_data };")
+                    _emit_nb_arm(fsym, fwd.ret, "_ha, _hb", string(fwd.dunder), "        ")
+                    println(io, "    }")
+                else
+                    cs = _CSCALARS[fother]
+                    println(io, "    if (_ah) {")
+                    println(io, "        $(cs.tmptype) _sb;")
+                    println(io, "        if (PyArg_Parse(b, \"$(cs.fmt)\", &_sb)) {")
+                    println(io, "            PtHandle _ha = { ((_PtObj_$tname *)a)->_data };")
+                    _emit_nb_arm(fsym, fwd.ret, "_ha, ($(cs.ctype))_sb", string(fwd.dunder), "            ")
+                    println(io, "        }")
+                    println(io, "        PyErr_Clear();")
+                    println(io, "    }")
+                end
+            end
+            if refl !== nothing
+                rsym = cabi_symbol(refl)
+                cs = _CSCALARS[refl.extra_args[1].jl_type]
+                println(io, "    if (_bh) {")
+                println(io, "        $(cs.tmptype) _sa;")
+                println(io, "        if (PyArg_Parse(a, \"$(cs.fmt)\", &_sa)) {")
+                println(io, "            PtHandle _hb = { ((_PtObj_$tname *)b)->_data };")
+                _emit_nb_arm(rsym, refl.ret, "_hb, ($(cs.ctype))_sa", string(refl.dunder), "            ")
+                println(io, "        }")
+                println(io, "        PyErr_Clear();")
+                println(io, "    }")
+            end
+            println(io, "    Py_RETURN_NOTIMPLEMENTED;")
             println(io, "}")
         end
 
@@ -1756,12 +1797,17 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             m.dunder === :__repr__ && continue                       # already emitted above
             m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__) && continue  # richcmp
             m.dunder ∈ (:__enter__, :__exit__) && continue           # tp_methods
+            (is_numeric_binary(m.dunder) || is_numeric_reflected(m.dunder)) && continue  # grouped below
             clean = replace(replace(string(m.dunder), r"^__" => ""), r"__$" => "")
             slot  = _PYMETHOD_SLOTS[m.dunder].slot
             println(io, "    {$slot, (void *)_pt_slot_$(tname)_$(clean)},")
         end
         if has_richcmp
             println(io, "    {Py_tp_richcompare, (void *)_pt_richcmp_$(tname)},")
+        end
+        for slot in numbin_slots
+            nbtag = replace(slot, "Py_" => "")
+            println(io, "    {$slot, (void *)_pt_$(nbtag)_$(tname)},")
         end
         if has_getattr
             println(io, "    {Py_tp_getattro, (void *)_pt_getattr_$tname},")

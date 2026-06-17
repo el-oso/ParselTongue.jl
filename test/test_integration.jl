@@ -269,13 +269,26 @@ end
         ng = -na
         assert ng.x == -1.0 and ng.y == -2.0, "__neg__"
         assert abs(nb) == 5.0, f"__abs__: {abs(nb)}"          # 3-4-5
-        # Binary op with a non-Pt2D operand returns NotImplemented → TypeError.
+        # Same-handle __add__ with a non-Pt2D operand → NotImplemented → TypeError.
         try:
             _ = na + 5
             assert False, "Pt2D + int should raise TypeError"
         except TypeError:
             pass
-        del na, nb, s, d, ng
+        # Mixed-type: T × scalar (p / k, forward) and scalar × T (k * p, reflected).
+        half = nb / 2.0
+        assert isinstance(half, feature.Pt2D) and half.x == 1.5 and half.y == 2.0, "Pt2D / scalar"
+        scaled = 3.0 * na          # reflected __rmul__  (int/float left operand)
+        assert isinstance(scaled, feature.Pt2D) and scaled.x == 3.0 and scaled.y == 6.0, "scalar * Pt2D"
+        scaled_i = 2 * na          # int coerces to double via PyArg_Parse 'd'
+        assert scaled_i.x == 2.0 and scaled_i.y == 4.0, "int * Pt2D coercion"
+        assert (na * nb) == 11.0, "Pt2D * Pt2D still dot product (T×T)"
+        try:
+            _ = na / "x"           # bad scalar → NotImplemented → TypeError
+            assert False, "Pt2D / str should raise TypeError"
+        except TypeError:
+            pass
+        del na, nb, s, d, ng, half, scaled, scaled_i
         # Bound named method on an immutable @pyhandle: returns a new handle.
         pt_b = feature.Pt2D(1.0, 2.0)
         pt_t = pt_b.translated(3.0, 4.0)

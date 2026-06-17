@@ -932,32 +932,68 @@ end
     @test :__add__ in dunders && :__mul__ in dunders
     @test :__neg__ in dunders && :__abs__ in dunders
 
-    # Binary op: ccallable takes a second PtHandle (same handle type) and
-    # returns the declared carrier (handle for __add__, scalar for __mul__).
+    # Binary op (T×T): the operand carrier is a same-handle PtHandle, extracted via
+    # from_c — routed through the shared extra-args enumeration path (_a1).
     m_add = _METHODS[findfirst(m -> m.dunder === :__add__, _METHODS)]
     @test length(m_add.extra_args) == 1
     @test m_add.extra_args[1].jl_type === _TestHandle
     code_add = emit_ccallable_method(m_add)
-    @test occursin("_other::ParselTongue.PtHandle{_TestHandle}", code_add)
-    @test occursin("from_c(_TestHandle, _other)", code_add) ||
-          occursin("from_c(Main._TestHandle, _other)", code_add)
+    @test occursin("_a1::ParselTongue.PtHandle{_TestHandle}", code_add)
+    @test occursin("from_c(_TestHandle, _a1)", code_add) ||
+          occursin("from_c(Main._TestHandle, _a1)", code_add)
 
     # Unary op: ccallable takes only self.
     m_neg = _METHODS[findfirst(m -> m.dunder === :__neg__, _METHODS)]
     @test isempty(m_neg.extra_args)
     code_neg = emit_ccallable_method(m_neg)
-    @test !occursin("_other", code_neg)
+    @test !occursin("_a1", code_neg)
 
-    # C shim: number-protocol slots + NotImplemented type guard for binary ops.
+    # C shim: number-protocol slots; binary ops share one combined wrapper per slot
+    # (_pt_nb_<op>_T); unary ops keep their own per-method wrapper.
     c = emit_cshim("num_demo", _EXPORTS, PtError[], [_TestHandle], _METHODS)
     @test occursin("Py_nb_add", c)
     @test occursin("Py_nb_multiply", c)
     @test occursin("Py_nb_negative", c)
     @test occursin("Py_nb_absolute", c)
-    @test occursin("Py_RETURN_NOTIMPLEMENTED", c)   # binary type guard
-    # Binary slot signature is binaryfunc; unary is unaryfunc.
-    @test occursin("_pt_slot__TestHandle_add(PyObject *self, PyObject *other)", c)
-    @test occursin("_pt_slot__TestHandle_neg(PyObject *self)", c)
+    @test occursin("Py_RETURN_NOTIMPLEMENTED", c)   # NotImplemented fallback for mixed types
+    @test occursin("_pt_nb_add__TestHandle(PyObject *a, PyObject *b)", c)  # grouped binary wrapper
+    @test occursin("_pt_slot__TestHandle_neg(PyObject *self)", c)          # per-method unary
+
+    clear_exports!()
+end
+
+@testset "@pymethod mixed-type operators (scalar + reflected)" begin
+    clear_exports!()
+    @pyhandle _TestHandle
+    @pyfunc make_thmix(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
+    # T × scalar forward + scalar × T reflected, both mapping to Py_nb_multiply.
+    @pymethod __mul__  thmix_scale(p::_TestHandle, k::Float64)::_TestHandle = _TestHandle(p.x*k, p.n)
+    @pymethod __rmul__ thmix_rscale(p::_TestHandle, k::Float64)::_TestHandle = _TestHandle(p.x*k, p.n)
+
+    mul = _METHODS[findfirst(m -> m.dunder === :__mul__, _METHODS)]
+    @test mul.extra_args[1].jl_type === Float64       # scalar other allowed now
+    rmul = _METHODS[findfirst(m -> m.dunder === :__rmul__, _METHODS)]
+    @test rmul.extra_args[1].jl_type === Float64
+
+    # ccallable for the scalar op: operand carrier is the scalar (not PtHandle).
+    code = emit_ccallable_method(mul)
+    @test occursin("_a1::Float64", code)
+
+    # C shim: one combined nb_multiply wrapper handling forward (a is handle, parse b)
+    # and reflected (b is handle, parse a) with PyErr_Clear fallback.
+    c = emit_cshim("mix_demo", _EXPORTS, PtError[], [_TestHandle], _METHODS)
+    @test occursin("_pt_nb_multiply__TestHandle(PyObject *a, PyObject *b)", c)
+    @test occursin("PyArg_Parse(b,", c)      # forward parses the right operand
+    @test occursin("PyArg_Parse(a,", c)      # reflected parses the left operand
+    @test occursin("PyErr_Clear()", c)       # parse-fail fallback → NotImplemented
+    @test count(s -> occursin("{Py_nb_multiply,", s), split(c, "\n")) == 1  # single slot entry
+
+    # Reflected op rejects a handle-typed operand (handle×handle is the forward op).
+    err = try
+        @eval @pymethod __radd__ bad_r(p::_TestHandle, q::_TestHandle)::_TestHandle = p
+        nothing
+    catch e; e; end
+    @test (err isa LoadError ? err.error : err) isa ErrorException
 
     clear_exports!()
 end

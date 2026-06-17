@@ -205,15 +205,15 @@ function emit_ccallable_method(m::PtMethod; errors::Vector{PtError}=PtError[])
     T_src = _type_src(T)
     extra_params = if m.dunder === :__getitem__
         ", _idx::Int64"
-    elseif m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__) ||
-           is_numeric_binary(m.dunder)
+    elseif m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__)
         ", _other::$self_c"
     elseif m.dunder === :__setitem__
         # idx::Int64 + val carrier (extra_args[1]=Int64, extra_args[2]=val type)
         val_c = _type_src(c_abi_type(m.extra_args[2].jl_type))
         ", _idx::Int64, _val::$val_c"
-    elseif m.dunder ∈ (:__contains__, :__call__)
-        # One or more extra boundary args.
+    elseif m.dunder ∈ (:__contains__, :__call__) ||
+           is_numeric_binary(m.dunder) || is_numeric_reflected(m.dunder)
+        # One or more extra boundary args (numeric `other` may be a handle or scalar).
         join([string(", _a", i, "::", _type_src(c_abi_type(a.jl_type)))
               for (i, a) in enumerate(m.extra_args)])
     else
@@ -221,13 +221,13 @@ function emit_ccallable_method(m::PtMethod; errors::Vector{PtError}=PtError[])
     end
     extra_call = if m.dunder === :__getitem__
         ", _idx"
-    elseif m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__) ||
-           is_numeric_binary(m.dunder)
+    elseif m.dunder ∈ (:__eq__, :__ne__, :__lt__, :__le__, :__gt__, :__ge__)
         string(", ParselTongue.from_c(", T_src, ", _other)")
     elseif m.dunder === :__setitem__
         val_T_src = _type_src(m.extra_args[2].jl_type)
         ", _idx, ParselTongue.from_c($val_T_src, _val)"
-    elseif m.dunder ∈ (:__contains__, :__call__)
+    elseif m.dunder ∈ (:__contains__, :__call__) ||
+           is_numeric_binary(m.dunder) || is_numeric_reflected(m.dunder)
         join([string(", ParselTongue.from_c(", _type_src(a.jl_type), ", _a", i, ")")
               for (i, a) in enumerate(m.extra_args)])
     else
