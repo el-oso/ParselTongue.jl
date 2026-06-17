@@ -124,11 +124,16 @@ jobs:
           DEBUGINFOD_URLS: "https://debuginfod.ubuntu.com"
         run: |
           export FEATURE_DIR="$RUNNER_TEMP/featdiag"
+          # Enable debuginfod up front (in .gdbinit) so the first-use confirmation
+          # prompt — auto-answered "no" in batch mode — never blocks symbol loading.
+          mkdir -p "$HOME"
+          printf 'set debuginfod enabled on\n' > "$HOME/.gdbinit"
+          python3 -c "import sys; print('running python:', sys.executable, sys.version)"
           crashed=0
           for i in $(seq 1 40); do
             gdb -batch \
+              -iex 'set debuginfod enabled on' \
               -ex 'set pagination off' \
-              -ex 'set debuginfod enabled on' \
               -ex 'run' \
               -ex 'echo \n===== CRASH BACKTRACE (bt full) =====\n' \
               -ex 'bt full' \
