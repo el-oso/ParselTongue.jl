@@ -1222,14 +1222,19 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         # Opt-in subclassing flags (PyO3-style): BASETYPE (Python subclasses) and a
         # per-instance __dict__ (PyO3 #[pyclass(dict)]).
         is_subclassable = T in subclass_types
-        has_dict        = T in dict_types
+        # A subclassable type MUST carry a classic `tp_dictoffset` (the `_dict` field
+        # below), even if the user did not ask for dict=true. Otherwise a pure-Python
+        # subclass (which always gets a __dict__) is given CPython's *managed dict*
+        # (≥3.12), whose inline values overlap our `_data` field — corrupting the heap
+        # and crashing on dealloc. Giving the base a classic dict slot makes subclasses
+        # inherit it instead of the managed dict. So subclassable ⟹ dict slot.
+        has_dict        = (T in dict_types) || is_subclassable
 
-        # dict=true gives instances a real __dict__ via an explicit `_dict` field +
-        # tp_dictoffset (the classic, version-stable mechanism — no managed-dict
-        # pre-header). A type whose instances can hold arbitrary Python objects must
-        # participate in cyclic GC, so dict types are GC types (traverse/clear visit
-        # _dict; dealloc untracks). PyType_GenericAlloc already GC-tracks, so we do NOT
-        # call PyObject_GC_Track ourselves.
+        # dict slot: a real __dict__ via an explicit `_dict` field + tp_dictoffset
+        # (the classic, version-stable mechanism — no managed-dict pre-header). A type
+        # whose instances can hold arbitrary Python objects must participate in cyclic
+        # GC, so dict types are GC types (traverse/clear visit _dict; dealloc untracks).
+        # PyType_GenericAlloc already GC-tracks, so we do NOT call PyObject_GC_Track.
         if has_dict
             println(io, "typedef struct { PyObject_HEAD void *_data; PyObject *_dict; } _PtObj_$tname;")
         else
@@ -1258,8 +1263,12 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             println(io, "    PyObject_GC_UnTrack(self);")
             println(io, "    Py_XDECREF(((_PtObj_$tname *)self)->_dict);")
             println(io, "    $release_data")
-            # tp_free is PyObject_GC_Del for GC types; correct for base + subclasses.
-            println(io, "    Py_TYPE(self)->tp_free(self);")
+            # tp_free is PyObject_GC_Del for GC types; correct for base AND for a
+            # pure-Python subclass (whose tp_free differs). Fetch it via PyType_GetSlot
+            # rather than Py_TYPE(self)->tp_free so this compiles under the limited ABI
+            # too (PyTypeObject is opaque there). abi3-safe (PyType_GetSlot ≥ 3.4).
+            println(io, "    freefunc _pt_free = (freefunc)PyType_GetSlot(Py_TYPE(self), Py_tp_free);")
+            println(io, "    _pt_free(self);")
             println(io, "}")
         else
             println(io, "static void _pt_dealloc_$tname(PyObject *self) {")
@@ -2028,9 +2037,10 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
     println(io, "#include <stdbool.h>")
     println(io, "#include <stdlib.h>")
     println(io, "#include <string.h>")
-    if !isempty(dict_types)
-        # PyMemberDef + the Py_T_PYSSIZET / Py_READONLY names (Python.h, 3.12+); fall
-        # back to <structmember.h> on older CPython so dict=true builds on 3.11 too.
+    if !isempty(dict_types) || !isempty(subclass_types)
+        # Subclassable types (and dict=true types) emit a `__dictoffset__` PyMemberDef
+        # using offsetof(), which needs <stddef.h>, plus the Py_T_PYSSIZET / Py_READONLY
+        # names (Python.h, 3.12+); fall back to <structmember.h> on older CPython.
         println(io, "#include <stddef.h>")
         println(io, "#if PY_VERSION_HEX < 0x030C0000")
         println(io, "#include <structmember.h>")
