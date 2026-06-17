@@ -121,6 +121,9 @@ jobs:
           ulimit -c unlimited || true
           echo "core" | sudo tee /proc/sys/kernel/core_pattern || true
           FEATURE_DIR="$RUNNER_TEMP/featdiag" python3 test/diag/repro.py; echo "plain exit=$?"
+      - name: Run repro via Julia spawn (mimics _py_run; A=inherited env, B=scrubbed)
+        continue-on-error: true
+        run: FEATURE_DIR="$RUNNER_TEMP/featdiag" julia --project=. test/diag/spawn_repro.jl
       - name: Run repro under gdb (native backtrace)
         continue-on-error: true
         run: |

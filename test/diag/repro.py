@@ -19,6 +19,9 @@ def mark(msg):
     print(f"[repro] {msg}", file=sys.stderr, flush=True)
 
 
+for _k in ("LD_LIBRARY_PATH", "LD_PRELOAD", "JULIA_NUM_THREADS", "JULIA_DEPOT_PATH"):
+    mark(f"env {_k}={os.environ.get(_k, '(unset)')}")
+
 mark("importing feature")
 import feature
 
