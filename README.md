@@ -47,8 +47,8 @@ Full guide, boundary-type reference, and worked examples:
 | `@pyfunc f(a::T)::R = …` | Mark a function for export (emits it normally + records its signature). An optional leading string sets the Python name: `@pyfunc "py_name" f(…) = …`. |
 | `@pymodule name begin … end` | Group `@pyfunc` definitions and name the Python module. |
 | `@pyhandle T` | Expose an isbits struct `T` as a real Python class; scalar fields become attributes (read-only, or read/write with `mutable=true`). |
-| `@pyhandle T subclass=true` | Opt into Python subclassing (`Py_TPFLAGS_BASETYPE` + subclass-aware `tp_new`); mirrors PyO3 `#[pyclass(subclass)]`. Subclasses add methods/properties and override dunders. |
-| `@pymutable T` | Expose a **`mutable struct`** (heap fields like `String`/`Vector` allowed) as a mutable Python class backed by a Julia GC registry; methods mutate the live object in place. Also takes `subclass=true`. |
+| `@pyhandle T subclass=true` | Opt into Python subclassing (`Py_TPFLAGS_BASETYPE` + subclass-aware `tp_new`); mirrors PyO3 `#[pyclass(subclass)]`. Add `dict=true` for a per-instance `__dict__` (GC type; non-abi3) so subclass instances can set arbitrary attributes. |
+| `@pymutable T` | Expose a **`mutable struct`** (heap fields like `String`/`Vector` allowed) as a mutable Python class backed by a Julia GC registry; methods mutate the live object in place. Also takes `subclass=`/`dict=`. |
 | `@pymethod <dunder> f(p::T)… = …` | Attach a Python dunder to a `@pyhandle`/`@pymutable` type: `__new__` (constructor), `__repr__`/`__str__`, `__len__`/`__hash__`/`__bool__`, `__getitem__`/`__setitem__`, `__contains__`, `__call__`, `__iter__`/`__next__`, `__enter__`/`__exit__`, comparisons (`__eq__`…`__ge__`), and numeric ops incl. mixed-type + reflected (`__add__`/`__mul__`/`__rmul__`/`__neg__`/…). |
 | `@pymethod f(p::T, …)… = …` | One-arg form (plain name) → a **bound named method** `obj.f(args)`. |
 | `@pyproperty T name::V (p -> …)` | Attach a computed read-only property to a handle type. |
@@ -139,7 +139,8 @@ v0.27 — full build pipeline shipping: scalars, strings, N-D numeric arrays,
 handles (`@pyhandle` — `isinstance`, auto field access with optional `mutable=true`,
 constructor/repr/len/hash/bool/getitem/setitem/contains/call/iter/next/enter/exit,
 comparison + numeric dunders incl. mixed-type/reflected, bound named methods,
-`@pyproperty`, opt-in Python subclassing via `subclass=`), mutable classes
+`@pyproperty`, opt-in Python subclassing + instance `__dict__` via `subclass=`/`dict=`),
+mutable classes
 with heap fields and stateful iterators (`@pymutable` — GC-registry-backed, in-place
 mutation, `__next__`), custom Python exception types (`@pyerror`), keyword/default
 arguments, arbitrary-signature `PyCallable{Args,Ret}` callbacks, manylinux

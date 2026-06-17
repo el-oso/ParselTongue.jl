@@ -121,6 +121,12 @@ function build_extension(user_path::AbstractString;
     isempty(exports) && error(
         "ParselTongue: no @pyfunc exports found in $user_path. " *
         "Annotate functions with @pyfunc.")
+    # dict=true builds a GC type whose dealloc reaches through PyTypeObject (tp_free) —
+    # that field is opaque under the limited API, so dict=true needs the full API.
+    (abi3 && !isempty(dict_types)) && error(
+        "ParselTongue: `dict=true` (per-instance __dict__) is incompatible with " *
+        "abi3=true (the stable ABI hides PyTypeObject internals). Types: " *
+        "$(join(string.(dict_types), ", ")). Build without abi3, or drop dict=true.")
 
     mod = mod_name !== nothing ? String(mod_name) :
           _MODULE_NAME[] !== nothing ? _MODULE_NAME[] :

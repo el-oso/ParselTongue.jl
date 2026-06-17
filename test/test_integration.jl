@@ -394,30 +394,37 @@ end
     @test_throws ErrorException build_extension(badmod)
 end
 
-# Python subclassing of a @pymutable type (subclass=true): a pure-Python subclass adds
-# methods/overrides dunders, inheriting the constructor, bound methods, and fields.
-@testset "integration: subclass (@pymutable)" begin
+# Python subclassing + per-instance __dict__ (subclass=true, dict=true): a pure-Python
+# subclass adds methods/overrides dunders and sets arbitrary instance attributes; the
+# GC type collects reference cycles through the dict. dict=true needs the full API.
+@testset "integration: subclass + dict (@pymutable)" begin
     if !_have_tools()
-        @info "skipping subclass integration test (need python3, a C compiler, and juliac)"
+        @info "skipping subclass/dict integration test (need python3, a C compiler, and juliac)"
         @test_skip true
     else
         fixture = joinpath(@__DIR__, "fixtures", "subclassmod.jl")
+        # dict=true is incompatible with abi3 (PyTypeObject internals are hidden there).
+        @test_throws ErrorException build_extension(fixture; outdir=mktempdir(), abi3=true)
+
         if Sys.iswindows()
             outdir = mktempdir()
             @test isfile(build_extension(fixture; outdir=outdir))
-            @info "Windows: subclass build succeeded (Python import is wheel-only)"
+            @info "Windows: subclass/dict build succeeded (Python import is wheel-only)"
         else
             outdir = mktempdir()
             so = build_extension(fixture; outdir=outdir)
             @test isfile(so)
             script = """
-            import sys; sys.path.insert(0, $(repr(outdir)))
+            import sys, gc; sys.path.insert(0, $(repr(outdir)))
             import subclassmod as m
             b = m.Bag("widgets")
             assert isinstance(b, m.Bag)
             assert b.bump() == 1 and b.bump() == 2          # inherited mutation
             assert m.bag_count(b) == 2
             assert repr(b) == "Bag(widgets, n=2)"           # inherited __repr__
+            b.tag = "urgent"; assert b.tag == "urgent"      # instance __dict__ (dict=true)
+            b.meta = {"k": [1, 2]}; assert b.meta == {"k": [1, 2]}
+            assert b.__dict__ == {"tag": "urgent", "meta": {"k": [1, 2]}}, b.__dict__
             class TaggedBag(m.Bag):                         # subclass=true
                 def doubled(self): return m.bag_count(self) * 2
                 def __repr__(self): return f"Tagged<{m.bag_count(self)}>"
@@ -427,9 +434,16 @@ end
             assert t.doubled() == 6, "subclass method over inherited mutation"
             assert repr(t) == "Tagged<3>", "subclass __repr__ override"
             assert m.bag_count(t) == 3, "base C function on subclass instance"
-            print("SUBCLASS_OK")
+            t.note = [1, 2, 3]; assert t.note == [1, 2, 3]  # subclass instance attribute
+            # GC: reference cycles through the instance dict are collectable.
+            gc.collect()
+            for _ in range(200):
+                x = m.Bag("cyc"); x.self_ref = x; x.lst = [x]
+            del x
+            assert gc.collect() > 0, "GC failed to reclaim reference cycles"
+            print("SUBDICT_OK")
             """
-            @test occursin("SUBCLASS_OK", _py_run(script))
+            @test occursin("SUBDICT_OK", _py_run(script))
         end
     end
 end

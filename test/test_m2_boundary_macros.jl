@@ -1128,7 +1128,7 @@ end
 
 # ── Python subclassing (subclass= / dict= flags) ─────────────────────────────
 
-@testset "subclass= opt (Python subclassing)" begin
+@testset "subclass= / dict= opts (Python subclassing + instance dict)" begin
     clear_exports!()
     @pyhandle _TestHandle subclass=true
     @pyfunc make_thsc(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
@@ -1142,10 +1142,22 @@ end
 
     clear_exports!()
 
-    # dict=true is not yet supported → clear error (both @pyhandle and @pymutable).
-    err_d = try; @eval @pyhandle _TestHandle dict=true; catch e; e; end
-    @test (err_d isa LoadError ? err_d.error : err_d) isa ErrorException
-    @test occursin("dict=true", sprint(showerror, err_d isa LoadError ? err_d.error : err_d))
+    # dict=true on a @pymutable type → GC type with an explicit _dict + tp_dictoffset.
+    push!(_MUTABLE_STRUCT_TYPES, _TestMutable); push!(_HANDLE_TYPES, _TestMutable)
+    push!(_SUBCLASS_TYPES, _TestMutable); push!(_DICT_TYPES, _TestMutable)
+    @test _TestMutable in _DICT_TYPES
+    c2 = emit_cshim("dc", _EXPORTS, PtError[], [_TestMutable], PtMethod[], PtNew[];
+                    mutable_struct_types=[_TestMutable],
+                    subclass_types=[_TestMutable], dict_types=[_TestMutable])
+    @test occursin("PyObject *_dict;", c2)               # explicit dict field
+    @test occursin("__dictoffset__", c2)                 # tp_dictoffset via member
+    @test occursin("Py_TPFLAGS_HAVE_GC", c2)             # GC type
+    @test occursin("_pt_traverse__TestMutable", c2) && occursin("Py_VISIT", c2)
+    @test occursin("_pt_clear__TestMutable", c2) && occursin("Py_CLEAR", c2)
+    @test occursin("PyObject_GenericGetDict", c2)        # __dict__ descriptor
+    @test occursin("PyObject_GC_UnTrack", c2)            # dealloc untracks
+    @test !occursin("PyObject_GC_Track", c2)             # alloc tracks; we must NOT
+    clear_exports!()
 
     # Unknown / malformed options are rejected.
     err = try; @eval @pyhandle _TestHandle bogus=true; catch e; e; end

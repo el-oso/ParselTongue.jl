@@ -149,23 +149,29 @@ method (`PtNamedMethod`, `_NAMED_METHODS`). `is_numeric_binary`/`is_numeric_refl
 return, named-method args) reference them; the carrier set is collected from exports **and**
 method/`__new__`/property/named-method signatures via `_carrier_set`.
 
-### Python subclassing (`subclass=`, PyO3-style opt-in flag)
+### Python subclassing (`subclass=` / `dict=`, PyO3-style opt-in flags)
 
 `@pyhandle T subclass=true` / `@pymutable T subclass=true` add `Py_TPFLAGS_BASETYPE` and a
 subclass-aware `tp_new` (allocates with the passed `type`, not the hardcoded base, so
 `class Sub(T)` instances are real `Sub` objects) — abi3-safe. A pure-Python subclass inherits
 the constructor/fields/methods/dunders and may add methods, properties, and dunder overrides.
-Flags live in `_SUBCLASS_TYPES` / `_DICT_TYPES`, threaded via the `_preloaded` NamedTuple
-(`_registry_snapshot`).
 
-`dict=true` (per-instance `__dict__`, PyO3 `#[pyclass(dict)]`) is **not yet supported** —
-`_parse_class_opts` raises. It needs `Py_TPFLAGS_MANAGED_DICT` + full GC integration
-(`Py_TPFLAGS_HAVE_GC`, `tp_traverse`/`tp_clear` visiting the managed dict via the
-version-specific `PyObject_*ManagedDict` helpers, GC-tracked instances, `tp_free`-based
-dealloc); getting that right across CPython 3.12–3.14 is fiddly and was deferred. The
-`_DICT_TYPES` registry + `dict_types` plumbing remain as wiring for a future implementation.
-Native inheritance between ParselTongue types (PyO3 `extends=`) is unsupported — Julia
-structs can't share a C layout.
+`dict=true` (PyO3 `#[pyclass(dict)]`) gives instances a real `__dict__`. We use the
+**classic explicit-`tp_dictoffset`** mechanism (version-stable across 3.11–3.14), NOT the
+managed-dict pre-header (which is version-fragile and was the source of the earlier crash):
+the instance struct gains a `PyObject *_dict` field, exposed as `tp_dictoffset` via the
+`__dictoffset__` special member that `PyType_FromSpec` recognises, plus a `__dict__` getset
+(`PyObject_GenericGetDict`/`SetDict`). An object holding arbitrary Python refs must collect
+cycles, so dict types are GC types: `Py_TPFLAGS_HAVE_GC` + `tp_traverse`/`tp_clear`
+(`Py_VISIT`/`Py_CLEAR` on `_dict`) + `PyObject_GC_UnTrack` in dealloc + `tp_free`. Crucial
+gotcha: **`PyType_GenericAlloc` already GC-tracks**, so we must NOT call `PyObject_GC_Track`
+(doing so trips `_PyObject_AssertFailed`). `dict=true` requires the full API — `build_extension`
+errors if combined with `abi3=true` (the dealloc reaches `Py_TYPE(self)->tp_free`, and
+`PyTypeObject` is opaque under the limited API).
+
+Flags live in `_SUBCLASS_TYPES` / `_DICT_TYPES`, threaded via the `_preloaded` NamedTuple
+(`_registry_snapshot`). Native inheritance between ParselTongue types (PyO3 `extends=`) is
+unsupported — Julia structs can't share a C layout.
 
 ### How `cshim.jl` generates richcmp
 

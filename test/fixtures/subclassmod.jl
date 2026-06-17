@@ -1,12 +1,14 @@
 using ParselTongue
 
-# A subclassable @pymutable type: Python can `class Sub(Bag): ...`, adding methods
-# and overriding dunders, while inheriting the constructor, bound methods, and fields.
+# Subclassable @pymutable with a per-instance __dict__ (dict=true). A Python subclass
+# can add methods, override dunders, and set arbitrary instance attributes; the type is
+# a GC type so reference cycles through the dict are collected. dict=true needs the full
+# (non-abi3) API.
 mutable struct Bag
     n::Int64
     name::String
 end
-@pymutable Bag subclass=true
+@pymutable Bag subclass=true dict=true
 @pymethod __new__ bag_new(name::String)::Bag = Bag(0, name)
 @pymethod __repr__ bag_repr(b::Bag)::String = "Bag($(b.name), n=$(b.n))"
 @pymethod bump!(b::Bag)::Int64 = (b.n += 1; b.n)

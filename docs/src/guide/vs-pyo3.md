@@ -14,7 +14,7 @@ the Python object graph you can reach from native code.
 | Annotation | `@pyfunc` / `@pymodule` | `#[pyfunction]` / `#[pymodule]` |
 | Build CLI | `pt wheel file.jl` (or `build_wheel("file.jl")`) | `maturin build` |
 | Type mapping | Explicit boundary contract | Derive macros + `FromPyObject` / `IntoPyObject` |
-| Classes | `@pyhandle` (isbits) + `@pymutable` (heap fields, GC registry); `isinstance`, mutable fields, ~25 dunders incl. numeric (mixed-type) + iterator (`__next__`), bound named methods, `@pyproperty`, context managers, opt-in `subclass=` (Python subclassing) | `#[pyclass]` (full object protocol incl. instance `dict`, `extends=` native inheritance) |
+| Classes | `@pyhandle` (isbits) + `@pymutable` (heap fields, GC registry); `isinstance`, mutable fields, ~25 dunders incl. numeric (mixed-type) + iterator (`__next__`), bound named methods, `@pyproperty`, context managers, opt-in `subclass=` / `dict=` (Python subclassing + instance dict) | `#[pyclass]` (full object protocol incl. `extends=` native inheritance) |
 | Custom exceptions | `@pyerror MyError <: ValueError` | `create_exception!` |
 | Python callables | `PyCallable{Args,Ret}` (any scalar signature) | `Py<PyAny>` / `PyCallable` (any signature) |
 | GIL release during call | Yes (automatic) | Yes (opt-in with `py.allow_threads`) |
@@ -211,28 +211,24 @@ a non-matching operand yields `NotImplemented` so Python falls back):
 @pymethod __rmul__    rscale(p::Vec2, k::Float64)::Vec2 = Vec2(p.x*k, p.y*k) # 2.0 * p
 ```
 
-Types opt into **Python subclassing** with a flag mirroring PyO3's
-`#[pyclass(subclass)]` (default off):
+Types opt into **Python subclassing** and a **per-instance `__dict__`** with flags
+mirroring PyO3's `#[pyclass(subclass)]` / `#[pyclass(dict)]` (default off):
 
 ```julia
-@pyhandle Vec2 subclass=true       # `class MyVec(Vec2): ...` in Python
-@pymutable Counter subclass=true   # works for mutable types too
+@pyhandle Vec2 subclass=true               # `class MyVec(Vec2): ...` in Python
+@pymutable Counter subclass=true dict=true # subclass + arbitrary instance attributes
 ```
 
-`subclass=true` adds `Py_TPFLAGS_BASETYPE` and a subclass-aware `tp_new`
-(abi3-safe). A pure-Python subclass can add methods, `@property`, and override
-dunders, inheriting the constructor, fields, and bound methods.
+`subclass=true` adds `Py_TPFLAGS_BASETYPE` and a subclass-aware `tp_new` (abi3-safe);
+a pure-Python subclass can add methods, `@property`, and override dunders, inheriting
+the constructor, fields, and bound methods. `dict=true` gives instances a real
+`__dict__` (`obj.attr = …`, `vars(obj)`) via an explicit dict field + `tp_dictoffset`;
+the type becomes a GC type so reference cycles through the dict are collected.
+`dict=true` needs the full (non-abi3) API.
 
-Remaining gaps vs `#[pyclass]`:
-
-- **`#[pyclass(dict)]`** — a per-instance `__dict__` so subclass *instances* can hold
-  arbitrary attributes. Needs `Py_TPFLAGS_MANAGED_DICT` + full GC integration
-  (traverse/clear/track), which is version-fragile across CPython 3.12–3.14;
-  `dict=true` currently raises a clear "not yet supported" error. Subclasses can still
-  add methods and class attributes.
-- **`extends=`** — native inheritance *between* ParselTongue types or from a Python
-  builtin (sharing fields/layout). Independent Julia structs can't share a C layout,
-  so that case is unsupported.
+The remaining gap vs `#[pyclass]` is **`extends=`** — native inheritance *between*
+ParselTongue types or from a Python builtin (sharing fields/layout). Independent
+Julia structs can't share a C layout, so that case is unsupported.
 
 ## Error handling
 
@@ -384,9 +380,6 @@ build can take minutes.
 
 - Your performance-critical code is in Rust, or you want Rust's memory-safety
   guarantees in the extension layer.
-- You need **per-instance `__dict__`** on subclasses (`#[pyclass(dict)]`) so Python
-  subclass instances can set arbitrary attributes; ParselTongue supports methods-only
-  subclassing today (`subclass=true`), with instance `dict` planned.
 - You need **native inheritance** (`#[pyclass(extends=...)]`): one native class
   sharing the fields/layout of another, or subclassing a Python builtin. ParselTongue
   supports Python subclassing of its types (`subclass=true`) but not field-sharing

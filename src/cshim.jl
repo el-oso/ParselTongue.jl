@@ -1220,11 +1220,21 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         # access through Julia rather than raw C memory.
         is_mut_struct = T in mutable_struct_types
         # Opt-in subclassing flags (PyO3-style): BASETYPE (Python subclasses) and a
-        # managed instance __dict__ (CPython ≥ 3.12; guarded against abi3 in build.jl).
+        # per-instance __dict__ (PyO3 #[pyclass(dict)]).
         is_subclassable = T in subclass_types
         has_dict        = T in dict_types
 
-        println(io, "typedef struct { PyObject_HEAD void *_data; } _PtObj_$tname;")
+        # dict=true gives instances a real __dict__ via an explicit `_dict` field +
+        # tp_dictoffset (the classic, version-stable mechanism — no managed-dict
+        # pre-header). A type whose instances can hold arbitrary Python objects must
+        # participate in cyclic GC, so dict types are GC types (traverse/clear visit
+        # _dict; dealloc untracks). PyType_GenericAlloc already GC-tracks, so we do NOT
+        # call PyObject_GC_Track ourselves.
+        if has_dict
+            println(io, "typedef struct { PyObject_HEAD void *_data; PyObject *_dict; } _PtObj_$tname;")
+        else
+            println(io, "typedef struct { PyObject_HEAD void *_data; } _PtObj_$tname;")
+        end
         # Declare early so _pt_richcmp_T (emitted below) can reference it.
         println(io, "static PyObject *_PtType_$tname = NULL;")
         # Forward-declare _pt_make_obj_T so _pt_new_T (emitted below) can call it.
@@ -1235,10 +1245,28 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         release_data = is_mut_struct ?
             "{ PtHandle h = { ((_PtObj_$tname *)self)->_data }; _pt_dealloc_$(tname)_jl(h); }" :
             "free(((_PtObj_$tname *)self)->_data);"
-        println(io, "static void _pt_dealloc_$tname(PyObject *self) {")
-        println(io, "    $release_data")
-        println(io, "    PyObject_Free(self);")
-        println(io, "}")
+        if has_dict
+            println(io, "static int _pt_traverse_$tname(PyObject *self, visitproc visit, void *arg) {")
+            println(io, "    Py_VISIT(((_PtObj_$tname *)self)->_dict);")
+            println(io, "    return 0;")
+            println(io, "}")
+            println(io, "static int _pt_clear_$tname(PyObject *self) {")
+            println(io, "    Py_CLEAR(((_PtObj_$tname *)self)->_dict);")
+            println(io, "    return 0;")
+            println(io, "}")
+            println(io, "static void _pt_dealloc_$tname(PyObject *self) {")
+            println(io, "    PyObject_GC_UnTrack(self);")
+            println(io, "    Py_XDECREF(((_PtObj_$tname *)self)->_dict);")
+            println(io, "    $release_data")
+            # tp_free is PyObject_GC_Del for GC types; correct for base + subclasses.
+            println(io, "    Py_TYPE(self)->tp_free(self);")
+            println(io, "}")
+        else
+            println(io, "static void _pt_dealloc_$tname(PyObject *self) {")
+            println(io, "    $release_data")
+            println(io, "    PyObject_Free(self);")
+            println(io, "}")
+        end
 
         # For each @pymethod, emit a C slot wrapper. The wrapper kind is
         # determined by the dunder and/or its Julia return type.
@@ -1762,9 +1790,9 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             println(io, "};")
         end
 
-        # Properties: emit getter C functions and a PyGetSetDef table.
+        # Properties (+ the __dict__ descriptor for dict types): PyGetSetDef table.
         tprops = filter(p -> p.handle_type === T, properties)
-        has_getset = !isempty(tprops)
+        has_getset = !isempty(tprops) || has_dict
         if has_getset
             for p in tprops
                 get_sym = string("pt_prop_get_$(tname)_$(p.prop_name)")
@@ -1792,6 +1820,8 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
             for p in tprops
                 println(io, "    {\"$(p.prop_name)\", _pt_getter_$(tname)_$(p.prop_name), NULL, \"$(p.prop_name) (property)\", NULL},")
             end
+            # Expose obj.__dict__ (tp_dictoffset is set via the __dictoffset__ member).
+            has_dict && println(io, "    {\"__dict__\", PyObject_GenericGetDict, PyObject_GenericSetDict, NULL, NULL},")
             println(io, "    {NULL, NULL, NULL, NULL, NULL}")
             println(io, "};")
         end
@@ -1799,6 +1829,15 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         # tp_new slot: emitted before the slot array (needs the extern declaration).
         if tnew !== nothing
             _emit_tp_new_slot(io, tname, tnew; subclassable=is_subclassable, is_mut_struct, has_dict)
+        end
+
+        # dict=true: expose the `_dict` field as the instance __dict__ via the
+        # __dictoffset__ special member that PyType_FromSpec recognises.
+        if has_dict
+            println(io, "static PyMemberDef _pt_members_$tname[] = {")
+            println(io, "    {\"__dictoffset__\", Py_T_PYSSIZET, offsetof(_PtObj_$tname, _dict), Py_READONLY},")
+            println(io, "    {NULL, 0, 0, 0, NULL}")
+            println(io, "};")
         end
 
         # Slots array: always dealloc + repr (user or default), then all other
@@ -1841,11 +1880,18 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         if has_getset
             println(io, "    {Py_tp_getset, (void *)_pt_getset_$tname},")
         end
+        if has_dict
+            println(io, "    {Py_tp_members,  (void *)_pt_members_$tname},")
+            println(io, "    {Py_tp_traverse, (void *)_pt_traverse_$tname},")
+            println(io, "    {Py_tp_clear,    (void *)_pt_clear_$tname},")
+        end
         println(io, "    {0, NULL}")
         println(io, "};")
 
         flags = "Py_TPFLAGS_DEFAULT"
         is_subclassable && (flags *= " | Py_TPFLAGS_BASETYPE")
+        # A type whose instances hold a __dict__ must be a GC type (cycle collection).
+        has_dict && (flags *= " | Py_TPFLAGS_HAVE_GC")
         println(io, "static PyType_Spec _pt_spec_$tname = {")
         println(io, "    \"$mod_name.$tname\", sizeof(_PtObj_$tname), 0,")
         println(io, "    $flags, _pt_slots_$tname")
@@ -1982,6 +2028,20 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
     println(io, "#include <stdbool.h>")
     println(io, "#include <stdlib.h>")
     println(io, "#include <string.h>")
+    if !isempty(dict_types)
+        # PyMemberDef + the Py_T_PYSSIZET / Py_READONLY names (Python.h, 3.12+); fall
+        # back to <structmember.h> on older CPython so dict=true builds on 3.11 too.
+        println(io, "#include <stddef.h>")
+        println(io, "#if PY_VERSION_HEX < 0x030C0000")
+        println(io, "#include <structmember.h>")
+        println(io, "#ifndef Py_T_PYSSIZET")
+        println(io, "#define Py_T_PYSSIZET T_PYSSIZET")
+        println(io, "#endif")
+        println(io, "#ifndef Py_READONLY")
+        println(io, "#define Py_READONLY READONLY")
+        println(io, "#endif")
+        println(io, "#endif")
+    end
     println(io)
     eglobals = _error_globals(errors)
     if !isempty(eglobals)
