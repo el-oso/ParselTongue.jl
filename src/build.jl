@@ -303,9 +303,15 @@ function _find_cc()
     cc = get(ENV, "JULIA_CC", get(ENV, "CC", nothing))
     cc !== nothing && return Cmd(Base.shell_split(cc))
     if Sys.iswindows()
-        # Prefer MinGW-w64 GCC; MSVC (cl.exe) is not yet supported.
-        for c in ("gcc", "x86_64-w64-mingw32-gcc", "clang")
+        # Prefer MinGW-w64 GCC. Accept clang only if it targets MinGW (MSYS2/w64)
+        # — standalone LLVM clang on Windows defaults to MSVC mode and won't
+        # accept -Wl,--whole-archive. JULIA_CC=clang bypasses this check.
+        for c in ("gcc", "x86_64-w64-mingw32-gcc")
             Sys.which(c) !== nothing && return `$c`
+        end
+        clang = Sys.which("clang")
+        if clang !== nothing && _clang_is_mingw(clang)
+            return `clang`
         end
         error("ParselTongue: no C compiler found on Windows. " *
               "Install MinGW-w64 (via MSYS2 or Julia's bundled toolchain) " *
@@ -315,6 +321,18 @@ function _find_cc()
         Sys.which(c) !== nothing && return `$c`
     end
     error("ParselTongue: no C compiler found (looked for cc, gcc, clang).")
+end
+
+# Returns true if `clang` targets a MinGW/w64 triple (and therefore accepts
+# GNU linker flags like --whole-archive). Standalone LLVM clang on Windows
+# defaults to a MSVC triple and must be rejected.
+function _clang_is_mingw(clang::AbstractString)::Bool
+    try
+        triple = strip(read(`$clang -dumpmachine`, String))
+        return occursin("mingw", triple) || occursin("w64", triple)
+    catch
+        return false
+    end
 end
 
 # On Windows, extension modules must link the Python DLL explicitly at link time
