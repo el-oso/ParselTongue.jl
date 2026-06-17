@@ -47,6 +47,23 @@ struct Mut{T} end
 
 The C-ABI carrier type that `T` is lowered to at the `@ccallable` boundary.
 Evaluated on the build host during codegen (not inside the trimmed library).
+
+Scalars are their own carrier; `String` lowers to `Cstring`; numeric arrays
+lower to a `PtArray` carrier.
+
+# Examples
+```jldoctest
+julia> using ParselTongue: c_abi_type
+
+julia> c_abi_type(Float64)
+Float64
+
+julia> c_abi_type(String)
+Cstring
+
+julia> c_abi_type(Vector{Float32})
+ParselTongue.PtArray{Float32, 1}
+```
 """
 function c_abi_type end
 
@@ -708,8 +725,9 @@ The bare name `PyCallable` (no parameters) defaults to `Float64 → Float64`:
 @pyfunc apply2(f::PyCallable{Tuple{Int64,Int64},Int64}, a::Int64, b::Int64)::Int64 = f(a, b)
 ```
 
-Supported argument and return scalar types: `Int8`–`Int64`, `UInt8`–`UInt64`,
-`Bool`, `Float32`, `Float64`.
+Supported argument and return types: scalars (`Int8`–`Int64`, `UInt8`–`UInt64`,
+`Bool`, `Float32`, `Float64`), `String` (↔ Python `str`), and `Vector{T}` for
+scalar `T` (↔ Python `list`).
 """
 struct PyCallable{Args<:Tuple, Ret} <: PyBoundary
     ptr::Ptr{Cvoid}
@@ -725,6 +743,12 @@ to_c(f::PyCallable) = f.ptr
 # Verify the PyBoundary contract on a concrete PyCallable instantiation and confirm
 # that to_c/from_c are trim-safe (no invokelatest, Base.which, etc.).
 @verify PyCallable{Tuple{Float64},Float64} trim_compat=true
+
+# Scalar element types that can be boxed/unboxed for a PyCallable signature, and
+# that may also appear as the element type of a `Vector{T}` argument or return.
+const _PY_SCALAR = Union{Int8,Int16,Int32,Int64,
+                         UInt8,UInt16,UInt32,UInt64,
+                         Bool,Float32,Float64}
 
 # ── Per-type scalar boxing / unboxing (trim-safe direct ccalls) ────────
 # Each method is concretely typed, so dispatch from the @generated call operator
@@ -752,6 +776,51 @@ _py_unbox(::Type{UInt16},  r::Ptr{Cvoid}) = UInt16(ccall(:PyLong_AsUnsignedLongL
 _py_unbox(::Type{UInt32},  r::Ptr{Cvoid}) = UInt32(ccall(:PyLong_AsUnsignedLongLong, Culonglong, (Ptr{Cvoid},), r))
 _py_unbox(::Type{UInt64},  r::Ptr{Cvoid}) = ccall(:PyLong_AsUnsignedLongLong, Culonglong, (Ptr{Cvoid},), r)
 _py_unbox(::Type{Bool},    r::Ptr{Cvoid}) = ccall(:PyObject_IsTrue, Cint, (Ptr{Cvoid},), r) != 0
+
+# ── String boxing / unboxing ───────────────────────────────────────────
+# PyUnicode_DecodeUTF8 returns a NEW reference (PyTuple_SetItem steals it).
+_py_box(s::String) = ccall(:PyUnicode_DecodeUTF8, Ptr{Cvoid},
+                           (Ptr{UInt8}, Cssize_t, Ptr{UInt8}),
+                           pointer(s), Cssize_t(ncodeunits(s)), C_NULL)
+
+# PyUnicode_AsUTF8 returns a pointer into the PyObject's internal buffer (borrowed).
+# The @generated call operator Py_DecRefs the result *after* _py_unbox returns, so
+# we must copy now with unsafe_string before that decref invalidates the buffer.
+function _py_unbox(::Type{String}, r::Ptr{Cvoid})
+    p = ccall(:PyUnicode_AsUTF8, Ptr{UInt8}, (Ptr{Cvoid},), r)
+    p == C_NULL && return ""
+    unsafe_string(p)
+end
+
+# ── Vector{T} boxing / unboxing (T scalar) ─────────────────────────────
+# Concrete per-T methods: the loop body calls the scalar _py_box/_py_unbox, which
+# resolve statically (T is known), so the @generated call operator stays trim-safe.
+function _py_box(v::Vector{T}) where {T<:_PY_SCALAR}
+    n   = length(v)
+    lst = ccall(:PyList_New, Ptr{Cvoid}, (Cssize_t,), Cssize_t(n))
+    lst == C_NULL && return C_NULL
+    for i in 0:n-1
+        item = _py_box(v[i+1])
+        if item == C_NULL
+            ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), lst)
+            return C_NULL
+        end
+        # PyList_SetItem steals the reference to `item`.
+        ccall(:PyList_SetItem, Cint, (Ptr{Cvoid}, Cssize_t, Ptr{Cvoid}), lst, Cssize_t(i), item)
+    end
+    return lst
+end
+
+function _py_unbox(::Type{Vector{T}}, r::Ptr{Cvoid}) where {T<:_PY_SCALAR}
+    n = Int(ccall(:PySequence_Size, Cssize_t, (Ptr{Cvoid},), r))
+    v = Vector{T}(undef, n)
+    for i in 0:n-1
+        # PyList_GetItem returns a BORROWED reference — do NOT Py_DecRef it.
+        item = ccall(:PyList_GetItem, Ptr{Cvoid}, (Ptr{Cvoid}, Cssize_t), r, Cssize_t(i))
+        v[i+1] = _py_unbox(T, item)
+    end
+    return v
+end
 
 # Call the Python callable. Generated per concrete (Args, Ret): builds the arg
 # tuple with unrolled _py_box calls, invokes PyObject_Call, unboxes via Ret.
@@ -840,6 +909,20 @@ end
 
 True when `T` implements the full boundary protocol (`c_abi_type`, `to_c`,
 `from_c`). Non-throwing form of `assert_boundary`.
+
+# Examples
+```jldoctest
+julia> using ParselTongue: is_boundary_type
+
+julia> is_boundary_type(Float64)
+true
+
+julia> is_boundary_type(Dict{String,Float64})
+true
+
+julia> is_boundary_type(Set{Int})
+false
+```
 """
 is_boundary_type(T::Type) = isempty(_missing_boundary_methods(T))
 

@@ -2304,6 +2304,15 @@ end
     @test hasmethod(ParselTongue._py_box, Tuple{Float64})
     @test hasmethod(ParselTongue._py_unbox, Tuple{Type{Int64}, Ptr{Cvoid}})
     @test hasmethod(ParselTongue._py_unbox, Tuple{Type{Bool}, Ptr{Cvoid}})
+    # Non-scalar box/unbox: String and Vector{T} (item L extension).
+    @test hasmethod(ParselTongue._py_box, Tuple{String})
+    @test hasmethod(ParselTongue._py_unbox, Tuple{Type{String}, Ptr{Cvoid}})
+    @test hasmethod(ParselTongue._py_box, Tuple{Vector{Float64}})
+    @test hasmethod(ParselTongue._py_box, Tuple{Vector{Int64}})
+    @test hasmethod(ParselTongue._py_unbox, Tuple{Type{Vector{Float64}}, Ptr{Cvoid}})
+    # PyCallable signatures with non-scalar arg/return are valid boundary types.
+    @test is_boundary_type(PyCallable{Tuple{String},String})
+    @test is_boundary_type(PyCallable{Tuple{Vector{Float64}},Vector{Float64}})
 
     # A multi-arg PyCallable signature lowers to a void* carrier per arg.
     clear_exports!()

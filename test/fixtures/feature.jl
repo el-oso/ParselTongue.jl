@@ -143,6 +143,10 @@ end
     # Arbitrary callable signatures (item L): two Int64 args → Int64.
     @pyfunc combine(f::PyCallable{Tuple{Int64,Int64},Int64}, a::Int64, b::Int64)::Int64 = f(a, b)
 
+    # Non-scalar callable signatures (item L): String and Vector{Float64}.
+    @pyfunc apply_str(f::PyCallable{Tuple{String},String}, s::String)::String = f(s)
+    @pyfunc apply_vec(f::PyCallable{Tuple{Vector{Float64}},Vector{Float64}}, v::Vector{Float64})::Vector{Float64} = f(v)
+
     # O7 @pymutable: mutate the live registry object; the change persists across calls.
     @pyfunc acc_add(a::Accumulator, x::Float64)::Float64 = (a.total += x; a.total)
     @pyfunc acc_total(a::Accumulator)::Float64 = a.total

@@ -4,11 +4,10 @@ DocumenterVitepress = "4710194d-e776-4893-9690-8d956a29c365"
 ParselTongue = "f960a036-e00a-43bb-b834-c57a5ea23a66"
 TypeContracts = "c7a3f1e2-84b5-4d69-9e0a-1f2b3c4d5e6f"
 
+[sources]
+ParselTongue = {path = ".."}
+
 [compat]
 Documenter = "1"
 DocumenterVitepress = "0"
 julia = "1.12"
-
-[sources]
-ParselTongue = {path = ".."}
-TypeContracts = {url = "https://github.com/el-oso/TypeContracts.jl", rev = "master"}

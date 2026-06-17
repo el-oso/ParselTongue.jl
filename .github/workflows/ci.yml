@@ -54,7 +54,6 @@ jobs:
         if: runner.os == 'Windows'
         run: pip install numpy
 
-      # TypeContracts is resolved via the [sources] entry in Project.toml.
       - name: Instantiate
         run: |
           julia --project=. -e 'using Pkg; Pkg.instantiate()'
@@ -68,6 +67,24 @@ jobs:
       # Skips gracefully when juliac / python3 / cc are unavailable (see _have_tools).
       - name: Integration tests (juliac build + Python import)
         run: julia --project=. test/test_integration.jl
+
+  # Doctest gate: runs only the docstring doctests via Documenter.doctest — no
+  # page build, no Vitepress/npm, no deploy. OS-independent, so a single runner.
+  # The full docs build (with Vitepress) runs separately in Documentation.yml.
+  doctests:
+    name: Doctests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v3
+      - name: Instantiate docs project
+        run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'
+      - name: Run doctests
+        run: julia --project=docs docs/doctests.jl
 
   # Memory-safety gate for the generated C glue. Compiles the shim (no Julia
   # linked — pt_* are stubbed) with AddressSanitizer and runs the marshalling

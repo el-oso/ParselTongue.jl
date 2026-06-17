@@ -236,7 +236,15 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   gracefully if tools absent). README updated with installation instructions and a current
   status section. **General registry**: blocked on TypeContracts being registered in
   General first; the rest of Project.toml (UUID, compat, extras) is already correct.
-  Doctest of docs examples deferred (requires node/npm). Effort M.
+  **Doctests done (post-v0.25.0):** `doctest = true` in `docs/make.jl` with `warnonly`
+  narrowed to everything-except-`:doctest` (so doctests fail the build while the
+  Vitepress-style cross-reference links stay soft warnings). `jldoctest` blocks added to
+  `c_abi_type` and `is_boundary_type`. CI runs a node-free gate (`docs/doctests.jl` →
+  `Documenter.doctest`, `doctest`-job in `ci.yml`); the full Vitepress build in
+  `Documentation.yml` also exercises them. **Blocker found & worked around:** TypeContracts'
+  `@contract` attaches a marker docstring with `:path => nothing`, which crashes Documenter's
+  doctest runner; `make.jl`/`doctests.jl` backfill an empty path until TypeContracts is fixed
+  (gap filed for TypeContracts).
 - [x] **11. Startup latency** — shipped v0.14.0. `startup_benchmark(ext_path; call_expr, n, python)`
   runs `n` fresh-subprocess trials, times import and optional first call, returns a
   NamedTuple with `import_ms_median/min/max` and `call_ms_median/min/max`. Integration
@@ -314,8 +322,13 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   carrier stays `Ptr{Cvoid}` for every signature (`ispycallable(C) = C === Ptr{Cvoid}`).
   Supported scalar arg/return types: `Int8`–`Int64`, `UInt8`–`UInt64`, `Bool`, `Float32`,
   `Float64`. Files: `src/boundary.jl` (parameterize + box/unbox + `@generated` operator),
-  `src/ccallable_gen.jl` (`_type_src` PyCallable case). **Done v0.11.0.** Non-scalar
-  callback args/returns remain future work.
+  `src/ccallable_gen.jl` (`_type_src` PyCallable case). **Done v0.11.0.**
+  **Non-scalar callback args/returns done (post-v0.25.0):** `String` (↔ Python `str`,
+  via `PyUnicode_DecodeUTF8`/`PyUnicode_AsUTF8`) and `Vector{T}` for scalar T (↔ Python
+  `list`, via `PyList_New`/`PyList_SetItem` + `PySequence_Size`/`PyList_GetItem`). New
+  `_PY_SCALAR` union gates the element types; the loop-based `_py_box`/`_py_unbox` methods
+  stay trim-safe because the `@generated` operator calls them with concrete T. Fixtures
+  `apply_str`/`apply_vec` in `test/fixtures/feature.jl`.
 
 - [x] **M. `pyproject.toml` generation** — `build_wheel(...; emit_pyproject=true)` writes a
   minimal PEP 621 `pyproject.toml` next to the `.whl`: `[build-system]` stub +

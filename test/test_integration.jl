@@ -354,6 +354,11 @@ end
         # Arbitrary callable signatures (item L): (Int64, Int64) -> Int64
         assert feature.combine(lambda a, b: a + b, 3, 4) == 7,   "combine: add"
         assert feature.combine(lambda a, b: a * b, 6, 7) == 42,  "combine: mul"
+        # Non-scalar callable signatures (item L): String and Vector{Float64}
+        assert feature.apply_str(str.upper, "hello") == "HELLO",  "apply_str: upper"
+        assert feature.apply_str(lambda s: s[::-1], "abc") == "cba", "apply_str: reverse"
+        assert list(feature.apply_vec(lambda v: [x * 2.0 for x in v], array.array("d", [1.0, 2.0, 3.0]))) == [2.0, 4.0, 6.0], "apply_vec: double"
+        assert list(feature.apply_vec(sorted, array.array("d", [3.0, 1.0, 2.0]))) == [1.0, 2.0, 3.0], "apply_vec: sorted"
         # Refcount-leak gate: calling a wrapper must not leak references to its
         # arguments (e.g. an INCREF without a matching DECREF on the arg buffer or
         # callable) nor leak Python objects per call. Catches the Python-side half
