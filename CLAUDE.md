@@ -153,21 +153,32 @@ method/`__new__`/property/named-method signatures via `_carrier_set`.
 
 `@pyhandle T subclass=true` / `@pymutable T subclass=true` add `Py_TPFLAGS_BASETYPE` and a
 subclass-aware `tp_new` (allocates with the passed `type`, not the hardcoded base, so
-`class Sub(T)` instances are real `Sub` objects) — abi3-safe. A pure-Python subclass inherits
+`class Sub(T)` instances are real `Sub` objects). A pure-Python subclass inherits
 the constructor/fields/methods/dunders and may add methods, properties, and dunder overrides.
 
-`dict=true` (PyO3 `#[pyclass(dict)]`) gives instances a real `__dict__`. We use the
-**classic explicit-`tp_dictoffset`** mechanism (version-stable across 3.11–3.14), NOT the
-managed-dict pre-header (which is version-fragile and was the source of the earlier crash):
-the instance struct gains a `PyObject *_dict` field, exposed as `tp_dictoffset` via the
-`__dictoffset__` special member that `PyType_FromSpec` recognises, plus a `__dict__` getset
+**`subclass=true` ⟹ the dict slot** (`has_dict = (T in _DICT_TYPES) || is_subclassable`,
+`cshim.jl`). This is load-bearing, not cosmetic: a pure-Python subclass *always* gets a
+`__dict__`, and on CPython ≥3.12 a subclass of a type **without** `tp_dictoffset` is given a
+**managed dict** whose inline values overlap our `_data` field (offset 16, after
+`PyObject_HEAD`) — `free(self->_data)` in dealloc then frees a clobbered interior pointer →
+heap corruption → intermittent SIGSEGV (deterministic on 3.12, latent on 3.14). Giving the
+base a classic `tp_dictoffset` makes subclasses inherit the classic slot instead. See
+[[subclass-managed-dict-crash]].
+
+`dict=true` (PyO3 `#[pyclass(dict)]`) gives instances a real `__dict__`; subclassable types
+get the same machinery automatically. We use the **classic explicit-`tp_dictoffset`**
+mechanism (version-stable across 3.11–3.14), NOT the managed-dict pre-header: the instance
+struct gains a `PyObject *_dict` field, exposed as `tp_dictoffset` via the `__dictoffset__`
+special member that `PyType_FromSpec` recognises, plus a `__dict__` getset
 (`PyObject_GenericGetDict`/`SetDict`). An object holding arbitrary Python refs must collect
 cycles, so dict types are GC types: `Py_TPFLAGS_HAVE_GC` + `tp_traverse`/`tp_clear`
 (`Py_VISIT`/`Py_CLEAR` on `_dict`) + `PyObject_GC_UnTrack` in dealloc + `tp_free`. Crucial
 gotcha: **`PyType_GenericAlloc` already GC-tracks**, so we must NOT call `PyObject_GC_Track`
-(doing so trips `_PyObject_AssertFailed`). `dict=true` requires the full API — `build_extension`
-errors if combined with `abi3=true` (the dealloc reaches `Py_TYPE(self)->tp_free`, and
-`PyTypeObject` is opaque under the limited API).
+(doing so trips `_PyObject_AssertFailed`). The dealloc fetches `tp_free` via
+`PyType_GetSlot(Py_TYPE(self), Py_tp_free)` (limited-API safe; handles a GC subclass's
+differing `tp_free`) rather than `Py_TYPE(self)->tp_free`, so subclassable types build under
+`abi3=true`. Explicit `dict=true` still errors with `abi3=true` (`build_extension` guard on
+`_DICT_TYPES`).
 
 Flags live in `_SUBCLASS_TYPES` / `_DICT_TYPES`, threaded via the `_preloaded` NamedTuple
 (`_registry_snapshot`). Native inheritance between ParselTongue types (PyO3 `extends=`) is
