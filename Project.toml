@@ -7,9 +7,6 @@ authors = ["el_oso"]
 MLStyle = "d8e11817-5142-5d16-987a-aa16d5891078"
 TypeContracts = "c7a3f1e2-84b5-4d69-9e0a-1f2b3c4d5e6f"
 
-[sources]
-TypeContracts = {rev = "master", url = "https://github.com/el-oso/TypeContracts.jl"}
-
 [compat]
 MLStyle = "0.4"
 TypeContracts = "0.13"
