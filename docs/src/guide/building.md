@@ -89,9 +89,31 @@ names must be unique across the files (they share one C method table). All the
 ### Trim modes
 
 `--trim=safe` (the default) makes juliac **error at build time** if an exported
-code path needs dynamic dispatch — the failure is reported as a Julia
-stack-frame, before any wheel is produced. If you hit one, the usual fix is to
-make the offending function type-stable. As an escape hatch:
+code path needs dynamic dispatch. ParselTongue translates the raw verifier output
+into a source-mapped `TrimFailure` that points directly to the problem:
+
+```julia
+# bad.jl
+@pymodule bad begin
+    @pyfunc dyn(n::Int64)::Int64 = Base.inferencebarrier(n) + 1
+end
+```
+
+```julia
+julia> build_extension("bad.jl")
+ERROR: TrimFailure: juliac --trim=safe rejected 1 call site (4 verifier errors) — these calls are not statically resolvable.
+
+  ✗ dyn(n::Int64)  bad.jl:3  (4 errors)
+      unresolved: (Base.compilerbarrier(:type, n::Int64)::Any + 1)::Any
+      → a value inferred as `Any` makes this call dynamic — annotate or narrow the type
+        (e.g. `x::Concrete`, a type assertion, or avoid abstract containers) so the
+        call is statically resolvable.
+
+  (rebuild with verbose=true / keep_build=true for raw juliac output.)
+```
+
+The fix is to make the offending function type-stable — remove `inferencebarrier`,
+use concrete types, or add a type assertion. As an escape hatch:
 
 ```julia
 build_wheel("mymod.jl"; trim = :unsafe_warn)   # warns instead of erroring
