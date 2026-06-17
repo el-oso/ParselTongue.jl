@@ -117,12 +117,18 @@ jobs:
           ls -la "$RUNNER_TEMP/featdiag"
       - name: Loop full script under gdb until it crashes
         continue-on-error: true
+        env:
+          # Let gdb auto-download CPython (and glibc) debug symbols so the
+          # stripped `?? ()` frames in the python3 binary resolve to real
+          # function names — pinpointing the exact corrupted/crashing call.
+          DEBUGINFOD_URLS: "https://debuginfod.ubuntu.com"
         run: |
           export FEATURE_DIR="$RUNNER_TEMP/featdiag"
           crashed=0
           for i in $(seq 1 40); do
             gdb -batch \
               -ex 'set pagination off' \
+              -ex 'set debuginfod enabled on' \
               -ex 'run' \
               -ex 'echo \n===== CRASH BACKTRACE (bt full) =====\n' \
               -ex 'bt full' \
