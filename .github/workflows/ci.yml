@@ -87,6 +87,60 @@ jobs:
       - name: Run doctests
         run: julia --project=docs docs/doctests.jl
 
+  # Diagnostic (non-blocking): the Linux integration job intermittently SIGSEGVs
+  # in the embedded-Julia↔CPython subprocess. This job rebuilds the `feature`
+  # extension and runs test/diag/repro.py — which prints a stderr marker before
+  # each call group — first plainly (captures the last marker + Julia's own
+  # signal backtrace + a core dump) and then under gdb (native backtrace, since
+  # Julia's SIGSEGV handler otherwise preempts Python's faulthandler).
+  segfault-diag:
+    name: Segfault diagnosis (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v3
+      - name: Install gdb + numpy
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y gdb
+          pip3 install numpy --break-system-packages
+      - name: Instantiate
+        run: julia --project=. -e 'using Pkg; Pkg.instantiate()'
+      - name: Build feature extension
+        run: |
+          mkdir -p "$RUNNER_TEMP/featdiag"
+          julia --project=. -e 'using ParselTongue; build_extension("test/fixtures/feature.jl"; outdir=ENV["RUNNER_TEMP"]*"/featdiag")'
+          ls -la "$RUNNER_TEMP/featdiag"
+      - name: Run repro (plain — markers + Julia backtrace + core dump)
+        continue-on-error: true
+        run: |
+          ulimit -c unlimited || true
+          echo "core" | sudo tee /proc/sys/kernel/core_pattern || true
+          FEATURE_DIR="$RUNNER_TEMP/featdiag" python3 test/diag/repro.py; echo "plain exit=$?"
+      - name: Run repro under gdb (native backtrace)
+        continue-on-error: true
+        run: |
+          FEATURE_DIR="$RUNNER_TEMP/featdiag" gdb -batch \
+            -ex 'set pagination off' \
+            -ex 'run' \
+            -ex 'echo \n===== CRASH BACKTRACE =====\n' \
+            -ex 'bt full' \
+            -ex 'echo \n===== ALL THREADS =====\n' \
+            -ex 'thread apply all bt' \
+            --args python3 test/diag/repro.py
+      - name: Analyze core dump if present
+        continue-on-error: true
+        run: |
+          for c in core core.* "$RUNNER_TEMP"/featdiag/core*; do
+            [ -f "$c" ] || continue
+            echo "=== core: $c ==="
+            gdb -batch -ex 'bt full' -ex 'thread apply all bt' python3 "$c"
+          done
+
   # Memory-safety gate for the generated C glue. Compiles the shim (no Julia
   # linked — pt_* are stubbed) with AddressSanitizer and runs the marshalling
   # paths; a leak/overflow in the glue (e.g. a reverted A1/A2 fix) fails here.
