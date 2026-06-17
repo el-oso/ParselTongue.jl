@@ -121,6 +121,12 @@ function build_extension(user_path::AbstractString;
     isempty(exports) && error(
         "ParselTongue: no @pyfunc exports found in $user_path. " *
         "Annotate functions with @pyfunc.")
+    # An instance __dict__ uses Py_TPFLAGS_MANAGED_DICT (CPython ≥ 3.12), which is not
+    # part of the stable ABI — so `dict=true` is incompatible with an abi3 build.
+    (abi3 && !isempty(dict_types)) && error(
+        "ParselTongue: `dict=true` (instance __dict__, needs CPython ≥ 3.12) is " *
+        "incompatible with abi3=true (stable-ABI floor 3.11). Types: " *
+        "$(join(string.(dict_types), ", ")). Build without abi3, or drop dict=true.")
 
     mod = mod_name !== nothing ? String(mod_name) :
           _MODULE_NAME[] !== nothing ? _MODULE_NAME[] :
@@ -148,7 +154,8 @@ function build_extension(user_path::AbstractString;
     # 4. Generate the C PyInit shim.
     cpath = joinpath(builddir, string("_", mod, "module.c"))
     write(cpath, Base.invokelatest(emit_cshim, mod, exports, errors, handle_types, methods, news_list;
-                                   mutable_types, mutable_struct_types, properties, named_methods, abi3))
+                                   mutable_types, mutable_struct_types, properties, named_methods,
+                                   subclass_types, dict_types, abi3))
 
     # 5. Link the shim + archive into the extension module.
     so_path = joinpath(outdir, string(mod, ext_suffix))

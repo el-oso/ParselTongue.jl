@@ -1083,7 +1083,8 @@ typedef struct { void *ptr; } PtHandle;
 
 # Emit the `tp_new` C slot for one @pyhandle type that has a `@pymethod __new__`.
 # Reuses _arg_plan for argument parsing (same machinery as _wrapper_fn).
-function _emit_tp_new_slot(io::IO, tname::String, n::PtNew; abi3::Bool=false)
+function _emit_tp_new_slot(io::IO, tname::String, n::PtNew; abi3::Bool=false,
+                           subclassable::Bool=false, is_mut_struct::Bool=false)
     sym  = cabi_symbol(n)
     args = n.args
     plans = [_arg_plan(c_abi_type(a.jl_type), i; abi3) for (i, a) in enumerate(args)]
@@ -1121,7 +1122,23 @@ function _emit_tp_new_slot(io::IO, tname::String, n::PtNew; abi3::Bool=false)
     println(io, "        free(_pt_errmsg);")
     println(io, "        return NULL;")
     println(io, "    }")
-    println(io, "    return _pt_make_obj_$(tname)(h);")
+    if subclassable
+        # Honor the passed `type` so `class Sub(T)` instances are real Sub objects
+        # (not the base). _pt_make_obj_T always builds a base instance — correct for
+        # method/function return values, but not for subclass construction.
+        println(io, "    _PtObj_$(tname) *obj = (_PtObj_$(tname) *)PyType_GenericAlloc(type, 0);")
+        # On alloc failure, release the just-built Julia value: free the malloc'd
+        # struct (@pyhandle) or drop the registry entry (@pymutable).
+        if is_mut_struct
+            println(io, "    if (!obj) { _pt_dealloc_$(tname)_jl(h); return NULL; }")
+        else
+            println(io, "    if (!obj) { free(h.ptr); return NULL; }")
+        end
+        println(io, "    obj->_data = h.ptr;")
+        println(io, "    return (PyObject *)obj;")
+    else
+        println(io, "    return _pt_make_obj_$(tname)(h);")
+    end
     println(io, "}")
 end
 
@@ -1188,7 +1205,9 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                                 mutable_types::AbstractVector{<:Type}=Type[],
                                 mutable_struct_types::AbstractVector{<:Type}=Type[],
                                 properties::AbstractVector{PtProperty}=PtProperty[],
-                                named_methods::AbstractVector{PtNamedMethod}=PtNamedMethod[])
+                                named_methods::AbstractVector{PtNamedMethod}=PtNamedMethod[],
+                                subclass_types::AbstractVector{<:Type}=Type[],
+                                dict_types::AbstractVector{<:Type}=Type[])
     isempty(handle_types) && return
     println(io, "/* @pyhandle types: each becomes a real Python class (isinstance, repr, etc.) */")
     for T in handle_types
@@ -1199,6 +1218,10 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         # @pymutable types store a registry id in _data and route dealloc / field
         # access through Julia rather than raw C memory.
         is_mut_struct = T in mutable_struct_types
+        # Opt-in subclassing flags (PyO3-style): BASETYPE (Python subclasses) and a
+        # managed instance __dict__ (CPython ≥ 3.12; guarded against abi3 in build.jl).
+        is_subclassable = T in subclass_types
+        has_dict        = T in dict_types
 
         println(io, "typedef struct { PyObject_HEAD void *_data; } _PtObj_$tname;")
         # Declare early so _pt_richcmp_T (emitted below) can reference it.
@@ -1778,7 +1801,7 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
 
         # tp_new slot: emitted before the slot array (needs the extern declaration).
         if tnew !== nothing
-            _emit_tp_new_slot(io, tname, tnew)
+            _emit_tp_new_slot(io, tname, tnew; subclassable=is_subclassable, is_mut_struct)
         end
 
         # Slots array: always dealloc + repr (user or default), then all other
@@ -1824,9 +1847,12 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         println(io, "    {0, NULL}")
         println(io, "};")
 
+        flags = "Py_TPFLAGS_DEFAULT"
+        is_subclassable && (flags *= " | Py_TPFLAGS_BASETYPE")
+        has_dict        && (flags *= " | Py_TPFLAGS_MANAGED_DICT")
         println(io, "static PyType_Spec _pt_spec_$tname = {")
         println(io, "    \"$mod_name.$tname\", sizeof(_PtObj_$tname), 0,")
-        println(io, "    Py_TPFLAGS_DEFAULT, _pt_slots_$tname")
+        println(io, "    $flags, _pt_slots_$tname")
         println(io, "};")
         println(io, "static PyObject *_pt_make_obj_$tname(PtHandle h) {")
         println(io, "    _PtObj_$tname *obj = (_PtObj_$tname *)")
@@ -1941,6 +1967,8 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
                     mutable_struct_types::Vector{<:Type}=Type[],
                     properties::Vector{PtProperty}=PtProperty[],
                     named_methods::Vector{PtNamedMethod}=PtNamedMethod[],
+                    subclass_types::Vector{<:Type}=Type[],
+                    dict_types::Vector{<:Type}=Type[],
                     doc::AbstractString="", abi3::Bool=false)
     isempty(doc) && (doc = "ParselTongue extension (Julia via juliac --trim)")
     io = IOBuffer()
@@ -2008,7 +2036,8 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
         println(io)
     end
     _emit_handle_type_defs(io, mod_name, handle_types, methods, news;
-                           mutable_types, mutable_struct_types, properties, named_methods)
+                           mutable_types, mutable_struct_types, properties, named_methods,
+                           subclass_types, dict_types)
     println(io, "/* C-ABI entry points emitted by juliac --trim */")
     for e in exports
         println(io, _extern_decl(e))

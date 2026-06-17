@@ -14,7 +14,7 @@ the Python object graph you can reach from native code.
 | Annotation | `@pyfunc` / `@pymodule` | `#[pyfunction]` / `#[pymodule]` |
 | Build CLI | `pt wheel file.jl` (or `build_wheel("file.jl")`) | `maturin build` |
 | Type mapping | Explicit boundary contract | Derive macros + `FromPyObject` / `IntoPyObject` |
-| Classes | `@pyhandle` (isbits) + `@pymutable` (heap fields, GC registry); `isinstance`, mutable fields, ~25 dunders incl. numeric + iterator (`__next__`), `@pyproperty`, context managers | `#[pyclass]` (full object protocol; arbitrary struct fields) |
+| Classes | `@pyhandle` (isbits) + `@pymutable` (heap fields, GC registry); `isinstance`, mutable fields, ~25 dunders incl. numeric (mixed-type) + iterator (`__next__`), bound named methods, `@pyproperty`, context managers, opt-in `subclass=`/`dict=` | `#[pyclass]` (full object protocol incl. `extends=` native inheritance) |
 | Custom exceptions | `@pyerror MyError <: ValueError` | `create_exception!` |
 | Python callables | `PyCallable{Args,Ret}` (any scalar signature) | `Py<PyAny>` / `PyCallable` (any signature) |
 | GIL release during call | Yes (automatic) | Yes (opt-in with `py.allow_threads`) |
@@ -190,10 +190,42 @@ mutable struct CountUp; cur::Int64; stop::Int64; end
 ```
 
 The registry is a concretely-typed global, so `to_c`/`from_c`/dealloc stay
-trim-safe. The remaining gaps vs `#[pyclass]` are **Python inheritance** and
-**bound named methods** (today, methods on a `@pymutable` are written as
-module-level `@pyfunc`s taking the object, e.g. `mod.bump(c)` rather than
-`c.bump()`).
+trim-safe.
+
+### Bound methods, mixed-type operators, and subclassing
+
+A `@pymethod` with a **plain (non-dunder) name** becomes a bound instance method
+(`obj.method(args)`), registered in the type's method table:
+
+```julia
+@pymethod bump!(c::Counter)::Int64 = (c.count += 1; c.count)   # c.bump()
+@pymethod scaled(v::Vec2, k::Float64)::Vec2 = Vec2(v.x*k, v.y*k) # v.scaled(2.0)
+```
+
+Numeric operators support **mixed operand types** and reflected forms, so both
+`vec * 2.0` and `2.0 * vec` work (the C number slot dispatches on operand types;
+a non-matching operand yields `NotImplemented` so Python falls back):
+
+```julia
+@pymethod __truediv__ divk(p::Vec2, k::Float64)::Vec2 = Vec2(p.x/k, p.y/k)  # p / 2.0
+@pymethod __rmul__    rscale(p::Vec2, k::Float64)::Vec2 = Vec2(p.x*k, p.y*k) # 2.0 * p
+```
+
+Types opt into **Python subclassing** with flags mirroring PyO3's
+`#[pyclass(subclass)]` / `#[pyclass(dict)]` (default off):
+
+```julia
+@pyhandle Vec2 subclass=true              # `class MyVec(Vec2): ...` in Python
+@pymutable Counter subclass=true dict=true  # subclass + per-instance attributes
+```
+
+`subclass=true` adds `Py_TPFLAGS_BASETYPE` and a subclass-aware `tp_new`
+(abi3-safe). `dict=true` adds a managed instance `__dict__` (CPython ≥ 3.12; rejected
+with a clear error if combined with `abi3=true`).
+
+The remaining gap vs `#[pyclass]` is **`extends=`** — native inheritance *between*
+ParselTongue types or from a Python builtin (sharing fields/layout). Independent
+Julia structs can't share a C layout, so that case is unsupported.
 
 ## Error handling
 
@@ -345,10 +377,12 @@ build can take minutes.
 
 - Your performance-critical code is in Rust, or you want Rust's memory-safety
   guarantees in the extension layer.
-- You need **Python inheritance**, or **bound named methods** on a class
-  (ParselTongue exposes class methods as module-level functions, not `obj.method()`).
-- You need **mixed-type operator overloading** (e.g. `vec * float`); ParselTongue's
-  numeric dunders require both operands to be the same handle type.
+- You need **native inheritance** (`#[pyclass(extends=...)]`): one native class
+  sharing the fields/layout of another, or subclassing a Python builtin. ParselTongue
+  supports Python subclassing of its types (`subclass=true`) but not field-sharing
+  inheritance between independent Julia structs.
+- You need an operator with **two different operand signatures on one method**
+  (ParselTongue's `__mul__` is either `T×T` or `T×scalar`, not both at once).
 - You need **free-threading** CPython.
 - You need a fully self-contained wheel with **nothing installed once**: a PyO3
   wheel carries its whole runtime, whereas a ~1 MB ParselTongue wheel still needs a

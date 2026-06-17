@@ -162,27 +162,14 @@ automatically when the Python object is garbage-collected.
 `T` must satisfy `isbitstype(T)`.
 """
 macro pyhandle(T_expr, opts...)
-    mutable = false
-    for opt in opts
-        if opt isa Expr && opt.head === :(=) && opt.args[1] === :mutable
-            mutable = opt.args[2] === true ||
-                      (opt.args[2] isa Bool && opt.args[2])
-        end
-    end
+    mutable, subclass, dict = _parse_class_opts(:pyhandle, opts)
     T = Core.eval(__module__, T_expr)
     isbitstype(T) || error(
         "@pyhandle: `$T` must be an isbitstype (immutable struct with all-isbits fields).")
     T in _HANDLE_TYPES || push!(_HANDLE_TYPES, T)
-    if mutable
-        T in _MUTABLE_HANDLE_TYPES || push!(_MUTABLE_HANDLE_TYPES, T)
-    end
-    # Whether to also register as a mutable type at evaluation time (in quote).
-    # This handles the case where clear_exports!() empties the registry between
-    # macro expansion (parse time) and the point where the registry is read.
-    mutable_push_expr = mutable ?
-        :( $T in ParselTongue._MUTABLE_HANDLE_TYPES ||
-           push!(ParselTongue._MUTABLE_HANDLE_TYPES, $T) ) :
-        :(nothing)
+    mutable  && (T in _MUTABLE_HANDLE_TYPES || push!(_MUTABLE_HANDLE_TYPES, T))
+    subclass && (T in _SUBCLASS_TYPES || push!(_SUBCLASS_TYPES, T))
+    dict     && (T in _DICT_TYPES || push!(_DICT_TYPES, T))
 
     quote
         ParselTongue.c_abi_type(::Type{$T}) = ParselTongue.PtHandle{$T}
@@ -200,10 +187,36 @@ macro pyhandle(T_expr, opts...)
         # PyBoundary this is a no-op today. TypeContracts would need a structural form
         # (@verify T for_contract=PyBoundary trim_compat=true) to cover this case.
         TypeContracts.check_trim_compat($T)
-        $mutable_push_expr
+        # Runtime re-registration (survives clear_exports! between macro expansion and read).
+        $(_class_opt_push_expr(T, mutable, :_MUTABLE_HANDLE_TYPES))
+        $(_class_opt_push_expr(T, subclass, :_SUBCLASS_TYPES))
+        $(_class_opt_push_expr(T, dict, :_DICT_TYPES))
         nothing
     end
 end
+
+# Parse `mutable=`/`subclass=`/`dict=` boolean opts shared by @pyhandle / @pymutable.
+# `subclass`/`dict` mirror PyO3 #[pyclass(subclass)] / #[pyclass(dict)] (default off).
+function _parse_class_opts(macroname::Symbol, opts)
+    mutable = false; subclass = false; dict = false
+    for opt in opts
+        (opt isa Expr && opt.head === :(=)) ||
+            error("@$macroname: options must be `name=true/false`, got `$opt`.")
+        k = opt.args[1]
+        v = opt.args[2] === true || (opt.args[2] isa Bool && opt.args[2])
+        if     k === :mutable;  mutable  = v
+        elseif k === :subclass; subclass = v
+        elseif k === :dict;     dict     = v
+        else error("@$macroname: unknown option `$k` (expected mutable/subclass/dict).")
+        end
+    end
+    return (mutable, subclass, dict)
+end
+
+# Runtime push into a registry (no-op when the flag is off).
+_class_opt_push_expr(T, flag::Bool, reg::Symbol) =
+    flag ? :( $T in getfield(ParselTongue, $(QuoteNode(reg))) ||
+              push!(getfield(ParselTongue, $(QuoteNode(reg))), $T) ) : :(nothing)
 
 """
     @pymutable T
@@ -235,11 +248,14 @@ registry is a concretely-typed global, all of `to_c`/`from_c`/dealloc remain
 trim-safe. `@pymutable` is the recommended base for stateful iterators
 (`@pymethod __next__`).
 """
-macro pymutable(T_expr)
+macro pymutable(T_expr, opts...)
+    _, subclass, dict = _parse_class_opts(:pymutable, opts)
     T = Core.eval(__module__, T_expr)
     (T isa DataType && Base.ismutabletype(T)) || error(
         "@pymutable: `$T` must be a `mutable struct` (got an immutable or non-struct type). " *
         "Use @pyhandle for immutable isbits structs.")
+    subclass && (T in _SUBCLASS_TYPES || push!(_SUBCLASS_TYPES, T))
+    dict     && (T in _DICT_TYPES || push!(_DICT_TYPES, T))
     tname   = string(T.name.name)
     reg_sym = esc(Symbol("_PtRegistry_", tname))
     seq_sym = esc(Symbol("_PtIdSeq_", tname))
@@ -274,6 +290,8 @@ macro pymutable(T_expr)
             push!(ParselTongue._MUTABLE_STRUCT_TYPES, $Tq)
         $Tq in ParselTongue._HANDLE_TYPES ||
             push!(ParselTongue._HANDLE_TYPES, $Tq)
+        $(_class_opt_push_expr(T, subclass, :_SUBCLASS_TYPES))
+        $(_class_opt_push_expr(T, dict, :_DICT_TYPES))
         nothing
     end
 end

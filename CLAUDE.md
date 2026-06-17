@@ -136,15 +136,28 @@ The C carrier is `PtHandle { void *ptr; }`. `from_c(T, h)` = `unsafe_load(Ptr{T}
 | `__iter__` | `Py_tp_iter` | — | self | Pure C `Py_INCREF(self); return self` (no Julia call) |
 | `__next__` | `Py_tp_iternext` | — | `PtOpt` (`Union{V,Nothing}`) | `has_value==0` → `PyErr_SetNone(StopIteration)`; advance state in place (`@pymutable`) |
 | `__enter__`, `__exit__` | `Py_tp_methods` (PyMethodDef) | — | self / `int8_t` | NOT type slots — go in the method table |
-| `__add__`,`__sub__`,`__mul__`,`__truediv__`,`__floordiv__`,`__mod__`,`__pow__`,`__matmul__` | `Py_nb_*` (binary) | same handle type → `PtHandle{T}` | any boundary → `PyObject*` | Type-guards both operands; returns `NotImplemented` for mixed types (Python tries reflected op). `__pow__` is ternaryfunc (modulo ignored) |
-| `__neg__`,`__pos__`,`__abs__`,`__invert__` | `Py_nb_*` (unary) | — | any boundary → `PyObject*` | |
+| `__add__`,`__sub__`,`__mul__`,`__truediv__`,`__floordiv__`,`__mod__`,`__pow__`,`__matmul__` (+ `__r*__` reflected) | `Py_nb_*` (binary) | same handle **or** scalar (`:numeric_other`) | any boundary → `PyObject*` | Forward + reflected for one slot share ONE combined wrapper (grouped like richcmp); dispatches on operand types — T×T, T×scalar, scalar×T. Scalar parse failure → `PyErr_Clear` + `NotImplemented` (mixed-type fallback). `__pow__`/`__rpow__` ternaryfunc (modulo ignored) |
+| `__neg__`,`__pos__`,`__abs__`,`__invert__` | `Py_nb_*` (unary) | — | any boundary → `PyObject*` | Per-method wrapper (no dispatch) |
 | `__eq__`, `__ne__`, `__lt__`, `__le__`, `__gt__`, `__ge__` | `Py_tp_richcompare` (shared) | same handle type → `PtHandle{T}` | `int8_t` → `PyBool_FromLong` | Single `_pt_richcmp_T`; `__eq__`↔`__ne__` auto-derived (negation); ordering ops return `NotImplemented` when not registered (Python handles reflection) |
+| *(named)* `@pymethod foo(self::T, …)` | `Py_tp_methods` (PyMethodDef) | any boundary args (tuple) | any boundary / `Nothing`→`None` | One-arg `@pymethod` form (non-dunder name) → bound `obj.foo(args)` via `PtNamedMethod`; METH_VARARGS PyCFunction |
 
-`@pymethod` is dunder-only; `is_numeric_binary`/`is_numeric_unary` (`macros.jl`) classify the
-number-protocol slots. The C-ABI carrier struct typedefs (array/opt/dict/tuple) are emitted by
-`emit_cshim` **before** `_emit_handle_type_defs`, because method slot wrappers (e.g. `__next__`'s
-`PtOpt`, `__getitem__`'s return) reference them; the carrier set is collected from exports **and**
-method/`__new__`/property signatures via `_carrier_set`.
+`@pymethod` two-arg form is dunder-only; the one-arg form (plain name) registers a bound named
+method (`PtNamedMethod`, `_NAMED_METHODS`). `is_numeric_binary`/`is_numeric_reflected`/`is_numeric_unary`
+(`macros.jl`) classify the number-protocol slots; binary+reflected are grouped per `Py_nb_*` slot in
+`cshim.jl`. The C-ABI carrier struct typedefs (array/opt/dict/tuple) are emitted by `emit_cshim`
+**before** `_emit_handle_type_defs`, because slot wrappers (e.g. `__next__`'s `PtOpt`, `__getitem__`'s
+return, named-method args) reference them; the carrier set is collected from exports **and**
+method/`__new__`/property/named-method signatures via `_carrier_set`.
+
+### Python subclassing (`subclass=` / `dict=`, PyO3-style opt-in flags)
+
+`@pyhandle T subclass=true` / `@pymutable T subclass=true` add `Py_TPFLAGS_BASETYPE` and a
+subclass-aware `tp_new` (allocates with the passed `type`, not the hardcoded base, so
+`class Sub(T)` instances are real `Sub` objects) — abi3-safe. `dict=true` adds
+`Py_TPFLAGS_MANAGED_DICT` (CPython ≥ 3.12) for per-instance attributes; `build_extension`
+errors if `dict=true` is combined with `abi3=true`. Flags live in `_SUBCLASS_TYPES` / `_DICT_TYPES`,
+threaded via the `_preloaded` NamedTuple (`_registry_snapshot`). Native inheritance between
+ParselTongue types (PyO3 `extends=`) is unsupported — Julia structs can't share a C layout.
 
 ### How `cshim.jl` generates richcmp
 
@@ -186,13 +199,14 @@ emitted by `emit_ccallable_field_accessors`) routed through `Py_tp_getattro`/`Py
 **not** raw memory reads, since fields may be non-isbits.
 
 Because `__new__`, `@pymethod`s, and `@pyfunc` args/returns all go through the shared `PtHandle`
-plumbing, only `to_c`/`from_c`/dealloc/field-access differ from `@pyhandle`. **Bound named methods
-are not supported**: write mutating methods as module-level `@pyfunc f(c::T, …)` (which mutate the
-live registry object, persisting), invoked as `mod.f(c)`. Stateful iterators are the canonical use:
+plumbing, only `to_c`/`from_c`/dealloc/field-access differ from `@pyhandle`. Mutating methods can be
+bound (`@pymethod bump!(c::T, …)` → `c.bump()`) or module-level (`@pyfunc f(c::T, …)` → `mod.f(c)`);
+both mutate the live registry object. Stateful iterators are the canonical use:
 `@pymethod __iter__ (self-return)` + `@pymethod __next__ (::Union{V,Nothing})`.
 
-Registries (`_MUTABLE_STRUCT_TYPES`) thread through the 8-tuple `_preloaded`
-(`build.jl`/`wheel.jl`) and into `emit_entry`/`emit_cshim` as `mutable_struct_types`.
+All build-host registries are snapshotted into the `_preloaded` NamedTuple (`_registry_snapshot`,
+`macros.jl`) and threaded into `emit_entry`/`emit_cshim` (`mutable_struct_types`, `named_methods`,
+`subclass_types`, `dict_types`, …).
 
 ## The CLI (`app/pt.jl`, `src/cli.jl`)
 

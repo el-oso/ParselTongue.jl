@@ -294,6 +294,21 @@ end
         pt_t = pt_b.translated(3.0, 4.0)
         assert isinstance(pt_t, feature.Pt2D) and pt_t.x == 4.0 and pt_t.y == 6.0, "Pt2D.translated"
         del pt_b, pt_t
+        # Python subclassing (subclass=true): Pt2D is a base type; a pure-Python subclass
+        # can add methods and override dunders, inheriting fields/property/constructor.
+        class LabeledPt(feature.Pt2D):
+            def quadrant(self):
+                return 1 if (self.x >= 0 and self.y >= 0) else 0
+            def __repr__(self):
+                return f"LabeledPt({self.x},{self.y})"
+        lp = LabeledPt(3.0, 4.0)
+        assert isinstance(lp, LabeledPt) and isinstance(lp, feature.Pt2D), "subclass isinstance"
+        assert lp.x == 3.0 and lp.y == 4.0, "inherited auto field access"
+        assert abs(lp.norm - 5.0) < 1e-10, "inherited @pyproperty on subclass"
+        assert lp.quadrant() == 1, "subclass method"
+        assert repr(lp) == "LabeledPt(3.0,4.0)", "subclass __repr__ override"
+        assert feature.point_x(lp) == 3.0, "base C function accepts subclass instance"
+        del lp
         # Item O7: @pymutable — mutable struct with a String field, backed by a GC registry.
         acc = feature.Accumulator("temps")
         assert isinstance(acc, feature.Accumulator), "Accumulator instance"
@@ -377,6 +392,47 @@ end
     badmod = tempname() * ".jl"
     write(badmod, "x = 1\n")                                          # no @pyfunc
     @test_throws ErrorException build_extension(badmod)
+end
+
+# Python subclassing with an instance __dict__ (dict=true). Needs CPython ≥ 3.12
+# (managed dict) so it is built without abi3; also checks the dict=true + abi3 guard.
+@testset "integration: subclass + dict (@pymutable)" begin
+    if !_have_tools()
+        @info "skipping subclass/dict integration test (need python3, a C compiler, and juliac)"
+        @test_skip true
+    else
+        fixture = joinpath(@__DIR__, "fixtures", "subclassmod.jl")
+        # dict=true is incompatible with abi3 — must raise a clear error.
+        @test_throws ErrorException build_extension(fixture; outdir=mktempdir(), abi3=true)
+
+        if Sys.iswindows()
+            outdir = mktempdir()
+            @test isfile(build_extension(fixture; outdir=outdir))
+            @info "Windows: subclass/dict build succeeded (Python import is wheel-only)"
+        else
+            outdir = mktempdir()
+            so = build_extension(fixture; outdir=outdir)
+            @test isfile(so)
+            script = """
+            import sys; sys.path.insert(0, $(repr(outdir)))
+            import subclassmod as m
+            b = m.Bag("widgets")
+            assert isinstance(b, m.Bag)
+            assert b.bump() == 1 and b.bump() == 2          # inherited mutation
+            assert m.bag_count(b) == 2
+            b.tag = "urgent"; assert b.tag == "urgent"      # instance __dict__ (dict=true)
+            class TaggedBag(m.Bag):                         # subclass=true
+                def doubled(self): return m.bag_count(self) * 2
+            t = TaggedBag("sub")
+            assert isinstance(t, m.Bag)
+            t.bump(); t.bump(); t.bump()
+            assert t.doubled() == 6, "subclass method over inherited mutation"
+            t.note = [1, 2]; assert t.note == [1, 2]        # subclass instance __dict__
+            print("SUBDICT_OK")
+            """
+            @test occursin("SUBDICT_OK", _py_run(script))
+        end
+    end
 end
 
 @testset "integration: abi3 stable-ABI shim (item 2)" begin

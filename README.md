@@ -47,8 +47,10 @@ Full guide, boundary-type reference, and worked examples:
 | `@pyfunc f(a::T)::R = …` | Mark a function for export (emits it normally + records its signature). An optional leading string sets the Python name: `@pyfunc "py_name" f(…) = …`. |
 | `@pymodule name begin … end` | Group `@pyfunc` definitions and name the Python module. |
 | `@pyhandle T` | Expose an isbits struct `T` as a real Python class; scalar fields become attributes (read-only, or read/write with `mutable=true`). |
-| `@pymutable T` | Expose a **`mutable struct`** (heap fields like `String`/`Vector` allowed) as a mutable Python class backed by a Julia GC registry; methods mutate the live object in place. |
-| `@pymethod <dunder> f(p::T)… = …` | Attach a Python dunder to a `@pyhandle`/`@pymutable` type: `__new__` (constructor), `__repr__`/`__str__`, `__len__`/`__hash__`/`__bool__`, `__getitem__`/`__setitem__`, `__contains__`, `__call__`, `__iter__`/`__next__`, `__enter__`/`__exit__`, comparisons (`__eq__`…`__ge__`), and numeric ops (`__add__`/`__sub__`/`__mul__`/`__neg__`/`__abs__`/…). |
+| `@pyhandle T subclass=true` | Opt into Python subclassing (`Py_TPFLAGS_BASETYPE`); mirrors PyO3 `#[pyclass(subclass)]`. `dict=true` adds a per-instance `__dict__` (CPython ≥ 3.12, non-abi3). |
+| `@pymutable T` | Expose a **`mutable struct`** (heap fields like `String`/`Vector` allowed) as a mutable Python class backed by a Julia GC registry; methods mutate the live object in place. Also takes `subclass=`/`dict=`. |
+| `@pymethod <dunder> f(p::T)… = …` | Attach a Python dunder to a `@pyhandle`/`@pymutable` type: `__new__` (constructor), `__repr__`/`__str__`, `__len__`/`__hash__`/`__bool__`, `__getitem__`/`__setitem__`, `__contains__`, `__call__`, `__iter__`/`__next__`, `__enter__`/`__exit__`, comparisons (`__eq__`…`__ge__`), and numeric ops incl. mixed-type + reflected (`__add__`/`__mul__`/`__rmul__`/`__neg__`/…). |
+| `@pymethod f(p::T, …)… = …` | One-arg form (plain name) → a **bound named method** `obj.f(args)`. |
 | `@pyproperty T name::V (p -> …)` | Attach a computed read-only property to a handle type. |
 | `build_extension(path; mod_name, outdir, trim, python, verbose)` | Build just the importable extension `.so` (the surrounding env must provide libjulia). |
 | `build_wheel(path; version, mod_name, outdir, python, trim, runtime, slim, abi3, emit_pyproject, verbose)` | Build a self-contained, pip-installable wheel that bundles the Julia runtime. |
@@ -131,14 +133,15 @@ metadata. The boundary type system reuses
 
 ## Status
 
-v0.24 — full build pipeline shipping: scalars, strings, N-D numeric arrays,
+v0.27 — full build pipeline shipping: scalars, strings, N-D numeric arrays,
 `ComplexF64`, `Vector{String}`, `Dict{String,V}`, `Vector{UInt8}` (bytes),
 `Union{T,Nothing}` (Optional), `NamedTuple`, `Tuple`, real-Python-class opaque
 handles (`@pyhandle` — `isinstance`, auto field access with optional `mutable=true`,
 constructor/repr/len/hash/bool/getitem/setitem/contains/call/iter/next/enter/exit,
-comparison + numeric dunders, `@pyproperty`), mutable classes with heap fields and
-stateful iterators (`@pymutable` — GC-registry-backed, in-place mutation, `__next__`),
-custom Python exception types (`@pyerror`), keyword/default
+comparison + numeric dunders incl. mixed-type/reflected, bound named methods,
+`@pyproperty`, opt-in Python subclassing via `subclass=`/`dict=`), mutable classes
+with heap fields and stateful iterators (`@pymutable` — GC-registry-backed, in-place
+mutation, `__next__`), custom Python exception types (`@pyerror`), keyword/default
 arguments, arbitrary-signature `PyCallable{Args,Ret}` callbacks, manylinux
 tagging, abi3 stable-ABI wheels, shared-runtime wheels, slim bundling,
 multi-module wheels (`build_multi_wheel`), `pyproject.toml` generation,

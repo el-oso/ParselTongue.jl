@@ -6,7 +6,8 @@ struct Pt2D
     x::Float64
     y::Float64
 end
-@pyhandle Pt2D mutable=true
+# subclass=true adds Py_TPFLAGS_BASETYPE so Python can subclass Pt2D (abi3-safe).
+@pyhandle Pt2D mutable=true subclass=true
 
 # Custom repr via @pymethod (item J): overrides the generated "<Pt2D>" default.
 @pymethod __repr__ pt2d_repr(p::Pt2D)::String = string("<Pt2D: x=", p.x, ", y=", p.y, ">")
