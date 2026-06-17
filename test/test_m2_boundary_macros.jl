@@ -1128,31 +1128,24 @@ end
 
 # ── Python subclassing (subclass= / dict= flags) ─────────────────────────────
 
-@testset "subclass= / dict= opts (Python inheritance)" begin
+@testset "subclass= opt (Python subclassing)" begin
     clear_exports!()
     @pyhandle _TestHandle subclass=true
     @pyfunc make_thsc(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
     @pymethod __new__ thsc_new(x::Float64, n::Int64)::_TestHandle = _TestHandle(x, n)
     @test _TestHandle in _SUBCLASS_TYPES
-    @test !(_TestHandle in _DICT_TYPES)
 
     c = emit_cshim("sc", _EXPORTS, PtError[], [_TestHandle], _METHODS, _NEWS;
                    subclass_types=[_TestHandle])
     @test occursin("Py_TPFLAGS_BASETYPE", c)
     @test occursin("PyType_GenericAlloc(type, 0)", c)    # subclass-aware tp_new honors `type`
-    @test !occursin("Py_TPFLAGS_MANAGED_DICT", c)        # no dict requested
 
     clear_exports!()
 
-    # dict=true on a @pymutable type → managed dict flag.
-    push!(_MUTABLE_STRUCT_TYPES, _TestMutable); push!(_HANDLE_TYPES, _TestMutable)
-    push!(_SUBCLASS_TYPES, _TestMutable); push!(_DICT_TYPES, _TestMutable)
-    c2 = emit_cshim("dc", _EXPORTS, PtError[], [_TestMutable], PtMethod[], PtNew[];
-                    mutable_struct_types=[_TestMutable],
-                    subclass_types=[_TestMutable], dict_types=[_TestMutable])
-    @test occursin("Py_TPFLAGS_BASETYPE", c2)
-    @test occursin("Py_TPFLAGS_MANAGED_DICT", c2)
-    clear_exports!()
+    # dict=true is not yet supported → clear error (both @pyhandle and @pymutable).
+    err_d = try; @eval @pyhandle _TestHandle dict=true; catch e; e; end
+    @test (err_d isa LoadError ? err_d.error : err_d) isa ErrorException
+    @test occursin("dict=true", sprint(showerror, err_d isa LoadError ? err_d.error : err_d))
 
     # Unknown / malformed options are rejected.
     err = try; @eval @pyhandle _TestHandle bogus=true; catch e; e; end

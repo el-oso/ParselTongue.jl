@@ -1084,7 +1084,8 @@ typedef struct { void *ptr; } PtHandle;
 # Emit the `tp_new` C slot for one @pyhandle type that has a `@pymethod __new__`.
 # Reuses _arg_plan for argument parsing (same machinery as _wrapper_fn).
 function _emit_tp_new_slot(io::IO, tname::String, n::PtNew; abi3::Bool=false,
-                           subclassable::Bool=false, is_mut_struct::Bool=false)
+                           subclassable::Bool=false, is_mut_struct::Bool=false,
+                           has_dict::Bool=false)
     sym  = cabi_symbol(n)
     args = n.args
     plans = [_arg_plan(c_abi_type(a.jl_type), i; abi3) for (i, a) in enumerate(args)]
@@ -1228,20 +1229,16 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
         println(io, "static PyObject *_PtType_$tname = NULL;")
         # Forward-declare _pt_make_obj_T so _pt_new_T (emitted below) can call it.
         println(io, "static PyObject *_pt_make_obj_$tname(PtHandle);")
-        if is_mut_struct
-            # Drop the registry reference (lets Julia GC the object); _data is the id.
-            println(io, "extern void _pt_dealloc_$(tname)_jl(PtHandle);")
-            println(io, "static void _pt_dealloc_$tname(PyObject *self) {")
-            println(io, "    PtHandle h = { ((_PtObj_$tname *)self)->_data };")
-            println(io, "    _pt_dealloc_$(tname)_jl(h);")
-            println(io, "    PyObject_Free(self);")
-            println(io, "}")
-        else
-            println(io, "static void _pt_dealloc_$tname(PyObject *self) {")
-            println(io, "    free(((_PtObj_$tname *)self)->_data);")
-            println(io, "    PyObject_Free(self);")
-            println(io, "}")
-        end
+        is_mut_struct && println(io, "extern void _pt_dealloc_$(tname)_jl(PtHandle);")
+        # Release the Julia-side value held in _data: drop the registry entry
+        # (@pymutable) or free the malloc'd struct (@pyhandle).
+        release_data = is_mut_struct ?
+            "{ PtHandle h = { ((_PtObj_$tname *)self)->_data }; _pt_dealloc_$(tname)_jl(h); }" :
+            "free(((_PtObj_$tname *)self)->_data);"
+        println(io, "static void _pt_dealloc_$tname(PyObject *self) {")
+        println(io, "    $release_data")
+        println(io, "    PyObject_Free(self);")
+        println(io, "}")
 
         # For each @pymethod, emit a C slot wrapper. The wrapper kind is
         # determined by the dunder and/or its Julia return type.
@@ -1801,7 +1798,7 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
 
         # tp_new slot: emitted before the slot array (needs the extern declaration).
         if tnew !== nothing
-            _emit_tp_new_slot(io, tname, tnew; subclassable=is_subclassable, is_mut_struct)
+            _emit_tp_new_slot(io, tname, tnew; subclassable=is_subclassable, is_mut_struct, has_dict)
         end
 
         # Slots array: always dealloc + repr (user or default), then all other
@@ -1849,15 +1846,17 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
 
         flags = "Py_TPFLAGS_DEFAULT"
         is_subclassable && (flags *= " | Py_TPFLAGS_BASETYPE")
-        has_dict        && (flags *= " | Py_TPFLAGS_MANAGED_DICT")
         println(io, "static PyType_Spec _pt_spec_$tname = {")
         println(io, "    \"$mod_name.$tname\", sizeof(_PtObj_$tname), 0,")
         println(io, "    $flags, _pt_slots_$tname")
         println(io, "};")
+        # On alloc failure, release the just-built Julia value correctly.
+        fail_release = is_mut_struct ?
+            "{ PtHandle _h = h; _pt_dealloc_$(tname)_jl(_h); }" : "free(h.ptr);"
         println(io, "static PyObject *_pt_make_obj_$tname(PtHandle h) {")
         println(io, "    _PtObj_$tname *obj = (_PtObj_$tname *)")
         println(io, "        PyType_GenericAlloc((PyTypeObject *)_PtType_$tname, 0);")
-        println(io, "    if (!obj) { free(h.ptr); return NULL; }")
+        println(io, "    if (!obj) { $fail_release return NULL; }")
         println(io, "    obj->_data = h.ptr;")
         println(io, "    return (PyObject *)obj;")
         println(io, "}")

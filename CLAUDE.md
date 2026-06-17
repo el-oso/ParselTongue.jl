@@ -149,15 +149,23 @@ method (`PtNamedMethod`, `_NAMED_METHODS`). `is_numeric_binary`/`is_numeric_refl
 return, named-method args) reference them; the carrier set is collected from exports **and**
 method/`__new__`/property/named-method signatures via `_carrier_set`.
 
-### Python subclassing (`subclass=` / `dict=`, PyO3-style opt-in flags)
+### Python subclassing (`subclass=`, PyO3-style opt-in flag)
 
 `@pyhandle T subclass=true` / `@pymutable T subclass=true` add `Py_TPFLAGS_BASETYPE` and a
 subclass-aware `tp_new` (allocates with the passed `type`, not the hardcoded base, so
-`class Sub(T)` instances are real `Sub` objects) — abi3-safe. `dict=true` adds
-`Py_TPFLAGS_MANAGED_DICT` (CPython ≥ 3.12) for per-instance attributes; `build_extension`
-errors if `dict=true` is combined with `abi3=true`. Flags live in `_SUBCLASS_TYPES` / `_DICT_TYPES`,
-threaded via the `_preloaded` NamedTuple (`_registry_snapshot`). Native inheritance between
-ParselTongue types (PyO3 `extends=`) is unsupported — Julia structs can't share a C layout.
+`class Sub(T)` instances are real `Sub` objects) — abi3-safe. A pure-Python subclass inherits
+the constructor/fields/methods/dunders and may add methods, properties, and dunder overrides.
+Flags live in `_SUBCLASS_TYPES` / `_DICT_TYPES`, threaded via the `_preloaded` NamedTuple
+(`_registry_snapshot`).
+
+`dict=true` (per-instance `__dict__`, PyO3 `#[pyclass(dict)]`) is **not yet supported** —
+`_parse_class_opts` raises. It needs `Py_TPFLAGS_MANAGED_DICT` + full GC integration
+(`Py_TPFLAGS_HAVE_GC`, `tp_traverse`/`tp_clear` visiting the managed dict via the
+version-specific `PyObject_*ManagedDict` helpers, GC-tracked instances, `tp_free`-based
+dealloc); getting that right across CPython 3.12–3.14 is fiddly and was deferred. The
+`_DICT_TYPES` registry + `dict_types` plumbing remain as wiring for a future implementation.
+Native inheritance between ParselTongue types (PyO3 `extends=`) is unsupported — Julia
+structs can't share a C layout.
 
 ### How `cshim.jl` generates richcmp
 

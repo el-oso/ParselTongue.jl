@@ -207,9 +207,16 @@ function _parse_class_opts(macroname::Symbol, opts)
         if     k === :mutable;  mutable  = v
         elseif k === :subclass; subclass = v
         elseif k === :dict;     dict     = v
-        else error("@$macroname: unknown option `$k` (expected mutable/subclass/dict).")
+        else error("@$macroname: unknown option `$k` (expected mutable/subclass).")
         end
     end
+    # dict=true (a per-instance __dict__) needs Py_TPFLAGS_MANAGED_DICT + full GC
+    # integration (traverse/clear/track) that is fiddly and version-specific across
+    # CPython 3.12–3.14; it is not yet supported. subclass=true (methods-only
+    # subclassing) is the supported, abi3-safe path.
+    dict && error("@$macroname: `dict=true` (per-instance __dict__) is not yet supported. " *
+                  "Use `subclass=true` for Python subclassing (methods/properties/dunder " *
+                  "overrides); add instance attributes on a pure-Python subclass instead.")
     return (mutable, subclass, dict)
 end
 

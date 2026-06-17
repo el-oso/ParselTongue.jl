@@ -394,21 +394,18 @@ end
     @test_throws ErrorException build_extension(badmod)
 end
 
-# Python subclassing with an instance __dict__ (dict=true). Needs CPython ≥ 3.12
-# (managed dict) so it is built without abi3; also checks the dict=true + abi3 guard.
-@testset "integration: subclass + dict (@pymutable)" begin
+# Python subclassing of a @pymutable type (subclass=true): a pure-Python subclass adds
+# methods/overrides dunders, inheriting the constructor, bound methods, and fields.
+@testset "integration: subclass (@pymutable)" begin
     if !_have_tools()
-        @info "skipping subclass/dict integration test (need python3, a C compiler, and juliac)"
+        @info "skipping subclass integration test (need python3, a C compiler, and juliac)"
         @test_skip true
     else
         fixture = joinpath(@__DIR__, "fixtures", "subclassmod.jl")
-        # dict=true is incompatible with abi3 — must raise a clear error.
-        @test_throws ErrorException build_extension(fixture; outdir=mktempdir(), abi3=true)
-
         if Sys.iswindows()
             outdir = mktempdir()
             @test isfile(build_extension(fixture; outdir=outdir))
-            @info "Windows: subclass/dict build succeeded (Python import is wheel-only)"
+            @info "Windows: subclass build succeeded (Python import is wheel-only)"
         else
             outdir = mktempdir()
             so = build_extension(fixture; outdir=outdir)
@@ -420,17 +417,19 @@ end
             assert isinstance(b, m.Bag)
             assert b.bump() == 1 and b.bump() == 2          # inherited mutation
             assert m.bag_count(b) == 2
-            b.tag = "urgent"; assert b.tag == "urgent"      # instance __dict__ (dict=true)
+            assert repr(b) == "Bag(widgets, n=2)"           # inherited __repr__
             class TaggedBag(m.Bag):                         # subclass=true
                 def doubled(self): return m.bag_count(self) * 2
+                def __repr__(self): return f"Tagged<{m.bag_count(self)}>"
             t = TaggedBag("sub")
-            assert isinstance(t, m.Bag)
+            assert isinstance(t, m.Bag) and isinstance(t, TaggedBag)
             t.bump(); t.bump(); t.bump()
             assert t.doubled() == 6, "subclass method over inherited mutation"
-            t.note = [1, 2]; assert t.note == [1, 2]        # subclass instance __dict__
-            print("SUBDICT_OK")
+            assert repr(t) == "Tagged<3>", "subclass __repr__ override"
+            assert m.bag_count(t) == 3, "base C function on subclass instance"
+            print("SUBCLASS_OK")
             """
-            @test occursin("SUBDICT_OK", _py_run(script))
+            @test occursin("SUBCLASS_OK", _py_run(script))
         end
     end
 end
