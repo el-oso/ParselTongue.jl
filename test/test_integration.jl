@@ -84,6 +84,7 @@ end
         # Drive the extension from a clean subprocess and report pass/fail.
         script = """
         $(_win_dll_preamble())import sys, array, cmath
+        import faulthandler; faulthandler.enable()   # print the Python line on any segfault
         sys.path.insert(0, $(repr(outdir)))
         import feature
         assert feature.add(40, 2) == 42

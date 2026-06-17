@@ -40,11 +40,12 @@ jobs:
 
       # numpy is optional (array returns fall back to memoryview without it),
       # but the integration test exercises the numpy path when it is available.
+      # Install via pip (matching macOS/Windows below) so numpy is built for the
+      # exact runner Python. apt's python3-numpy can be ABI-mismatched with a
+      # newer system Python and segfaults when imported in the embedded interpreter.
       - name: Install Python extras (Linux)
         if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y python3-numpy
+        run: pip3 install numpy --break-system-packages
 
       - name: Install Python extras (macOS)
         if: runner.os == 'macOS'
