@@ -73,6 +73,13 @@ name. `trim` is `:safe` (default), `:unsafe`, or `:unsafe_warn`.
 When `abi3=true` the C shim is compiled against the stable ABI
 (`Py_LIMITED_API=0x030B0000`, Python ≥ 3.11 floor) and the output uses the
 `.abi3.so` extension suffix, so the resulting module loads on any CPython ≥ 3.11.
+
+A `--trim=safe` failure is translated into an actionable, source-mapped error
+(`TypeContracts.TrimFailure`) instead of juliac's raw verifier dump; rebuild with
+`verbose=true` to also see the raw output. `trim_check=true` additionally runs an
+*advisory* static pre-scan of the exported functions before juliac and warns on
+likely dynamic-dispatch sites (off by default — it is heuristic and can flag valid
+trim-safe patterns such as `PyCallable`).
 """
 function build_extension(user_path::AbstractString;
                          mod_name::Union{Nothing,AbstractString}=nothing,
@@ -84,6 +91,10 @@ function build_extension(user_path::AbstractString;
                          strip_abs_rpath::Bool=false,
                          keep_build::Bool=false,
                          verbose::Bool=false,
+                         # Opt-in advisory pre-build trim scan. Off by default: it is a
+                         # heuristic and can false-positive on valid trim-safe patterns
+                         # (e.g. PyCallable, which dispatches through a @generated method).
+                         trim_check::Bool=false,
                          # Internal: extra source files to `include` in the juliac entry
                          # (multi-module wheels aggregate several sources into one image).
                          _extra_includes::Vector{String}=String[],
@@ -147,9 +158,15 @@ function build_extension(user_path::AbstractString;
                                         news=news_list, properties, named_methods, mutable_struct_types,
                                         extra_includes=_extra_includes))
 
+    # 2b. Opt-in proactive trim scan (advisory): warn on likely dynamic-dispatch sites
+    # before the slow juliac run. Off by default — heuristic, can false-positive on valid
+    # trim-safe patterns (e.g. PyCallable). juliac --trim=safe remains authoritative.
+    trim_check && trim === :safe && _trim_prescan(exports)
+
     # 3. Run juliac --trim to produce the trimmed object archive.
     img = joinpath(builddir, "img.a")
-    _run_juliac(tools, entry_path, img, trim, verbose)
+    _run_juliac(tools, entry_path, img, trim, verbose;
+                source_files=String[user_path; _extra_includes...])
 
     # 4. Generate the C PyInit shim.
     cpath = joinpath(builddir, string("_", mod, "module.c"))
@@ -177,8 +194,36 @@ function _abi3_ext_suffix(python::AbstractString)
     return readchomp(`$python -c $script`)
 end
 
+# Resolve one export's function in its (sandbox) module and scan it. Called via
+# invokelatest because including the user file bumped the world age.
+function _scan_one_export(e::PtExport)
+    f = getfield(e.mod, e.jl_func)
+    sig = Tuple{(a.jl_type for a in e.args)...}
+    hasmethod(f, sig) || return nothing
+    return trim_report(f, sig)
+end
+
+# Advisory pre-build scan: warn on likely trim-unsafe calls in exported functions before
+# the slow juliac run. Best-effort — only scans simple all-positional signatures and never
+# blocks the build (juliac --trim=safe is authoritative).
+function _trim_prescan(exports::AbstractVector{PtExport})
+    for e in exports
+        try
+            any(a -> a.is_keyword || isvarargs(a.jl_type), e.args) && continue
+            rep = Base.invokelatest(_scan_one_export, e)
+            rep === nothing && continue
+            rep.passed || @warn(
+                "ParselTongue: `$(e.export_name)` has likely trim-unsafe call(s) — " *
+                "juliac --trim=safe (run next) is authoritative.\n" * sprint(showerror, rep))
+        catch
+            # Advisory only: never fail the build because the scan tripped.
+        end
+    end
+    return nothing
+end
+
 function _run_juliac(t::BuildTools, entry::AbstractString, img::AbstractString,
-                     trim::Symbol, verbose::Bool)
+                     trim::Symbol, verbose::Bool; source_files::Vector{String}=String[])
     trimflag = trim === :safe ? "--trim=safe" :
                trim === :unsafe ? "--trim=unsafe" : "--trim=unsafe-warn"
     project = Base.active_project()
@@ -189,10 +234,19 @@ function _run_juliac(t::BuildTools, entry::AbstractString, img::AbstractString,
            $(t.buildscript) $entry --output-lib true $(img * ".abi.json")`
     cmd = addenv(cmd, "OPENBLAS_NUM_THREADS" => "1", "JULIA_NUM_THREADS" => "1")
     verbose && @info "ParselTongue: running juliac" cmd
-    if !success(pipeline(cmd; stdout, stderr))
-        error("ParselTongue: juliac --trim failed. Re-run with verbose=true; a " *
-              "`--trim=safe` error usually means dynamic dispatch in an exported path.")
+    # Capture juliac's output so a --trim failure can be translated into a readable,
+    # source-mapped diagnostic instead of the raw verifier dump (TypeContracts).
+    logf = tempname()
+    proc = open(logf, "w") do io
+        run(pipeline(ignorestatus(cmd); stdout=io, stderr=io))
     end
+    captured = isfile(logf) ? read(logf, String) : ""
+    rm(logf; force=true)
+    if !success(proc)
+        verbose && print(stderr, captured)   # raw juliac output, on demand
+        throw(explain_trim_failure(captured; entry_path=abspath(entry), source_files))
+    end
+    verbose && print(captured)
     isfile(img) || error("ParselTongue: juliac did not produce $img.")
     return img
 end

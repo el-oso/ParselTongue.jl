@@ -1,5 +1,6 @@
 using Test
 using ParselTongue
+using TypeContracts: TrimFailure
 
 # End-to-end: build the fixture extension with juliac --trim=safe, then import and
 # call it from a *separate* Python process (a second libjulia can't load into this
@@ -392,6 +393,29 @@ end
     badmod = tempname() * ".jl"
     write(badmod, "x = 1\n")                                          # no @pyfunc
     @test_throws ErrorException build_extension(badmod)
+end
+
+# A --trim=safe failure must surface as an actionable, source-mapped TrimFailure
+# (TypeContracts), not juliac's raw verifier dump.
+@testset "integration: trim failure → actionable diagnostic" begin
+    if !_have_tools()
+        @info "skipping trim-diagnostic test (need python3, a C compiler, and juliac)"
+        @test_skip true
+    else
+        fixture = joinpath(@__DIR__, "fixtures", "trimbad.jl")
+        err = try
+            build_extension(fixture; outdir=mktempdir())
+            nothing
+        catch e
+            e
+        end
+        @test err isa TrimFailure
+        msg = sprint(showerror, err)
+        @test occursin("trimbad.jl", msg)          # mapped to the user's source file
+        @test occursin("dyn", msg)                 # the offending function
+        @test occursin("rejected", msg)            # the readable summary
+        @test !occursin("Verifier error #", msg)   # raw juliac dump replaced
+    end
 end
 
 # Python subclassing + per-instance __dict__ (subclass=true, dict=true): a pure-Python
