@@ -410,6 +410,60 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   a single if/else if/else chain; unregistered ops fall through to `Py_RETURN_NOTIMPLEMENTED`.
   **Done v0.20.0.**
 
+## Phase 6 — handle completeness (shipped v0.21.0–v0.25.0)
+
+All items below were implemented after Phase 5 (O4) and are now complete.
+
+- [x] **P. `@pymutable T` — mutable classes via GC registry** — `@pymutable T` for
+  `mutable struct` types (heap fields like `String`/`Vector` allowed). Reuses `PtHandle{T}`
+  carrier but packs a registry id (not a heap pointer) into the ptr slot. The macro emits
+  `_PtRegistry_T` / `_PtIdSeq_T` at user-file scope. `to_c`/`from_c`/dealloc all go through
+  the registry; mutations on the live object persist across calls. Stateful iterators
+  (`__iter__` + `__next__`) are the canonical pattern. Files: `src/macros.jl`, `src/boundary.jl`,
+  `src/cshim.jl` (`is_mut_struct` branch), `src/ccallable_gen.jl` (field accessors).
+
+- [x] **Q. `subclass=true` / `dict=true` flags on `@pyhandle`/`@pymutable`** —
+  `subclass=true` adds `Py_TPFLAGS_BASETYPE` and a subclass-aware `tp_new`; pure-Python
+  subclasses get a real `Sub` type. `dict=true` adds `tp_dictoffset` (classic explicit
+  offset mechanism, version-stable across 3.11–3.14), `tp_traverse`/`tp_clear`,
+  `Py_TPFLAGS_HAVE_GC`, and `PyObject_GC_UnTrack` in dealloc. `dict=true` requires
+  full CPython API and errors if combined with `abi3=true`.
+  Flags live in `_SUBCLASS_TYPES` / `_DICT_TYPES`. Files: `src/macros.jl`, `src/cshim.jl`.
+
+- [x] **R. Named `@pymethod` (non-dunder bound methods)** — one-arg form
+  `@pymethod foo(self::T, x::Float64)::Float64 = …` registers a named bound method
+  (`obj.foo(args)`). Stored as `PtNamedMethod` in `_NAMED_METHODS`, emitted as a
+  `PyMethodDef` entry (`METH_VARARGS`, `PyArg_ParseTuple`). Distinct from the two-arg
+  dunder form. Files: `src/macros.jl` (`PtNamedMethod`, `_NAMED_METHODS`),
+  `src/ccallable_gen.jl`, `src/cshim.jl`.
+
+- [x] **S. `__new__` constructor** — custom Python-level constructor for `@pyhandle`/
+  `@pymutable` types registered via `@pynew`. Wired into `Py_tp_new` slot.
+
+- [x] **T. Remaining sequence/mapping dunders** —
+  - `__setitem__` (`Py_sq_ass_item`): write-back via `unsafe_store!` on return
+  - `__contains__` (`Py_sq_contains`): `in` operator, `int8_t` return
+  - `__call__` (`Py_tp_call`): callable objects, `PyArg_ParseTuple` for args
+
+- [x] **U. Iterator protocol** — `__iter__` (`Py_tp_iter`) emits pure C
+  `Py_INCREF(self); return self` (no Julia call); `__next__` (`Py_tp_iternext`)
+  returns `PtOpt{V}` (`Union{V,Nothing}`); `has_value==0` sets `StopIteration`.
+  Canonical use: `@pymutable` stateful iterators.
+
+- [x] **V. Context manager dunders** — `__enter__` and `__exit__` go into
+  `Py_tp_methods` (PyMethodDef), not type slots (no slot for them). `__enter__`
+  returns self; `__exit__` returns `int8_t`.
+
+- [x] **W. Number protocol dunders** —
+  - Binary + reflected: `__add__`/`__radd__`, `__sub__`/`__rsub__`, `__mul__`/`__rmul__`,
+    `__truediv__`/`__rtruediv__`, `__floordiv__`/`__rfloordiv__`, `__mod__`/`__rmod__`,
+    `__pow__`/`__rpow__`, `__matmul__`/`__rmatmul__`. Forward + reflected share one
+    `Py_nb_*` slot; the wrapper dispatches on operand types (T×T, T×scalar, scalar×T).
+    `:numeric_other` sentinel in `_PYMETHOD_EXTRA_ARGS` for the scalar operand.
+  - Unary: `__neg__`, `__pos__`, `__abs__`, `__invert__` (`Py_nb_*` unary slots).
+  Files: `src/macros.jl` (`is_numeric_binary`, `is_numeric_reflected`, `is_numeric_unary`),
+  `src/cshim.jl` (grouped binary+reflected emission).
+
 ## Audit findings — 2026-06-16 (open)
 
 Findings from a full source audit of `src/`. Grouped by severity. Fix bugs before
@@ -556,6 +610,29 @@ Phase 5 work; inconsistencies and improvements opportunistically.
   Windows preload via `os.add_dll_directory`, `build_runtime_wheel` Windows vendoring,
   `_current_os_kernel` helper). MSVC not supported — use MinGW-w64 gcc (pre-installed at
   `C:\msys64\mingw64\bin` on GitHub runners; CI adds it to PATH automatically).
+
+## Recently completed (post-v0.25.0)
+
+- **TrimFailure diagnostics** — `_run_juliac` now captures juliac output; on failure
+  `TypeContracts.explain_trim_failure` parses `Verifier error #N:` blocks, deduplicates
+  by user source location, and throws a source-mapped `TrimFailure <: Exception` instead
+  of a raw process error. `verbose=true` also prints raw output. Proactive `trim_report`
+  pre-scan available via `build_extension(...; trim_check=true)`. Lives in
+  `TypeContracts.TrimDiagnostics` (shared with Mexicah).
+- **Windows clang guard** — `_find_cc` now calls `_clang_is_mingw(clang)` (probes
+  `-dumpmachine`) before accepting `clang` on Windows. Standalone LLVM clang (MSVC
+  triple) is skipped; only MinGW/MSYS2 clang (`mingw`/`w64` triple) is accepted.
+  `JULIA_CC` bypasses the check.
+- **General registry compliance** — TagBot workflow, LLM disclosure in README, and
+  `[sources]` removal (TypeContracts v0.13 registered in General 2026-06-17).
+
+## Next steps
+
+- **Register in General** — trigger [Registrator](https://github.com/JuliaRegistries/Registrator.jl)
+  by commenting `@JuliaRegistrator register` on the latest commit. All AutoMerge criteria
+  are met; the PR will auto-merge after the 3-day new-package cooloff.
+- **TypeContracts `@verify T for_contract=PyBoundary`** — structural protocol trim-check
+  for user types that can't subtype PyBoundary (low priority; workaround in place).
 
 ## Cross-cutting conventions
 

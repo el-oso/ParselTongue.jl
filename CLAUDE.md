@@ -9,7 +9,7 @@ runs one build command, and gets an importable module or a self-contained, pip-i
 ## Commands
 
 ```bash
-# Instantiate — TypeContracts is resolved via the [sources] URL in Project.toml.
+# Instantiate
 julia --project=. -e 'using Pkg; Pkg.instantiate()'
 
 # Run the full test suite (unit + an end-to-end build/import; ~20s)
@@ -265,6 +265,16 @@ This enables two invocation paths:
   `os.add_dll_directory()` (Python 3.8+) in `__init__.py` instead of rpaths. The
   `_current_os_kernel()` helper parameterises `__init__.py` generation so Windows paths can be
   unit-tested on Linux by passing `_os_kernel=:windows` to the `_write_*` functions.
+- **`_find_cc` on Windows probes clang's target triple** (`build.jl:_clang_is_mingw`) before
+  accepting it. Standalone LLVM clang on Windows targets MSVC by default and does not accept
+  `-Wl,--whole-archive`; only MinGW/MSYS2 clang (triple contains `mingw` or `w64`) is accepted.
+  `JULIA_CC` bypasses this check.
+- **`slim=true` on Windows requires `objdump`** — part of the MinGW-w64 toolchain; not available
+  with standalone LLVM clang.
+- **TrimFailure diagnostics**: juliac output is captured in `_run_juliac`; on failure,
+  `TypeContracts.explain_trim_failure` parses `Verifier error #N:` blocks and throws a
+  source-mapped `TrimFailure` instead of a raw process error. `verbose=true` also prints the
+  raw output.
 
 ## Reference material
 
