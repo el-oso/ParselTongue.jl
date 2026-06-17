@@ -171,3 +171,11 @@ Or run without compiling (slower — starts Julia each time):
 ```bash
 julia --project=. app/pt.jl build examples/mathx/mathx.jl
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Acknowledgements
+
+This package was developed with assistance from [Claude](https://claude.ai) (Anthropic). All generated code has been reviewed and is maintained by the author.
