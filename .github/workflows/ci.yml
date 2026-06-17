@@ -88,11 +88,11 @@ jobs:
         run: julia --project=docs docs/doctests.jl
 
   # Diagnostic (non-blocking): the Linux integration job intermittently SIGSEGVs
-  # in the embedded-Julia↔CPython subprocess. This job rebuilds the `feature`
-  # extension and runs test/diag/repro.py — which prints a stderr marker before
-  # each call group — first plainly (captures the last marker + Julia's own
-  # signal backtrace + a core dump) and then under gdb (native backtrace, since
-  # Julia's SIGSEGV handler otherwise preempts Python's faulthandler).
+  # in the embedded-Julia↔CPython subprocess. It only reproduces with the FULL
+  # feature script (handles/dunders/@pymutable/iterators), so this job builds the
+  # `feature` extension once and loops test/fixtures/feature_script.py under gdb
+  # until it crashes, capturing the native backtrace (Julia's own SIGSEGV handler
+  # otherwise preempts Python's faulthandler, hiding the line).
   segfault-diag:
     name: Segfault diagnosis (Linux)
     runs-on: ubuntu-latest
@@ -115,34 +115,30 @@ jobs:
           mkdir -p "$RUNNER_TEMP/featdiag"
           julia --project=. -e 'using ParselTongue; build_extension("test/fixtures/feature.jl"; outdir=ENV["RUNNER_TEMP"]*"/featdiag")'
           ls -la "$RUNNER_TEMP/featdiag"
-      - name: Run repro (plain — markers + Julia backtrace + core dump)
+      - name: Loop full script under gdb until it crashes
         continue-on-error: true
         run: |
-          ulimit -c unlimited || true
-          echo "core" | sudo tee /proc/sys/kernel/core_pattern || true
-          FEATURE_DIR="$RUNNER_TEMP/featdiag" python3 test/diag/repro.py; echo "plain exit=$?"
-      - name: Run repro via Julia spawn (mimics _py_run; A=inherited env, B=scrubbed)
-        continue-on-error: true
-        run: FEATURE_DIR="$RUNNER_TEMP/featdiag" julia --project=. test/diag/spawn_repro.jl
-      - name: Run repro under gdb (native backtrace)
-        continue-on-error: true
-        run: |
-          FEATURE_DIR="$RUNNER_TEMP/featdiag" gdb -batch \
-            -ex 'set pagination off' \
-            -ex 'run' \
-            -ex 'echo \n===== CRASH BACKTRACE =====\n' \
-            -ex 'bt full' \
-            -ex 'echo \n===== ALL THREADS =====\n' \
-            -ex 'thread apply all bt' \
-            --args python3 test/diag/repro.py
-      - name: Analyze core dump if present
-        continue-on-error: true
-        run: |
-          for c in core core.* "$RUNNER_TEMP"/featdiag/core*; do
-            [ -f "$c" ] || continue
-            echo "=== core: $c ==="
-            gdb -batch -ex 'bt full' -ex 'thread apply all bt' python3 "$c"
+          export FEATURE_DIR="$RUNNER_TEMP/featdiag"
+          crashed=0
+          for i in $(seq 1 40); do
+            gdb -batch \
+              -ex 'set pagination off' \
+              -ex 'run' \
+              -ex 'echo \n===== CRASH BACKTRACE (bt full) =====\n' \
+              -ex 'bt full' \
+              -ex 'echo \n===== ALL THREADS =====\n' \
+              -ex 'thread apply all bt' \
+              --args python3 test/fixtures/feature_script.py > "gdb_$i.log" 2>&1
+            if grep -qE "SIGSEGV|Segmentation fault" "gdb_$i.log"; then
+              echo "===== CRASH on iteration $i ====="
+              cat "gdb_$i.log"
+              crashed=1
+              break
+            fi
+            echo "iter $i: clean ($(grep -c FEATURE_OK "gdb_$i.log") FEATURE_OK)"
           done
+          [ "$crashed" = 0 ] && echo "No crash captured in 40 iterations (crash rate is low or env-dependent)."
+          exit 0
 
   # Memory-safety gate for the generated C glue. Compiles the shim (no Julia
   # linked — pt_* are stubbed) with AddressSanitizer and runs the marshalling
