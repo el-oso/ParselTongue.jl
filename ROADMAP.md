@@ -241,10 +241,10 @@ asserts; plus a unit/integration test and a docs note. Run `julia --project=. te
   Vitepress-style cross-reference links stay soft warnings). `jldoctest` blocks added to
   `c_abi_type` and `is_boundary_type`. CI runs a node-free gate (`docs/doctests.jl` →
   `Documenter.doctest`, `doctest`-job in `ci.yml`); the full Vitepress build in
-  `Documentation.yml` also exercises them. **Blocker found & worked around:** TypeContracts'
-  `@contract` attaches a marker docstring with `:path => nothing`, which crashes Documenter's
-  doctest runner; `make.jl`/`doctests.jl` backfill an empty path until TypeContracts is fixed
-  (gap filed for TypeContracts).
+  `Documentation.yml` also exercises them. **Blocker found & fixed upstream:** TypeContracts'
+  `@contract` attached a marker docstring with `:path => nothing`, which crashed Documenter's
+  doctest runner; fixed in TypeContracts v0.13.1 (compat floor bumped accordingly). The
+  temporary path-backfill workaround in `make.jl`/`doctests.jl` has been removed.
 - [x] **11. Startup latency** — shipped v0.14.0. `startup_benchmark(ext_path; call_expr, n, python)`
   runs `n` fresh-subprocess trials, times import and optional first call, returns a
   NamedTuple with `import_ms_median/min/max` and `call_ms_median/min/max`. Integration

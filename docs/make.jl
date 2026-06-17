@@ -1,21 +1,6 @@
 using Documenter, DocumenterVitepress
 using ParselTongue
 
-# Work around TypeContracts ≤ 0.13: `@contract PyBoundary` attaches a marker
-# docstring (signature `Tuple{Val{:TypeContractsContract}}`) whose `:path` is
-# `nothing`. Documenter's doctest runner builds a `DocTestContext(path, …)` for
-# *every* docstring in the module and requires a `String` path, so it crashes
-# before running any real doctest. Backfill an empty path on such markers (they
-# contain no `jldoctest` blocks, so the path is never actually used). Remove once
-# TypeContracts sets a valid `:path` on contract docstrings.
-for (_, multidoc) in Documenter.DocSystem.getmeta(ParselTongue)
-    for (_, docstr) in multidoc.docs
-        if get(docstr.data, :path, "") === nothing
-            docstr.data[:path] = ""
-        end
-    end
-end
-
 makedocs(;
     modules = [ParselTongue],
     authors = "el-oso",
