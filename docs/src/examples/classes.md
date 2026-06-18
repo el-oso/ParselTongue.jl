@@ -11,6 +11,10 @@ features added after the original scalar/string/array examples:
 - `@pymutable` — a mutable class whose fields you can write and whose state persists
 - stateful iterators (`__iter__` / `__next__`) and context managers (`__enter__` / `__exit__`)
 
+Everything on this page is one file, `shapes.jl`. The class declarations come
+first; the [`@pymodule` that ties them together](#Tying-it-together) is at the end.
+Every code block below is checked in CI — copy any of them as-is.
+
 ## An immutable handle: `Point`
 
 ```julia
@@ -28,7 +32,7 @@ end
 # Constructor: enables `Point(x, y)` from Python (instead of a factory function).
 @pymethod __new__  point_new(x::Float64, y::Float64)::Point = Point(x, y)
 
-# Nice repr, length-as-rounded-norm, truthiness.
+# Nice repr and truthiness.
 @pymethod __repr__ point_repr(p::Point)::String = string("Point(", p.x, ", ", p.y, ")")
 @pymethod __bool__ point_bool(p::Point)::Bool   = p.x != 0.0 || p.y != 0.0
 
@@ -57,19 +61,9 @@ end
 
 # A bound named method that returns a new Point.
 @pymethod translated(p::Point, dx::Float64, dy::Float64)::Point = Point(p.x + dx, p.y + dy)
-
-@pymodule shapes begin
-    # Functions can also take and return Point handles.
-    @pyfunc midpoint(p::Point, q::Point)::Point = Point((p.x + q.x) / 2, (p.y + q.y) / 2)
-end
 ```
 
-The `@pyhandle` / `@pymethod` / `@pyproperty` declarations live at the **top level**
-of the file; the registered class is attached to the module automatically, so the
-`@pymodule` block only needs your free functions. (The mutable, iterator, and
-context-manager types below are declared the same way, in the same file.)
-
-From Python it behaves like any class:
+Once built (see the bottom of the page), it behaves like any class:
 
 ```python
 >>> import shapes
@@ -78,31 +72,29 @@ From Python it behaves like any class:
 Point(3.0, 4.0)
 >>> isinstance(p, shapes.Point)
 True
->>> p.norm                      # @pyproperty
+>>> p.norm                          # @pyproperty
 5.0
->>> p[0], p[1]                  # __getitem__
+>>> (p[0], p[1])                    # __getitem__
 (3.0, 4.0)
->>> p + shapes.Point(1.0, 1.0)  # __add__
+>>> p + shapes.Point(1.0, 1.0)      # __add__
 Point(4.0, 5.0)
->>> 2.0 * p                     # __rmul__ (reflected)
+>>> 2.0 * p                         # __rmul__ (reflected)
 Point(6.0, 8.0)
->>> abs(p)                      # __abs__
+>>> abs(p)                          # __abs__
 5.0
->>> shapes.Point(1.0, 0.0) < p  # __lt__ (by norm)
+>>> shapes.Point(1.0, 0.0) < p      # __lt__ (by norm)
 True
->>> p.translated(1.0, -1.0)     # bound named method
+>>> p.translated(1.0, -1.0)         # bound named method
 Point(4.0, 3.0)
->>> shapes.midpoint(p, shapes.Point(1.0, 2.0))
-Point(2.0, 3.0)
 ```
 
 Because `subclass=true`, pure-Python code can extend it:
 
 ```python
-class Labelled(shapes.Point):
-    def describe(self):
-        return f"{self.norm:.1f} away"
-
+>>> class Labelled(shapes.Point):
+...     def describe(self):
+...         return f"{self.norm:.1f} away"
+...
 >>> Labelled(3.0, 4.0).describe()
 '5.0 away'
 ```
@@ -132,13 +124,15 @@ end
 
 ```python
 >>> acc = shapes.Accumulator("sales")
->>> acc.add(10.0); acc.add(5.5)
+>>> acc.add(10.0)
+10.0
+>>> acc.add(5.5)
 15.5
->>> acc.describe()              # state persisted
+>>> acc.describe()                  # state persisted across calls
 'sales: 15.5'
->>> acc.total = 0.0            # scalar fields are writable
->>> acc.label
-'sales'
+>>> acc.total = 100.0               # scalar fields are writable
+>>> acc.describe()
+'sales: 100.0'
 ```
 
 ## A stateful iterator: `Counter`
@@ -162,24 +156,21 @@ end
 ```python
 >>> list(shapes.Counter(4))
 [0, 1, 2, 3]
->>> for i in shapes.Counter(3):
-...     print(i)
-0
-1
-2
+>>> [i * i for i in shapes.Counter(3)]
+[0, 1, 4]
 ```
 
-## A context manager: `Timerblock`
+## A context manager: `Session`
 
 `__enter__` / `__exit__` make a handle usable in a `with` statement. `__enter__`
 returns the object bound by `as`; `__exit__` returns a `Bool` (`false` = don't
 suppress exceptions):
 
 ```julia
-struct Session
+mutable struct Session
     name::String
 end
-@pyhandle Session
+@pymutable Session
 
 @pymethod __new__   session_new(name::String)::Session = Session(name)
 @pymethod __enter__ session_enter(s::Session)::Session = s
@@ -191,6 +182,31 @@ end
 >>> with shapes.Session("job") as s:
 ...     print(s)
 Session(job)
+```
+
+## Tying it together
+
+The class declarations above live at the **top level** of `shapes.jl`. Registered
+classes attach to the module automatically, so the `@pymodule` block at the end of
+the file only needs your free functions:
+
+```julia
+@pymodule shapes begin
+    # Functions can take and return the handle types declared above.
+    @pyfunc midpoint(p::Point, q::Point)::Point = Point((p.x + q.x) / 2, (p.y + q.y) / 2)
+end
+```
+
+```python
+>>> shapes.midpoint(shapes.Point(0.0, 0.0), shapes.Point(2.0, 4.0))
+Point(1.0, 2.0)
+```
+
+Build and install it like any other module:
+
+```julia
+using ParselTongue
+build_wheel("shapes.jl")
 ```
 
 See the [boundary-types guide](/guide/boundary-types) for the full list of

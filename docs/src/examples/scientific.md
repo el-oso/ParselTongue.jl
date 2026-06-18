@@ -39,18 +39,24 @@ pip install dist/sci-0.1.0-*.whl
 ## Use it from Python
 
 ```python
-import numpy as np
-import sci.linalg as la
-import sci.dsp as dsp
-
-A = np.array([[1., 2.], [3., 4.]])
-la.matmul(A, np.eye(2))                 # array([[1., 2.], [3., 4.]])
-la.rowsums(A)                           # array([3., 7.])
-la.normalize(np.array([3., 4.]))        # array([0.6, 0.8])
-
-dsp.conj_sum(np.array([1+2j, 3-1j]))    # (4-1j)
-x = np.array([1., 2., 3.]); dsp.scale(x, 10.0); x   # array([10., 20., 30.])  (in place)
-dsp.minmax(np.array([3., 1., 5.]))      # (1.0, 5.0)
+>>> import numpy as np
+>>> import sci.linalg as la
+>>> import sci.dsp as dsp
+>>> A = np.array([[1., 2.], [3., 4.]])
+>>> la.matmul(A, np.eye(2)).tolist()
+[[1.0, 2.0], [3.0, 4.0]]
+>>> la.rowsums(A).tolist()
+[3.0, 7.0]
+>>> la.normalize(np.array([3., 4.])).tolist()
+[0.6, 0.8]
+>>> dsp.conj_sum(np.array([1+2j, 3-1j]))
+(4-1j)
+>>> x = np.array([1., 2., 3.])
+>>> dsp.scale(x, 10.0)                   # in place; returns None
+>>> x.tolist()
+[10.0, 20.0, 30.0]
+>>> dsp.minmax(np.array([3., 1., 5.]))
+(1.0, 5.0)
 ```
 
 ## Submodules

@@ -1,7 +1,7 @@
 # Arrays & NumPy
 
-The `arrx` example (`examples/arrx/`) exposes 1-D numeric arrays. Inputs are
-zero-copy from any Python buffer; outputs come back as `numpy.ndarray`.
+The `arrx` example (`examples/arrx/`) exposes numeric arrays (1-D and N-D). Inputs
+are zero-copy from any Python buffer; outputs come back as `numpy.ndarray`.
 
 ## The Julia source
 
@@ -38,11 +38,11 @@ Inputs accept anything that exports the buffer protocol — NumPy arrays,
 >>> x = np.array([1.0, 2.0, 3.0, 4.0])
 >>> arrx.sum_f64(x)
 10.0
->>> arrx.scale_f64(x, 10.0)
-array([10., 20., 30., 40.])           # returns an ndarray
->>> arrx.cumsum_i64(np.array([5, 5, 5], dtype=np.int64))
-array([ 5, 10, 15])
->>> arrx.dot_f32(np.array([1,2,3], np.float32), np.array([4,5,6], np.float32))
+>>> arrx.scale_f64(x, 10.0).tolist()      # returns an ndarray; .tolist() for display
+[10.0, 20.0, 30.0, 40.0]
+>>> arrx.cumsum_i64(np.array([5, 5, 5], dtype=np.int64)).tolist()
+[5, 10, 15]
+>>> arrx.dot_f32(np.array([1, 2, 3], np.float32), np.array([4, 5, 6], np.float32))
 32.0
 ```
 
@@ -71,8 +71,11 @@ to a `memoryview`:
 Matrices and tensors work too. The **argument type** picks the row/column-major
 policy (both zero-copy):
 
+A second `@pymodule` block for the same package simply adds more functions to
+`arrx` (one extension per process, so keep everything in one module):
+
 ```julia
-@pymodule la begin
+@pymodule arrx begin
     # logical view: NumPy's shape and indexing (A[i,j] == a[i,j]); great for loops
     @pyfunc rowsums(A::AbstractMatrix{Float64})::Vector{Float64} = vec(sum(A, dims=2))
     # dense Array: BLAS-friendly, but a C-order input arrives transposed
@@ -81,10 +84,11 @@ end
 ```
 
 ```python
->>> import numpy as np, la
 >>> A = np.array([[1., 2., 3.], [4., 5., 6.]])   # shape (2, 3), C-order
->>> la.rowsums(A)                                # AbstractMatrix → natural shape
-array([ 6., 15.])
+>>> arrx.rowsums(A).tolist()                     # AbstractMatrix → natural shape
+[6.0, 15.0]
+>>> arrx.tr(np.array([[1., 2.], [3., 4.]]))      # diagonal sum (transpose-invariant)
+5.0
 ```
 
 A returned array always comes back in **natural** shape. See
