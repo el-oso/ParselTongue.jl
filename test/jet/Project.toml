@@ -1,0 +1,12 @@
+[deps]
+JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
+ParselTongue = "f960a036-e00a-43bb-b834-c57a5ea23a66"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+TypeContracts = "c7a3f1e2-84b5-4d69-9e0a-1f2b3c4d5e6f"
+
+[sources]
+ParselTongue = {path = "../.."}
+
+[compat]
+JET = "0.9, 0.10, 0.11"
+julia = "1.12"

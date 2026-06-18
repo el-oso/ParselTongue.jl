@@ -87,6 +87,24 @@ jobs:
       - name: Run doctests
         run: julia --project=docs docs/doctests.jl
 
+  # JET static-analysis gate: catches potential MethodErrors / inference failures in the
+  # marshalling functions before runtime (complements check_trim_compat's dynamic-dispatch
+  # check). OS-independent, single runner; test-only dep (JET never enters the trimmed lib).
+  jet:
+    name: JET static analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.12'
+      - uses: julia-actions/cache@v3
+      - name: Instantiate JET env
+        run: julia --project=test/jet -e 'using Pkg; Pkg.instantiate()'
+      - name: Run JET gate
+        run: julia --project=test/jet test/jet/run.jl
+
   # Memory-safety gate for the generated C glue. Compiles the shim (no Julia
   # linked — pt_* are stubbed) with AddressSanitizer and runs the marshalling
   # paths; a leak/overflow in the glue (e.g. a reverted A1/A2 fix) fails here.
