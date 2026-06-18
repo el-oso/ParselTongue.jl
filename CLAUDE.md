@@ -181,20 +181,21 @@ MSVC is not). Validated under ASan/LSan in `test/asan/` (dict-arg `take` + strar
 fixtures + driver, success + error paths, teeth-checked); the refcount-based buffer/PyCallable
 paths are covered by the integration refleak gate.
 
-**Julia-side analogue — the `PyCallable` call operator (`boundary.jl`).** The same
-"release on scope exit" idiom applies on the Julia side, where there is no `Drop`/`cleanup`
-attribute: the `@generated (f::PyCallable{Args,Ret})(args...)` operator re-acquires the GIL
+**Julia-side scope-exit cleanup — the `PyCallable` call operator (`boundary.jl`).** The same
+"release on scope exit" idiom as the C shim's guards applies on the Julia side via
+`try/finally`: the `@generated (f::PyCallable{Args,Ret})(args...)` operator re-acquires the GIL
 (`PyGILState_Ensure`) then wraps its whole body in **one `try/finally`**. The `finally`
 drops the GIL, the argument tuple, and the call result on *every* exit — success, a
 Python-side exception, and a Julia-side throw (`convert(Ti,…)` `InexactError`,
 `_py_unbox(Ret,…)` allocation). This replaced five hand-written `PyGILState_Release` sites
 that skipped the throw paths (a latent GIL leak — process-wide hazard — plus a `result`
-refcount leak). Do **not** revert to per-path releases. ErrorTypes.jl (Rust-style `Result`)
-was evaluated for this and **declined**: the guarantee is a *cleanup* concern (Rust gets it
-from `Drop`, not `Result`; Julia's analogue is `try/finally`), and without `#[must_use]` a
-Julia `Result` adds no enforcement — see `docs/src/guide/vs-pyo3.md` (GIL management) and the
-unmerged `spike/errortypes` branch. The exception path is gated by an error-path refleak
-case in `test/fixtures/feature_script.py` (`_no_refleak_raises`).
+refcount leak). Do **not** revert to per-path releases. `try/finally` is the deliberate fit
+here because the guarantee needed is cleanup-on-scope-exit; we prototyped `Result`-style
+propagation (ErrorTypes.jl) and kept `try/finally` since `Result` carries return-value
+outcomes and would still defer cleanup to a `finally` — see `docs/src/guide/vs-pyo3.md` (GIL
+management) and the unmerged `spike/errortypes` branch for the full rationale. The exception
+path is gated by an error-path refleak case in `test/fixtures/feature_script.py`
+(`_no_refleak_raises`).
 
 ### Python subclassing (`subclass=` / `dict=`, PyO3-style opt-in flags)
 
