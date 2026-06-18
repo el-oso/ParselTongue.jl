@@ -151,25 +151,35 @@ method/`__new__`/property/named-method signatures via `_carrier_set`.
 
 ### RAII scope guards in the generated C (`__attribute__((cleanup))`)
 
-Generated wrappers acquire heap resources in `ArgPlan.setup` and historically unwound them by
-hand on every `return NULL` (via `_insert_cleanup_before_return`), the error-prone pattern that
-caused the A1/A2 leak fixes. **Newer arg paths instead use compiler scope guards** — the technique
-the Linux kernel borrowed from Rust (`cleanup.h`). Implemented for **dict arguments** (`_ap_dict`,
-POC): the carrier is declared `__attribute__((cleanup(_pt_dictguard_<C>)))`, so the compiler frees
-`keys`/`vals` on *any* scope exit; the setup code is plain `return NULL` with no manual frees, and
-the per-carrier `_pt_dictguard_*` helper is emitted next to the typedef in `_dict_structs`.
+Generated wrappers acquire heap resources in `ArgPlan.setup`. They formerly unwound them by hand
+on every `return NULL` (via a `_insert_cleanup_before_return` rewriter), the error-prone pattern
+that caused the A1/A2 leak fixes. **Every heap-acquiring argument carrier now uses a compiler scope
+guard instead** — the technique the Linux kernel borrowed from Rust (`cleanup.h`). Each carrier is
+declared `__attribute__((cleanup(<guard>)))` so the compiler releases it on *any* scope exit, and
+the setup code is plain `return NULL` with no manual frees. The guards (all `static` helpers):
 
-Because `from_c` inside the Julia callee takes ownership of the dict on the **success** path, the
-guard is **disarmed** right after the call (NULL the carrier fields) via the new `ArgPlan.disarm`
-field — statements that run *only* post-call, never on error paths (unlike `ArgPlan.cleanup`,
-which is also inserted into later args' error paths). Both `_wrapper_fn` and `_wrapper_fn_varargs`
-emit `disarm` immediately after `Py_END_ALLOW_THREADS`. This is Rust's "borrow checker, pass it to
-the owner" idiom: the guard covers every error path (including a *later* arg failing before the
-call — a latent leak the old empty-`cleanup` dict path had), and the disarm prevents a double-free
-once ownership transfers. Compiler support: gcc/clang/MinGW (all supported targets; MSVC is not).
-The dict-argument path is exercised under ASan/LSan by `test/asan/` (the `take` fixture + driver).
-Extending this to the other always-release carriers (buffer/strarray/PyCallable) would let
-`_insert_cleanup_before_return` be retired.
+| carrier | builder | guard | release | disarm? |
+|---|---|---|---|---|
+| `Dict{String,V}` | `_ap_dict` | `_pt_dictguard_<C>` (by `_dict_structs`) | `free` keys/vals | **yes** |
+| `Vector{T}` numeric | `_ap_array` | `_pt_bufferguard` | `PyBuffer_Release` | no |
+| `Vector{String}` | `_ap_stra` | `_pt_strarrayguard` | `_pt_free_str_array` | no |
+| `PyCallable` | `_ap_pycallable` | `_pt_callableguard` | `Py_XDECREF` | no |
+
+**Disarm (`ArgPlan.disarm`).** Only the dict transfers ownership to the Julia callee (`from_c`
+frees it on success), so its guard must be **disarmed** after the call — NULL the carrier fields,
+emitted right after `Py_END_ALLOW_THREADS` in `_wrapper_fn`/`_wrapper_fn_varargs` **and** in the
+`@pymethod`/`@pynew`/named-method wrappers (`_emit_tp_new_slot` etc.). `disarm` runs *only*
+post-call, never on error paths. The other three carriers are always-release (no disarm): the
+guard fires on success and every error path alike. This is Rust's "borrow checker, pass it to the
+owner" idiom; it also closed a latent leak (a *later* arg failing before the call) and a latent
+double-free (dict args in method wrappers, which lacked the disarm).
+
+`_insert_cleanup_before_return` and the per-arg `cleanup`-threading are **retired** — the guards
+made them dead. `ArgPlan.cleanup` is now effectively reserved (only the handle method/`__new__`
+wrappers still emit it, and it is empty). Compiler support: gcc/clang/MinGW (all supported targets;
+MSVC is not). Validated under ASan/LSan in `test/asan/` (dict-arg `take` + strarray-arg `take_strs`
+fixtures + driver, success + error paths, teeth-checked); the refcount-based buffer/PyCallable
+paths are covered by the integration refleak gate.
 
 ### Python subclassing (`subclass=` / `dict=`, PyO3-style opt-in flags)
 

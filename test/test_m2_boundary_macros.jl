@@ -16,7 +16,6 @@ using ParselTongue: assert_boundary, assert_ret_boundary, is_boundary_type,
                     PtError, _ERRORS, _py_exc_cname, _error_globals, _error_inits,
                     PtDict, isdict, _dict_val_c, _dict_structs, _uses_bytes,
                     _manylinux_plat, _wheel_tag, _wheel_tag_abi3,
-                    _insert_cleanup_before_return,
                     PtVarArgs, isvarargs, _varargs_elt, _PtVarArgElt,
                     _missing_boundary_methods,
                     PyCallable, ispycallable,
@@ -1771,38 +1770,10 @@ end
 
 # ── Correctness fixes (audit) ─────────────────────────────────────────────────
 
-@testset "_insert_cleanup_before_return helper" begin
-    f = _insert_cleanup_before_return
-
-    # No cleanups → identity
-    @test f("if (x) return NULL;", String[]) == "if (x) return NULL;"
-
-    # Bare `if (COND) return NULL;` gets wrapped with braces
-    r = f("if (PyObject_GetBuffer(o, &b, 0) != 0) return NULL;", ["PyBuffer_Release(&a);"])
-    @test occursin("PyBuffer_Release(&a);", r)
-    @test occursin("return NULL;", r)
-    @test occursin('{', r)   # wrapped in braces
-
-    # Embedded `return NULL;` inside existing block (e.g. dimension check)
-    r2 = f("    PyErr_SetString(PyExc_TypeError, \"bad\"); return NULL;",
-            ["PyBuffer_Release(&buf1);"])
-    @test occursin("PyBuffer_Release(&buf1);", r2)
-    @test endswith(strip(r2), "return NULL;")
-
-    # OOM path: PyErr_NoMemory()
-    r3 = f("if (!p) { free(q); return PyErr_NoMemory(); }", ["PyBuffer_Release(&b);"])
-    @test occursin("PyBuffer_Release(&b);", r3)
-    @test occursin("PyErr_NoMemory()", r3)
-
-    # Multiple cleanups are all inserted
-    r4 = f("if (bad) return NULL;",
-            ["PyBuffer_Release(&b1);", "PyBuffer_Release(&b2);"])
-    @test occursin("PyBuffer_Release(&b1);", r4)
-    @test occursin("PyBuffer_Release(&b2);", r4)
-
-    # Line without return NULL is unchanged
-    @test f("PyBuffer_Release(&buf);", ["foo();"]) == "PyBuffer_Release(&buf);"
-end
+# (The old `_insert_cleanup_before_return` helper and its tests were removed: every
+# heap-acquiring argument carrier now releases via a per-carrier RAII scope guard
+# (__attribute__((cleanup))), so the manual error-path unwinder is no longer needed.
+# The guards are validated by the ASan/LSan gate in test/asan/.)
 
 @testset "array-arg buffers released via RAII scope guard (audit fix)" begin
     clear_exports!()

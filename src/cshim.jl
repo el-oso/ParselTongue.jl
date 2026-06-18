@@ -21,8 +21,10 @@ struct ArgPlan
     addrs::Vector{String}    # address expressions for ParseTuple
     setup::Vector{String}    # runs after ParseTuple, before the call (e.g. GetBuffer)
     callarg::String          # expression passed to the juliac function
-    cleanup::Vector{String}  # runs after the call on EVERY exit (also inserted into
-                             # later args' error paths) — e.g. PyBuffer_Release
+    cleanup::Vector{String}  # post-call release statements emitted after the call (only
+                             # by the handle method/__new__ wrappers). Now effectively
+                             # reserved/empty: every heap carrier releases via a RAII
+                             # __cleanup__ guard in `decls`, so error paths just return.
     disarm::Vector{String}   # runs ONLY after a successful call, NOT on error paths.
                              # Used to "disarm" a __cleanup__ guard once ownership of
                              # the carrier has transferred to the Julia callee (its
@@ -697,21 +699,6 @@ function _error_inits(mod_name::AbstractString, errors::AbstractVector{PtError})
     return stmts
 end
 
-# Insert `cleanups` statements before each `return NULL;` (or PyErr_NoMemory) in a
-# single setup line, so that resources acquired by earlier args are released on failure.
-# Handles two patterns: bare `if (COND) return NULL;` (wrapped with braces) and
-# embedded `return NULL;` inside an existing brace block (simple textual insertion).
-function _insert_cleanup_before_return(s::String, cleanups::Vector{String})
-    isempty(cleanups) && return s
-    (contains(s, "return NULL;") || contains(s, "return PyErr_NoMemory();")) || return s
-    cl = join(cleanups, " ")
-    m = match(r"^(if\s*\(.+\))\s+return NULL;$", s)
-    m !== nothing && return "$(m.captures[1]) { $cl return NULL; }"
-    s = replace(s, "return NULL;" => cl * " return NULL;")
-    s = replace(s, "return PyErr_NoMemory();" => cl * " return PyErr_NoMemory();")
-    return s
-end
-
 function _wrapper_fn_varargs(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=false)
     va_idx = something(findfirst(a -> isvarargs(a.jl_type), e.args))
     T_elt  = _varargs_elt(e.args[va_idx].jl_type)
@@ -769,17 +756,16 @@ function _wrapper_fn_varargs(e::PtExport; errors::Vector{PtError}=PtError[], abi
     end
 
     # Extract each fixed positional arg via PyArg_Parse on the individual tuple item.
-    # Track acquired buffer cleanups so failures release previously-acquired resources.
-    fixed_cleanups = String[]
+    # Release on every error path is handled by the per-carrier RAII scope guards in
+    # each arg's decls (__attribute__((cleanup))), so the setup just returns NULL.
     for (i, (plan, _)) in enumerate(zip(fixed_plans, fixed_args))
         parg = string("_parg_", i)
         println(io, "    PyObject *", parg, " = PyTuple_GET_ITEM(args, ", i - 1, ");")
         addr_str = isempty(plan.addrs) ? "" : ", " * join(plan.addrs, ", ")
         println(io, "    if (!PyArg_Parse(", parg, ", \"", plan.fmt, "\"", addr_str, ")) return NULL;")
         for s in plan.setup
-            println(io, "    ", _insert_cleanup_before_return(s, fixed_cleanups))
+            println(io, "    ", s)
         end
-        append!(fixed_cleanups, plan.cleanup)
     end
 
     # Parse keyword-only args using ParseTupleAndKeywords with an empty positional tuple.
@@ -797,15 +783,14 @@ function _wrapper_fn_varargs(e::PtExport; errors::Vector{PtError}=PtError[], abi
         end
         kw_fmt_str = String(take!(kw_fmt_req)) * "|" * String(take!(kw_fmt_opt))
         kw_entries = join(("\"$n\"" for n in kwnames), ", ")
-        fc_str = isempty(fixed_cleanups) ? "" : " " * join(fixed_cleanups, " ")
         println(io, "    { static char *_kwlist[] = {", kw_entries, ", NULL};")
         println(io, "      PyObject *_empty_args = PyTuple_New(0);")
-        println(io, "      if (!_empty_args) {", fc_str, " return NULL; }")
+        println(io, "      if (!_empty_args) return NULL;")
         addr_str = isempty(kw_addrs) ? "" : ", " * join(kw_addrs, ", ")
         println(io, "      int _kw_ok = PyArg_ParseTupleAndKeywords(_empty_args, kwargs,")
         println(io, "          \"", kw_fmt_str, "\", _kwlist", addr_str, ");")
         println(io, "      Py_DECREF(_empty_args);")
-        println(io, "      if (!_kw_ok) {", fc_str, " return NULL; }")
+        println(io, "      if (!_kw_ok) return NULL;")
         println(io, "    }")
         for (plan, _) in zip(kw_plans, kw_args)
             for s in plan.setup; println(io, "    ", s); end
@@ -813,16 +798,16 @@ function _wrapper_fn_varargs(e::PtExport; errors::Vector{PtError}=PtError[], abi
     end
 
     # Build varargs array: malloc, loop over remaining tuple items, extract scalars.
-    fc_str = isempty(fixed_cleanups) ? "" : join(fixed_cleanups, " ") * " "
+    # (Fixed/kw arg carriers self-release via their RAII guards on these error paths.)
     println(io, "    Py_ssize_t _nva = _nargs - ", n_fixed, ";")
     println(io, "    _va_data = (", ei.ctype,
             " *)malloc(_nva > 0 ? (size_t)_nva * sizeof(", ei.ctype, ") : 1);")
-    println(io, "    if (!_va_data) { ", fc_str, "return PyErr_NoMemory(); }")
+    println(io, "    if (!_va_data) return PyErr_NoMemory();")
     println(io, "    for (Py_ssize_t _vi = 0; _vi < _nva; _vi++) {")
     println(io, "        PyObject *_vobj = PyTuple_GET_ITEM(args, ", n_fixed, " + _vi);")
     println(io, "        ", cs.tmptype, " _vtmp;")
     println(io, "        if (!PyArg_Parse(_vobj, \"", cs.fmt, "\", &_vtmp))")
-    println(io, "            { ", fc_str, "free(_va_data); return NULL; }")
+    println(io, "            { free(_va_data); return NULL; }")
     println(io, "        _va_data[_vi] = (", cs.ctype, ")_vtmp;")
     println(io, "    }")
     println(io, "    ", va_name, ".data = _va_data;")
@@ -834,9 +819,6 @@ function _wrapper_fn_varargs(e::PtExport; errors::Vector{PtError}=PtError[], abi
     for plan in fixed_plans; push!(callargs, plan.callarg); end
     push!(callargs, va_name)
     for plan in kw_plans;    push!(callargs, plan.callarg); end
-
-    kw_cleanups  = vcat([plan.cleanup for plan in kw_plans]...)
-    all_cleanups = vcat(fixed_cleanups, kw_cleanups)
 
     println(io, "    int32_t _pt_err = 0;")
     println(io, "    char *_pt_errmsg = NULL;")
@@ -855,7 +837,6 @@ function _wrapper_fn_varargs(e::PtExport; errors::Vector{PtError}=PtError[], abi
     # Disarm ownership-transfer scope guards now the call has consumed the carriers.
     for plan in fixed_plans, s in plan.disarm; println(io, "    ", s); end
     for plan in kw_plans, s in plan.disarm; println(io, "    ", s); end
-    for s in all_cleanups; println(io, "    ", s); end
     println(io, "    free(_va_data);")
     println(io, "    if (_pt_err) {")
     println(io, "        const char *_msg = _pt_errmsg ? _pt_errmsg : \"Julia exception\";")
@@ -891,10 +872,9 @@ function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=
     end
 
     fmt_req = IOBuffer(); fmt_opt = IOBuffer()
-    addrs = String[]; callargs = String[]; cleanups = String[]
+    addrs = String[]; callargs = String[]
     kwnames = String[]
     per_arg_setups   = Vector{String}[]
-    per_arg_cleanups = Vector{String}[]
     disarms = String[]   # post-call-only (RAII guard ownership transfer); see ArgPlan
     for (i, a) in enumerate(e.args)
         logical = a.jl_type <: AbstractArray && !(a.jl_type <: Array)
@@ -906,9 +886,8 @@ function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=
         else
             print(fmt_opt, plan.fmt)
         end
-        append!(addrs, plan.addrs); append!(cleanups, plan.cleanup)
+        append!(addrs, plan.addrs)
         push!(per_arg_setups, plan.setup)
-        push!(per_arg_cleanups, plan.cleanup)
         append!(disarms, plan.disarm)
         push!(callargs, plan.callarg)
         push!(kwnames, string(a.name))
@@ -928,14 +907,13 @@ function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=
         println(io, "    if (!PyArg_ParseTuple(args, \"", fmt_str, "\", ",
                 join(addrs, ", "), ")) return NULL;")
     end
-    # Emit setups arg-by-arg, inserting accumulated release calls before return-NULL so
-    # that a failure in arg i properly releases resources acquired by args 0..i-1.
-    acquired = String[]
-    for (slist, clist) in zip(per_arg_setups, per_arg_cleanups)
+    # Emit setups arg-by-arg. A failure in any arg releases the resources acquired by
+    # earlier args automatically via their per-carrier RAII scope guards (the
+    # __attribute__((cleanup)) in each arg's decls), so no manual unwinding is needed.
+    for slist in per_arg_setups
         for s in slist
-            println(io, "    ", _insert_cleanup_before_return(s, acquired))
+            println(io, "    ", s)
         end
-        append!(acquired, clist)
     end
 
     println(io, "    int32_t _pt_err = 0;")
@@ -955,7 +933,6 @@ function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=
     end
     # Disarm ownership-transfer scope guards now the call has consumed the carriers.
     for s in disarms; println(io, "    ", s); end
-    for s in cleanups; println(io, "    ", s); end
     println(io, "    if (_pt_err) {")
     println(io, "        const char *_msg = _pt_errmsg ? _pt_errmsg : \"Julia exception\";")
     if isempty(errors)
@@ -1156,6 +1133,8 @@ function _emit_tp_new_slot(io::IO, tname::String, n::PtNew; abi3::Bool=false,
     println(io, "    PtHandle h = $(sym)($(callargs)$(err_sep)&_pt_err, &_pt_errmsg);")
     for plan in plans
         for s in plan.cleanup; println(io, "    ", s); end
+        # Disarm ownership-transfer RAII guards (e.g. dict args) now the call consumed them.
+        for s in plan.disarm;  println(io, "    ", s); end
     end
     println(io, "    if (_pt_err) {")
     println(io, "        PyErr_SetString(PyExc_RuntimeError,")
@@ -1219,6 +1198,8 @@ function _emit_named_method_wrapper(io::IO, tname::String, m::PtNamedMethod)
     end
     for plan in plans
         for s in plan.cleanup; println(io, "    ", s); end
+        # Disarm ownership-transfer RAII guards (e.g. dict args) now the call consumed them.
+        for s in plan.disarm;  println(io, "    ", s); end
     end
     println(io, "    if (_err) {")
     println(io, "        PyErr_SetString(PyExc_RuntimeError, _errmsg ? _errmsg : \"error in $(m.py_name)\");")
@@ -1432,6 +1413,8 @@ function _emit_handle_type_defs(io::IO, mod_name::AbstractString,
                 println(io, "    $c_ret_type r = $(sym)(h$(err_sep)$(callargs), &_err, &_errmsg);")
                 for plan in plans
                     for s in plan.cleanup; println(io, "    ", s); end
+                    # Disarm ownership-transfer RAII guards (e.g. dict args) post-call.
+                    for s in plan.disarm;  println(io, "    ", s); end
                 end
                 println(io, "    if (_err) {")
                 println(io, "        PyErr_SetString(PyExc_RuntimeError,")
