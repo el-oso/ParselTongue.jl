@@ -822,59 +822,85 @@ function _py_unbox(::Type{Vector{T}}, r::Ptr{Cvoid}) where {T<:_PY_SCALAR}
     return v
 end
 
-# Call the Python callable. Generated per concrete (Args, Ret): builds the arg
-# tuple with unrolled _py_box calls, invokes PyObject_Call, unboxes via Ret.
-# The generated body contains only ccalls and concrete _py_box/_py_unbox dispatch,
-# so --trim=safe accepts it. The C shim released the GIL before calling Julia, so
-# we re-acquire it here via PyGILState_Ensure.
-@generated function (f::PyCallable{Args,Ret})(args...) where {Args,Ret}
+# Call the Python callable. SPIKE (ErrorTypes): the call is split into a Result-returning
+# core `_pycall` and a thin operator that unwraps it.
+#
+# What this buys over the original inline-`error()` version (see git history of this file):
+#  • The two cleanup obligations — Py_DecRef(args_tup) and PyGILState_Release(gstate) — are
+#    now in ONE `finally` instead of being duplicated before each of the 4 `error(...)`
+#    sites. A new failure path can't forget them; and if `_py_unbox` itself threw, the GIL
+#    is still released (the original leaked it).
+#  • The failure flow is linear: `return Err(:sym)` at each step rather than nested
+#    cleanup-then-throw blocks.
+# What it does NOT buy: the `try/finally` stays — Result does cleanup of nothing, that is
+# still finally's job — and the operator still `error()`s on Err so the FFI boundary catch
+# turns it into a Python exception. So this is a readability/cleanup-DRYness change, not a
+# removal of the runtime guard. Generated body is concrete ccalls + Result, so --trim=safe
+# accepts it. The C shim released the GIL before calling Julia; we re-acquire via Ensure.
+# Two load-bearing trim-safety details, both discovered by building this under --trim=safe:
+#  1. `args` is passed as a single `Tuple` (not splatted) — calling `_pycall(f, args...)`
+#     from the operator lowers to `Core._apply_iterate`, a dynamic call the verifier rejects.
+#  2. Each return must build the concrete `Result{Ret,Symbol}` EXPLICITLY. Bare `Ok(x)`/
+#     `Err(s)` (and even a `::Result{Ret,Symbol}` return annotation on a @generated function)
+#     leave the inferred return as a non-concrete `Union{ResultConstructor{…Ok}, …Err}`,
+#     which --trim=safe rejects. `Result{Ret,Symbol}(Ok{Ret}(x))` / `(Err(s))` force it.
+@generated function _pycall(f::PyCallable{Args,Ret}, args::Tuple) where {Args,Ret}
     argtypes = (Args.parameters...,)
     nargs    = length(argtypes)
-    if length(args) != nargs
-        return :(error(string("PyCallable: expected ", $nargs, " argument(s), got ", $(length(args)))))
-    end
-    body = Expr(:block)
-    push!(body.args, :(gstate = ccall(:PyGILState_Ensure, Int32, ())))
-    push!(body.args, :(args_tup = ccall(:PyTuple_New, Ptr{Cvoid}, (Int,), $nargs)))
-    push!(body.args, quote
-        if args_tup == Ptr{Cvoid}(0)
-            ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-            error("PyCallable: failed to build args tuple")
-        end
-    end)
+    R        = :(Result{$Ret,Symbol})
+    boxsteps = Expr(:block)
     for i in 1:nargs
         Ti = argtypes[i]
-        push!(body.args, quote
+        push!(boxsteps.args, quote
             local item = _py_box(convert($Ti, args[$i]))
-            if item == Ptr{Cvoid}(0)
-                ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), args_tup)
-                ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-                error("PyCallable: failed to box argument")
-            end
+            item == Ptr{Cvoid}(0) && return $R(Err(:box_arg))
             # PyTuple_SetItem steals the reference to `item`.
             ccall(:PyTuple_SetItem, Int32, (Ptr{Cvoid}, Int, Ptr{Cvoid}), args_tup, $(i - 1), item)
         end)
     end
-    push!(body.args, quote
-        local result = ccall(:PyObject_Call, Ptr{Cvoid},
-                             (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}), f.ptr, args_tup, Ptr{Cvoid}(0))
-        ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), args_tup)
-        if result == Ptr{Cvoid}(0)
-            ccall(:PyErr_Clear, Cvoid, ())
+    quote
+        local args_tup::Ptr{Cvoid} = Ptr{Cvoid}(0)
+        local gstate = ccall(:PyGILState_Ensure, Int32, ())
+        try
+            args_tup = ccall(:PyTuple_New, Ptr{Cvoid}, (Int,), $nargs)
+            args_tup == Ptr{Cvoid}(0) && return $R(Err(:tuple_alloc))
+            $boxsteps
+            local result = ccall(:PyObject_Call, Ptr{Cvoid},
+                                 (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}), f.ptr, args_tup, Ptr{Cvoid}(0))
+            if result == Ptr{Cvoid}(0)
+                ccall(:PyErr_Clear, Cvoid, ())
+                return $R(Err(:callable_raised))
+            end
+            local r = _py_unbox($Ret, result)
+            ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), result)
+            if ccall(:PyErr_Occurred, Ptr{Cvoid}, ()) != C_NULL
+                ccall(:PyErr_Clear, Cvoid, ())
+                return $R(Err(:incompatible_return))
+            end
+            return $R(Ok{$Ret}(r))
+        finally
+            args_tup == Ptr{Cvoid}(0) || ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), args_tup)
             ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-            error("PyCallable: Python callable raised an exception")
         end
-        local r = _py_unbox($Ret, result)
-        ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), result)
-        if ccall(:PyErr_Occurred, Ptr{Cvoid}, ()) != C_NULL
-            ccall(:PyErr_Clear, Cvoid, ())
-            ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-            error("PyCallable: Python callable returned an incompatible value")
-        end
-        ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-        return r
-    end)
-    return body
+    end
+end
+
+# Map a _pycall error symbol to the message the FFI boundary surfaces.
+function _pycall_msg(s::Symbol)
+    s === :tuple_alloc         && return "PyCallable: failed to build args tuple"
+    s === :box_arg             && return "PyCallable: failed to box argument"
+    s === :callable_raised     && return "PyCallable: Python callable raised an exception"
+    s === :incompatible_return && return "PyCallable: Python callable returned an incompatible value"
+    return "PyCallable: call failed"
+end
+
+function (f::PyCallable{Args,Ret})(args...) where {Args,Ret}
+    length(args) == length(Args.parameters) ||
+        error(string("PyCallable: expected ", length(Args.parameters),
+                     " argument(s), got ", length(args)))
+    local res = _pycall(f, args)   # pass the tuple, not args... (avoids _apply_iterate)
+    is_error(res) && error(_pycall_msg(unwrap_error(res)))
+    return unwrap(res)
 end
 
 # ── Boundary validation (build host) ──────────────────────────────────

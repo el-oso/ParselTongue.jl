@@ -2,6 +2,7 @@ module ParselTongue
 
 using TypeContracts
 using MLStyle
+using ErrorTypes: Result, Ok, Err, is_error, unwrap, unwrap_error  # SPIKE: PyCallable Result core
 
 # NOTE: we do NOT depend on BaseTypeContracts — ParselTongue defines its own
 # PyBoundary contract and carrier types here; the Base contracts it provides are

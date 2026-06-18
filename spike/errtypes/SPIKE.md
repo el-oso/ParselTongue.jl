@@ -49,3 +49,44 @@ yet the premise doesn't hold — confirmed firsthand:
 
 Same conclusion would apply to Mexicah's nested `load`/`store!` (internal propagation
 only; the FFI catch + the cleanup `finally` both remain).
+
+---
+
+## Real-code conversion: the `PyCallable` call operator (`src/boundary.jl`)
+
+The one genuinely multi-step fallible path in the trimmed runtime. Converted the inline-
+`error()` `@generated` operator into a `Result{Ret,Symbol}`-returning core `_pycall` + a
+thin operator that unwraps it (still `error()`s on `Err` → the FFI boundary catch turns it
+into a Python exception). Builds under `--trim=safe`; all PyCallable paths (apply/combine/
+apply_str/apply_vec/bisect + the raise/incompatible-return error paths) behave identically;
+unit tests 49/49.
+
+**The genuine win (why this site was worth it):** the original duplicated the *two cleanup
+obligations* — `Py_DecRef(args_tup)` + `PyGILState_Release(gstate)` — before each of **4**
+`error()` sites. The Result version puts them in **one `finally`**, so:
+- a new failure path can't forget the cleanup;
+- the GIL is released even if `_py_unbox` itself throws (the original **leaked** it there);
+- the failure flow is linear (`return Err(:sym)`) instead of nested cleanup-then-throw.
+
+**Two non-obvious trim-safety costs discovered by building it** (both now commented in the
+code, and both are real adoption gotchas):
+1. **No splat.** `_pycall(f, args...)` lowers to `Core._apply_iterate` → verifier rejects.
+   Must pass the tuple: `_pycall(f, args)` with `args::Tuple`.
+2. **Explicit `Result` construction.** Bare `Ok(x)`/`Err(s)` return ErrorTypes'
+   `ResultConstructor`; the inferred return is a non-concrete `Union{ResultConstructor…}`
+   that `--trim=safe` rejects. A `::Result{Ret,Symbol}` annotation on the `@generated`
+   function is **not** enough — each return must be `Result{Ret,Symbol}(Ok{Ret}(x))` /
+   `(Err(s))` explicitly.
+
+**Honest verdict for this site:** a modest *readability + cleanup-DRYness + robustness*
+win (1 `finally` vs 4 duplicated cleanups). But note what it is and isn't:
+- The `try/finally` **stays** — Result does no cleanup; that is finally's job. So this does
+  **not** remove the runtime guard; it *reorganizes* error+cleanup around one.
+- The operator still `error()`s → the FFI boundary catch is unchanged.
+- No compile-time enforcement (Julia limitation, unchanged).
+- Adds a dependency to the trimmed image + the two trim gotchas as ongoing footguns.
+
+So: a small net positive *as a code-organization choice for cleanup-coupled multi-step
+paths*, **not** the compile-time win originally sought. Whether the cleanup-DRY benefit is
+worth a new dependency + the `@generated`/trim gotchas is a judgement call — for a single
+operator, probably not; across many such paths, plausibly. Branch left unmerged.
