@@ -1,19 +1,16 @@
-flowchart TD
-    A["<b>Your .jl file</b><br/>@pyfunc · @pymodule · @pyhandle · @pyerror"]
-    A --> B["<b>macros.jl</b><br/>record each export's signature<br/>into _EXPORTS / _ERRORS"]
+flowchart LR
+    A["<b>.jl source</b><br/>@pyfunc · @pymodule"]
+    A --> B["<b>macros.jl</b><br/>record exports"]
     B --> C(["build_extension"])
-
-    C --> D["<b>ccallable_gen.jl</b><br/>emit @ccallable C-ABI<br/>wrappers (_pt_entry.jl)"]
-    D --> E["<b>juliac --trim=safe</b><br/>compile + dead-code trim<br/>&rarr; img.a"]
-    C --> F["<b>cshim.jl</b><br/>emit PyInit, PyObject&#8596;C<br/>wrappers, method table"]
-
-    E --> G["<b>cc -shared</b><br/>link C shim + img.a + libjulia"]
+    C --> D["<b>ccallable_gen</b><br/>C-ABI wrappers"]
+    D --> E["<b>juliac --trim=safe</b><br/>&rarr; img.a"]
+    C --> F["<b>cshim.jl</b><br/>PyInit + wrappers"]
+    E --> G["<b>cc -shared</b><br/>+ libjulia"]
     F --> G
-    G --> H(["<b>mod.so / mod.pyd</b><br/>importable extension"])
-
+    G --> H(["<b>.so / .pyd</b>"])
     H --> I(["build_wheel"])
-    I --> J["vendor runtime<br/>(:bundled / :shared / :system)<br/>+ __init__.py + dist-info"]
-    J --> K(["<b>mod-*.whl</b><br/>pip install — no Julia needed"])
+    I --> J["vendor runtime<br/>+ __init__.py"]
+    J --> K(["<b>.whl</b>"])
 
     style A fill:#e3f2fd,stroke:#1565c0,color:#0d2440
     style H fill:#e8f5e9,stroke:#2e7d32,color:#0d2440
