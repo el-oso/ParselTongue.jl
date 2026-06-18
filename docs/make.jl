@@ -27,6 +27,8 @@ makedocs(;
             "Scalars (mathx)" => "examples/scalars.md",
             "Strings (strx)" => "examples/strings.md",
             "Arrays & NumPy (arrx)" => "examples/arrays.md",
+            "Classes & Objects" => "examples/classes.md",
+            "Callbacks & Errors" => "examples/callbacks-errors.md",
             "A Statistics Module" => "examples/statistics.md",
             "Scientific Module (sci)" => "examples/scientific.md",
         ],

@@ -20,11 +20,13 @@ backed by compiled Julia.
 |---|---|---|
 | Linux x86_64 | ✅ | `cc` / `gcc` / `clang` |
 | macOS arm64, x86_64 | ✅ | `cc` (Xcode clang) |
-| Windows x86_64 | ✅ | MinGW-w64 `gcc` (MSVC not supported) |
+| Windows x86_64 | ✅ | MinGW-w64 `gcc`/`clang` (MSVC not supported) |
 
 **Windows:** install [MSYS2](https://www.msys2.org/) and ensure
-`C:\msys64\mingw64\bin` is on your `PATH`, or set the `JULIA_CC` environment
-variable to the full path of your `gcc.exe`.
+`C:\msys64\mingw64\bin` is on your `PATH` — it provides MinGW-w64 `gcc`, and a
+MinGW/MSYS2 `clang` is also accepted. Or set the `JULIA_CC` environment variable to
+the full path of your compiler. Standalone LLVM/MSVC `clang` is rejected because it
+cannot link with `-Wl,--whole-archive`.
 
 ## Install ParselTongue
 

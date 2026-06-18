@@ -1,6 +1,42 @@
 # Building
 
-ParselTongue offers two build entry points.
+ParselTongue offers two build entry points. Both run the same pipeline: your
+annotated Julia is turned into a trimmed native object, a CPython C shim is
+generated from the very same macro metadata, and the two are linked into an
+importable extension. `build_wheel` adds packaging on top.
+
+## The build pipeline
+
+```mermaid
+flowchart TD
+    A["<b>Your .jl file</b><br/>@pyfunc · @pymodule · @pyhandle · @pyerror"]
+    A --> B["<b>macros.jl</b><br/>record each export's signature<br/>into _EXPORTS / _ERRORS"]
+    B --> C(["build_extension"])
+
+    C --> D["<b>ccallable_gen.jl</b><br/>emit @ccallable C-ABI<br/>wrappers (_pt_entry.jl)"]
+    D --> E["<b>juliac --trim=safe</b><br/>compile + dead-code trim<br/>→ img.a"]
+    C --> F["<b>cshim.jl</b><br/>emit PyInit, PyObject↔C<br/>wrappers, method table"]
+
+    E --> G["<b>cc -shared</b><br/>link C shim + img.a + libjulia"]
+    F --> G
+    G --> H(["<b>mod.so / mod.pyd</b><br/>importable extension"])
+
+    H --> I(["build_wheel"])
+    I --> J["vendor runtime<br/>(:bundled / :shared / :system)<br/>+ __init__.py + dist-info"]
+    J --> K(["<b>mod-*.whl</b><br/>pip install — no Julia needed"])
+
+    style A fill:#e3f2fd,stroke:#1565c0
+    style H fill:#e8f5e9,stroke:#2e7d32
+    style K fill:#e8f5e9,stroke:#2e7d32
+    style E fill:#fff3e0,stroke:#e65100
+    style G fill:#fff3e0,stroke:#e65100
+```
+
+The key idea: the `@ccallable` Julia wrappers and the C shim are generated from
+**one** source of truth — ParselTongue's own macro metadata — so every argument
+type, return type, and struct layout is already known. There is no separate ABI
+description to keep in sync, and no hand-written C. `build_extension` stops at the
+`.so`; `build_wheel` continues through packaging.
 
 ## `build_wheel` — a self-contained, pip-installable wheel
 

@@ -76,20 +76,19 @@ with a clear message (not a cryptic trim error), via a `TypeContracts` contract.
 
 ## Installation
 
-ParselTongue depends on
-[TypeContracts.jl](https://github.com/el-oso/TypeContracts.jl) (not yet in
-the Julia General registry). Install both from GitHub:
+ParselTongue is not yet in the Julia General registry, so install it from GitHub.
+Its dependency [TypeContracts.jl](https://github.com/el-oso/TypeContracts.jl) **is**
+in the General registry and resolves automatically:
 
 ```julia
 using Pkg
-Pkg.develop(url="https://github.com/el-oso/TypeContracts.jl.git")
 Pkg.add(url="https://github.com/el-oso/parseltongue.git")
 ```
 
 ## Requirements
 
 - Julia ≥ 1.12 with bundled `juliac` (available via `juliaup`).
-- A C compiler: `cc`/`gcc`/`clang` on Linux/macOS; MinGW-w64 `gcc` on Windows.
+- A C compiler: `cc`/`gcc`/`clang` on Linux/macOS; MinGW-w64 `gcc` or `clang` on Windows.
 - `python3` on the build host (any recent CPython 3.x).
 
 ## Platform support
@@ -98,22 +97,25 @@ Pkg.add(url="https://github.com/el-oso/parseltongue.git")
 |---|---|---|---|
 | Linux x86_64 | ✅ | ✅ | `cc` / `gcc` / `clang` |
 | macOS arm64, x86_64 | ✅ | ✅ | `cc` (Xcode clang) |
-| Windows x86_64 | ✅ | ✅ | MinGW-w64 `gcc` (MSVC not supported) |
+| Windows x86_64 | ✅ | ✅ | MinGW-w64 `gcc`/`clang` (MSVC not supported) |
 
 **Windows:** install [MSYS2](https://www.msys2.org/) and add
-`C:\msys64\mingw64\bin` to `PATH`, or point `JULIA_CC` at your `gcc.exe`.
+`C:\msys64\mingw64\bin` to `PATH` (it provides MinGW-w64 `gcc`; a MinGW/MSYS2
+`clang` also works), or point `JULIA_CC` at your compiler. Standalone LLVM/MSVC
+`clang` is rejected — it can't link with `-Wl,--whole-archive`.
 
-## Known limitations (v1)
+## Known limitations
 
-- **One ParselTongue extension per Python process.** Each wheel embeds its own
-  libjulia; importing two such extensions in the same process aborts (two Julia
-  runtimes cannot coexist). A shared-runtime mode is future work.
-- **Wheel size ≈ 100 MB.** The trimmed code is tiny, but the Julia runtime's
-  stdlib `__init__`s (OpenBLAS, etc.) run at startup and require their libraries,
-  so the support libraries must be bundled (only the system image, LLVM, and
-  codegen — ~500 MB — are excluded). Shrinking this needs suppression of unused
-  stdlib inits.
-- **Arrays are 1-D.** N-D support needs the column/row-major story resolved.
+- **One ParselTongue extension per Python process.** A `:bundled` wheel embeds its
+  own libjulia; importing two such extensions in one process aborts (two Julia
+  runtimes cannot coexist). `runtime=:shared` / `runtime=:system` extensions share a
+  single runtime and *can* be imported together.
+- **Wheel size ≈ 100 MB (default `:bundled`).** The trimmed code is tiny, but the
+  Julia runtime's stdlib `__init__`s (OpenBLAS, etc.) run at startup and require their
+  libraries, so they must be bundled (only the system image, LLVM, and codegen —
+  ~500 MB — are excluded). `slim=true` cuts this to ~38 MB (no stdlib JLLs), and
+  `runtime=:shared`/`:system` give a ~1 MB wheel with Julia installed once. Slimming
+  the default bundle further (suppressing unused stdlib inits) is still pending.
 - **Array dtype check** validates element size, not signedness/kind (e.g. an
   `int64` buffer passed where `Float64` is expected is not caught — same width).
 
@@ -143,7 +145,7 @@ comparison + numeric dunders incl. mixed-type/reflected, bound named methods,
 mutable classes
 with heap fields and stateful iterators (`@pymutable` — GC-registry-backed, in-place
 mutation, `__next__`), custom Python exception types (`@pyerror`), keyword/default
-arguments, arbitrary-signature `PyCallable{Args,Ret}` callbacks, manylinux
+arguments, typed `PyCallable{Args,Ret}` callbacks (scalars, strings, lists), manylinux
 tagging, abi3 stable-ABI wheels, shared-runtime wheels, slim bundling,
 multi-module wheels (`build_multi_wheel`), `pyproject.toml` generation,
 startup benchmarking, and a compiled `pt` CLI binary.

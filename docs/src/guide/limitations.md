@@ -1,7 +1,7 @@
-# Limitations (v1)
+# Limitations
 
-ParselTongue v0.1 is built on the experimental `juliac --trim`. These are the
-known constraints, with the reasoning behind each.
+ParselTongue is built on the experimental `juliac --trim` (Julia ≥ 1.12). These are
+the known constraints, with the reasoning behind each.
 
 ## One extension per Python process
 
@@ -39,8 +39,12 @@ libraries even when your code never uses them. Those libraries must therefore be
 bundled. Only the system image, the LLVM JIT, and codegen (~500 MB) are excluded,
 since a trimmed AOT binary provably never needs them.
 
-Shrinking the wheel further requires suppressing the unused stdlib inits — a
-planned optimization.
+Two options already reduce or remove this: `slim=true` vendors only the libraries
+reachable via `DT_NEEDED` (~38 MB, safe when your code uses no stdlib JLLs such as
+`LinearAlgebra`), and `runtime=:shared` / `runtime=:system` skip vendoring entirely
+(~1 MB wheel, with the Julia runtime installed once and shared by every extension).
+Slimming the *default* bundle further — by suppressing the unused stdlib inits — is
+still a planned optimization.
 
 ## Array dtype checking is width-only
 
@@ -67,10 +71,10 @@ using ErrorTypes
 _safe_div_impl(a::Float64, b::Float64)::Result{Float64,String} =
     b == 0.0 ? Err("division by zero") : Ok(a / b)
 
-@pyfunc safe_div(a::Float64, b::Float64)::Float64 =
-    is_ok(_safe_div_impl(a, b)) ?
-        unwrap(_safe_div_impl(a, b)) :
-        error(unwrap_err(_safe_div_impl(a, b)))
+@pyfunc safe_div(a::Float64, b::Float64)::Float64 = begin
+    r = _safe_div_impl(a, b)
+    is_error(r) ? error(unwrap_error(r)) : unwrap(r)
+end
 ```
 
 From Python's perspective, `Err(...)` and `throw(...)` are identical — both become

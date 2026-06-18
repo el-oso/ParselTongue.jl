@@ -16,13 +16,13 @@ the Python object graph you can reach from native code.
 | Type mapping | Explicit boundary contract | Derive macros + `FromPyObject` / `IntoPyObject` |
 | Classes | `@pyhandle` (isbits) + `@pymutable` (heap fields, GC registry); `isinstance`, mutable fields, ~25 dunders incl. numeric (mixed-type) + iterator (`__next__`), bound named methods, `@pyproperty`, context managers, opt-in `subclass=` / `dict=` (Python subclassing + instance dict) | `#[pyclass]` (full object protocol incl. `extends=` native inheritance) |
 | Custom exceptions | `@pyerror MyError <: ValueError` | `create_exception!` |
-| Python callables | `PyCallable{Args,Ret}` (any scalar signature) | `Py<PyAny>` / `PyCallable` (any signature) |
+| Python callables | `PyCallable{Args,Ret}` (scalars, `String`, `Vector`) | `Py<PyAny>` / `PyCallable` (any signature) |
 | GIL release during call | Yes (automatic) | Yes (opt-in with `py.allow_threads`) |
 | Stable-ABI wheel (abi3) | Yes (`abi3=true`, floor CPython 3.11) | Yes (`--features abi3`) |
 | manylinux tagging | Yes (auto or pinned) | Yes (via `maturin`) |
 | Emitted wheel size | ~1 MB with a shared/system runtime (Julia installed once); ~100 MB fully self-contained | ~1–5 MB (self-contained) |
 | macOS support | Yes (`-dynamiclib`, `@loader_path`) | Yes |
-| Windows support | Yes (MinGW-w64) | Yes |
+| Windows support | Yes (MinGW-w64 `gcc`/`clang`) | Yes |
 | Async | No | Yes |
 | Free-threading (GIL-free CPython) | No | Experimental |
 | Maturity | Early (v0.2x) | Production (v0.22+, widely used) |
@@ -319,9 +319,9 @@ fn apply(f: &Bound<'_, PyAny>, x: f64) -> PyResult<f64> {
 }
 ```
 
-**ParselTongue** supports `PyCallable{Args, Ret}` with any scalar signature.
-The bare name `PyCallable` defaults to `Float64 → Float64`; parameterize it to
-declare other signatures:
+**ParselTongue** supports `PyCallable{Args, Ret}` with scalar, `String`, and
+`Vector{scalar}` argument/return types. The bare name `PyCallable` defaults to
+`Float64 → Float64`; parameterize it to declare other signatures:
 
 ```julia
 @pyfunc apply(f::PyCallable, x::Float64)::Float64 = f(x)            # Float64 → Float64
@@ -343,9 +343,10 @@ Internally, `f(a, b, …)` re-acquires the GIL and calls `PyObject_Call` through
 chain of `ccall`s emitted by a `@generated` method — one trim-safe body per
 concrete signature, wrapped in a single `try/finally` that drops the GIL and every
 temporary reference on all exit paths (see *GIL management* above). Supported
-argument/return scalar types: `Int8`–`Int64`,
-`UInt8`–`UInt64`, `Bool`, `Float32`, `Float64`. Array/string/object arguments and
-returns to/from the callback are not yet supported.
+argument/return types: scalars (`Int8`–`Int64`, `UInt8`–`UInt64`, `Bool`, `Float32`,
+`Float64`), `String` (↔ `str`), and `Vector{T}` for scalar `T` (↔ `list`). `Dict`,
+`NamedTuple`, and `@pyhandle`/`@pymutable` object types are not yet supported as
+callback arguments or returns.
 
 ## Distribution
 
@@ -420,8 +421,9 @@ build can take minutes.
   wheel carries its whole runtime, whereas a ~1 MB ParselTongue wheel still needs a
   Julia runtime present (shared/system), and the self-contained `:bundled` wheel is
   ~100 MB.
-- You need to call Python callbacks with **non-scalar argument types** (arrays,
-  strings, objects); ParselTongue's `PyCallable{Args,Ret}` is limited to scalars.
+- You need to call Python callbacks with **container or object argument types**
+  (`dict`, `tuple`/struct, or class instances); ParselTongue's `PyCallable{Args,Ret}`
+  handles scalars, `str`, and `list`, but not those yet.
 - Your project already has Rust tooling in the CI pipeline.
 
 ## Both are good choices when
