@@ -20,4 +20,11 @@ using ParselTongue
     # in _ap_dict. The driver calls this with a valid dict (success → stub frees →
     # disarm must prevent a double-free) and with bad input (error → guard frees).
     @pyfunc take(d::Dict{String,Float64})::Float64 = sum(values(d); init = 0.0)
+    # Vector{String} *argument* path: the always-release RAII guard (_pt_strarrayguard)
+    # must free the (possibly partial) malloc'd array on the error path. The driver
+    # calls this with a valid list (success → guard frees), a non-list, and a list with
+    # a non-str item (error mid-build → guard frees the partial), so LSan catches a
+    # missing free. (The buffer/PyCallable guards are refcount-based — validated by the
+    # integration refleak gate, not LSan.)
+    @pyfunc take_strs(v::Vector{String})::Int64 = length(v)
 end

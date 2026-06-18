@@ -300,32 +300,40 @@ end
 function _ap_stra(tmp::String)
     obj = string(tmp, "_obj"); ni = string(tmp, "_n"); ii = string(tmp, "_i")
     itm = string(tmp, "_itm"); szv = string(tmp, "_sz"); sv = string(tmp, "_sv")
+    # RAII scope guard: the carrier is freed on any scope exit (incl. after the call —
+    # from_c copies, the shim owns the array). memset NULLs unfilled slots before len
+    # is set, so the guard is safe at any mid-construction return. No manual frees.
     decls = [string("PyObject *", obj, ";"),
-             string("PtStrArray ", tmp, " = {NULL, 0};")]
+             string("__attribute__((cleanup(_pt_strarrayguard))) PtStrArray ", tmp, " = {NULL, 0};")]
     setup = String[
         string("if (!PyList_Check(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"expected a list of str\"); return NULL; }"),
         string("{ Py_ssize_t ", ni, " = PyList_Size(", obj, ");"),
         string(tmp, ".data = (char **)malloc(", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
         string("if (!", tmp, ".data) { PyErr_NoMemory(); return NULL; }"),
-        string(tmp, ".len = (int64_t)", ni, ";"),
         string("memset(", tmp, ".data, 0, ", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
+        string(tmp, ".len = (int64_t)", ni, ";"),
         string("Py_ssize_t ", ii, "; for (", ii, " = 0; ", ii, " < ", ni, "; ", ii, "++) {"),
         string("    PyObject *", itm, " = PyList_GetItem(", obj, ", ", ii, ");"),
         string("    Py_ssize_t ", szv, ";"),
         string("    const char *", sv, " = PyUnicode_AsUTF8AndSize(", itm, ", &", szv, ");"),
-        string("    if (!", sv, ") { _pt_free_str_array(", tmp, ".data, ", ii, "); return NULL; }"),
+        string("    if (!", sv, ") return NULL;"),
         string("    ", tmp, ".data[", ii, "] = (char *)malloc((size_t)(", szv, " + 1));"),
-        string("    if (!", tmp, ".data[", ii, "]) { _pt_free_str_array(", tmp, ".data, ", ii, "); return PyErr_NoMemory(); }"),
+        string("    if (!", tmp, ".data[", ii, "]) return PyErr_NoMemory();"),
         string("    memcpy(", tmp, ".data[", ii, "], ", sv, ", (size_t)(", szv, " + 1)); } }"),
     ]
-    cleanup = [string("_pt_free_str_array(", tmp, ".data, ", tmp, ".len);")]
+    cleanup = String[]
     ArgPlan(decls, "O", [string("&", obj)], setup, tmp, cleanup)
 end
 
 function _ap_array(tmp::String, @nospecialize(C::Type), logical::Bool, mutable::Bool)
     e = _elt(C); sn = _structname(C); n = _ndims(C)
     obj = string(tmp, "_obj"); buf = string(tmp, "_buf")
-    decls = [string("PyObject *", obj, ";"), string("Py_buffer ", buf, ";"),
+    # RAII scope guard on the Py_buffer: released on any scope exit (incl. after the
+    # call — Julia reads from, but does not own, the buffer). Zero-init so the guard
+    # is a no-op if PyObject_GetBuffer fails before acquiring. No manual releases or
+    # cleanup field needed.
+    decls = [string("PyObject *", obj, ";"),
+             string("__attribute__((cleanup(_pt_bufferguard))) Py_buffer ", buf, " = {0};"),
              string(sn, " ", tmp, ";")]
     bufflags = mutable ? "PyBUF_STRIDES | PyBUF_FORMAT | PyBUF_WRITABLE" :
                          "PyBUF_STRIDES | PyBUF_FORMAT"
@@ -333,7 +341,6 @@ function _ap_array(tmp::String, @nospecialize(C::Type), logical::Bool, mutable::
         string("if (PyObject_GetBuffer(", obj, ", &", buf, ", ", bufflags, ") != 0) return NULL;"),
         string("if (", buf, ".ndim != ", n, " || ", buf,
                ".itemsize != (Py_ssize_t)sizeof(", e.ctype, ")) {"),
-        string("    PyBuffer_Release(&", buf, ");"),
         string("    PyErr_SetString(PyExc_TypeError, \"expected a ", n, "-D ", e.np,
                " array\"); return NULL;"),
         "}",
@@ -342,7 +349,6 @@ function _ap_array(tmp::String, @nospecialize(C::Type), logical::Bool, mutable::
         # Logical (AbstractArray) policy: C-contiguous only, order always 0.
         append!(setup, [
             string("if (!PyBuffer_IsContiguous(&", buf, ", 'C')) {"),
-            string("    PyBuffer_Release(&", buf, ");"),
             "    PyErr_SetString(PyExc_TypeError, \"AbstractArray argument requires a C-contiguous array (try np.ascontiguousarray)\"); return NULL;",
             "}",
             string(tmp, ".order = 0;"),
@@ -353,7 +359,6 @@ function _ap_array(tmp::String, @nospecialize(C::Type), logical::Bool, mutable::
             string("if (PyBuffer_IsContiguous(&", buf, ", 'C')) ", tmp, ".order = 0;"),
             string("else if (PyBuffer_IsContiguous(&", buf, ", 'F')) ", tmp, ".order = 1;"),
             "else {",
-            string("    PyBuffer_Release(&", buf, ");"),
             "    PyErr_SetString(PyExc_TypeError, \"expected a contiguous array\"); return NULL;",
             "}",
         ])
@@ -362,8 +367,7 @@ function _ap_array(tmp::String, @nospecialize(C::Type), logical::Bool, mutable::
     for k in 0:n-1
         push!(setup, string(tmp, ".shape[", k, "] = (int64_t)", buf, ".shape[", k, "];"))
     end
-    ArgPlan(decls, "O", [string("&", obj)], setup, tmp,
-            [string("PyBuffer_Release(&", buf, ");")])
+    ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
 end
 
 function _ap_handle(tmp::String, tname::String)
@@ -476,18 +480,19 @@ end
 
 function _ap_pycallable(tmp::String)
     obj = string(tmp, "_obj")
+    # RAII scope guard: drops the INCREF on any scope exit (incl. after the call). The
+    # carrier is NULL until the INCREF runs, so the guard's Py_XDECREF is a no-op on the
+    # type-check error path. No cleanup field / manual DECREF needed.
     decls = [
         string("PyObject *", obj, " = NULL;"),
-        string("void *", tmp, " = NULL;"),
+        string("__attribute__((cleanup(_pt_callableguard))) void *", tmp, " = NULL;"),
     ]
     setup = [
         string("if (!PyCallable_Check(", obj, ")) { PyErr_SetString(PyExc_TypeError, \"argument must be callable\"); return NULL; }"),
         string("Py_INCREF(", obj, ");"),
         string(tmp, " = (void *)", obj, ";"),
     ]
-    # Py_DECREF after Julia call; also inserted before return NULL in later setup steps.
-    cleanup = [string("Py_DECREF((PyObject *)", tmp, ");")]
-    ArgPlan(decls, "O", [string("&", obj)], setup, tmp, cleanup)
+    ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
 end
 
 function _arg_plan(@nospecialize(C::Type), i::Int; logical::Bool=false, mutable::Bool=false,
@@ -1087,6 +1092,9 @@ static void _pt_free_str_array(char **data, int64_t len) {
     for (int64_t i = 0; i < len; i++) if (data[i]) free(data[i]);
     free(data);
 }
+/* Scope guard (RAII) for a Vector{String} *argument* carrier: frees the (possibly
+   partially built) array on any scope exit. NULL slots are skipped by the helper. */
+static void _pt_strarrayguard(void *_p) { PtStrArray *_a = (PtStrArray *)_p; if (_a->data) _pt_free_str_array(_a->data, _a->len); }
 /* Build a Python list from a Julia-malloc'd string array. Takes ownership
    of data (frees each element and the array on success and error). */
 static PyObject *_pt_strarray_to_list(char **data, int64_t len) {
@@ -1964,6 +1972,10 @@ function _emit_handle_type_inits(io::IO, mod_name::AbstractString, handle_types:
 end
 
 const _WRAP_ARRAY_HELPER = """
+/* Scope guard (RAII) for an array *argument*'s Py_buffer: releases it on any scope
+   exit, so the buffer-protocol acquisition needs no hand-written release on each
+   error path. No-op when the buffer was never acquired (obj == NULL). */
+static void _pt_bufferguard(void *_p) { Py_buffer *_b = (Py_buffer *)_p; if (_b->obj) PyBuffer_Release(_b); }
 /* _PtBuf: a minimal Python object that owns a malloc'd byte buffer and exposes it
    via the buffer protocol.  numpy.frombuffer() accepts any buffer-protocol object,
    so Julia's result buffer can be handed straight to NumPy without an intermediate
@@ -2110,6 +2122,12 @@ function emit_cshim(mod_name::AbstractString, exports::AbstractVector{PtExport},
     end
     if any(_carrier_is_strarr, carriers)
         print(io, _WRAP_STRARR_HELPER)
+    end
+    if any(ispycallable, carriers)
+        # Scope guard (RAII) for a PyCallable *argument*: drops the INCREF on any
+        # scope exit. The carrier is NULL until the INCREF runs, so Py_XDECREF is a
+        # no-op on the type-check error path.
+        println(io, "static void _pt_callableguard(void *_p) { Py_XDECREF(*(PyObject **)_p); }")
     end
     structs = _array_structs(carriers)
     if !isempty(structs)

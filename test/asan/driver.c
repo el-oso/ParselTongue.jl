@@ -97,6 +97,13 @@ double pt_take(PtDict_double d, int32_t *err, char **errmsg) {
     return s;
 }
 
+/* Vector{String} *argument* stub: the shim owns the carrier (its RAII guard frees it
+ * after the call), so the stub only READS — it must not free. */
+int64_t pt_take_strs(PtStrArray v, int32_t *err, char **errmsg) {
+    *err = 0; *errmsg = NULL;
+    return v.len;
+}
+
 /* ── Harness ─────────────────────────────────────────────────────────── */
 
 static int g_failures = 0;
@@ -190,6 +197,46 @@ int main(void) {
         if (__lsan_do_recoverable_leak_check()) { fprintf(stderr, "LEAK after take({bad})\n"); g_failures++; }
 
         Py_DECREF(take);
+    }
+
+    /* ── Vector{String} argument path: _pt_strarrayguard (always-release RAII) ──
+     * Malloc'd strings + array → LSan catches a missing free on any path. */
+    PyObject *take_strs = PyObject_GetAttrString(mod, "take_strs");
+    if (!take_strs) { fprintf(stderr, "FAIL: no attribute take_strs\n"); g_failures++; }
+    else {
+        for (int w = 0; w < 2; w++) {  /* warm-up */
+            PyObject *good = Py_BuildValue("([s,s,s])", "x", "y", "z");
+            PyObject *r = PyObject_CallObject(take_strs, good);
+            Py_XDECREF(r); Py_DECREF(good); PyErr_Clear();
+        }
+        PyGC_Collect(); __lsan_do_recoverable_leak_check();  /* baseline */
+
+        /* success: guard frees the array after the call */
+        PyObject *good = Py_BuildValue("([s,s,s])", "x", "y", "z");
+        PyObject *r = PyObject_CallObject(take_strs, good);
+        if (!r) { fprintf(stderr, "FAIL: take_strs(good) raised\n"); PyErr_Print(); g_failures++; }
+        Py_XDECREF(r); Py_DECREF(good);
+        PyGC_Collect();
+        if (__lsan_do_recoverable_leak_check()) { fprintf(stderr, "LEAK after take_strs(good)\n"); g_failures++; }
+
+        /* error A: not a list → guard no-op (array never allocated) */
+        PyObject *bad1 = Py_BuildValue("(i)", 7);
+        r = PyObject_CallObject(take_strs, bad1);
+        if (r) { fprintf(stderr, "FAIL: take_strs(7) did not raise\n"); g_failures++; }
+        Py_XDECREF(r); Py_DECREF(bad1); PyErr_Clear();
+        PyGC_Collect();
+        if (__lsan_do_recoverable_leak_check()) { fprintf(stderr, "LEAK after take_strs(7)\n"); g_failures++; }
+
+        /* error B: list with a non-str item → fails mid-build → guard frees the
+         * partially-built array (data[0..i], data) */
+        PyObject *bad2 = Py_BuildValue("([s,i,s])", "x", 99, "z");
+        r = PyObject_CallObject(take_strs, bad2);
+        if (r) { fprintf(stderr, "FAIL: take_strs([x,99,z]) did not raise\n"); g_failures++; }
+        Py_XDECREF(r); Py_DECREF(bad2); PyErr_Clear();
+        PyGC_Collect();
+        if (__lsan_do_recoverable_leak_check()) { fprintf(stderr, "LEAK after take_strs([x,99,z])\n"); g_failures++; }
+
+        Py_DECREF(take_strs);
     }
 
     if (g_failures == 0) fprintf(stderr, "ASAN_GLUE_OK\n");

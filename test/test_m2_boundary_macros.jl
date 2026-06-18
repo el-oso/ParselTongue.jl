@@ -1804,22 +1804,22 @@ end
     @test f("PyBuffer_Release(&buf);", ["foo();"]) == "PyBuffer_Release(&buf);"
 end
 
-@testset "buffer-release cleanup in multi-array-arg shim (audit fix)" begin
+@testset "array-arg buffers released via RAII scope guard (audit fix)" begin
     clear_exports!()
     @pyfunc two_arr(a::Vector{Float64}, b::Vector{Float64})::Float64 = a[1] + b[1]
     c = emit_cshim("demo", _EXPORTS)
-    # After the first GetBuffer succeeds, a failure of the second must release the first.
-    # The generated code must contain a PyBuffer_Release inside the second GetBuffer's
-    # error branch.  Check for both buffer variable names appearing together in a
-    # release-then-return block.
-    @test occursin("PyBuffer_Release", c)
-    # Find the second GetBuffer error path and verify it has a release before return.
+    # Each array arg's Py_buffer is declared with a __attribute__((cleanup)) scope
+    # guard, so a failure of the second GetBuffer auto-releases the first buffer (and
+    # vice versa) on scope exit — no hand-written PyBuffer_Release on each error path.
+    @test occursin("static void _pt_bufferguard", c)      # the guard helper
+    @test occursin("PyBuffer_Release", c)                 # inside the guard
     lines = split(c, '\n')
+    # two array args → two guarded Py_buffer declarations (the guard, not inline frees,
+    # provides leak-safety on every error path).
+    guarded = findall(l -> occursin("cleanup(_pt_bufferguard)", l) && occursin("Py_buffer", l), lines)
+    @test length(guarded) == 2
     gb_lines = findall(l -> occursin("GetBuffer", l) && occursin("return NULL", l), lines)
     @test length(gb_lines) == 2   # two array args → two GetBuffer calls
-    # The second GetBuffer's return path must include a Release (for the first buffer).
-    second_gb_idx = gb_lines[2]
-    @test occursin("PyBuffer_Release", lines[second_gb_idx])
 end
 
 @testset "NamedTuple: PyDict_SetItemString return checked (audit fix)" begin
@@ -2345,7 +2345,9 @@ end
     @test any(s -> occursin("PyCallable_Check", s), plan.setup)
     @test any(s -> occursin("Py_INCREF", s), plan.setup)
     @test plan.callarg == "a1"
-    @test any(s -> occursin("Py_DECREF", s), plan.cleanup)
+    # DECREF is via the RAII scope guard on the carrier decl, not a manual cleanup.
+    @test isempty(plan.cleanup)
+    @test any(s -> occursin("cleanup(_pt_callableguard)", s), plan.decls)
 
     # ── _build_pyobject for Ptr{Cvoid} (return a callable) ────────────────
     stmts = _build_pyobject(Ptr{Cvoid}, "r", "_ret")
@@ -2385,7 +2387,7 @@ end
     shim, _ = _wrapper_fn(e3)
     @test occursin("PyCallable_Check", shim)
     @test occursin("Py_INCREF", shim)
-    @test occursin("Py_DECREF", shim)
+    @test occursin("_pt_callableguard", shim)  # DECREF via the RAII scope guard, not inline
     @test occursin("\"O", shim)             # "O" or "Od..." — PyCallable parsed with O
     @test occursin("void *", shim)          # declared as void*
     clear_exports!()
