@@ -86,6 +86,17 @@ int64_t pt_boom(int32_t *err, char **errmsg) {
     return 0;
 }
 
+/* Dict *argument* stub: mimics Julia's from_c taking ownership of the carrier —
+ * frees each key, the keys array, and vals. The wrapper's post-call disarm must
+ * have NULLed the carrier so its __cleanup__ guard does NOT double-free here. */
+double pt_take(PtDict_double d, int32_t *err, char **errmsg) {
+    *err = 0; *errmsg = NULL;
+    double s = 0.0;
+    for (int64_t i = 0; i < d.len; i++) { s += d.vals[i]; free(d.keys[i]); }
+    free(d.keys); free(d.vals);
+    return s;
+}
+
 /* ── Harness ─────────────────────────────────────────────────────────── */
 
 static int g_failures = 0;
@@ -136,6 +147,50 @@ int main(void) {
 
     for (size_t i = 0; i < sizeof(names) / sizeof(*names); i++)
         check_fn(mod, names[i], errs[i]);
+
+    /* ── Dict argument path: scope-guard + disarm (the POC under test) ─────
+     * take({...}) success: pt_take frees the carrier; the wrapper's disarm must
+     *   prevent the __cleanup__ guard from double-freeing (ASan catches that).
+     * take(123) and take({"a": "bad"}) error: the guard must free the (possibly
+     *   partial) carrier on the error return (LSan catches a leak). */
+    PyObject *take = PyObject_GetAttrString(mod, "take");
+    if (!take) { fprintf(stderr, "FAIL: no attribute take\n"); g_failures++; }
+    else {
+        /* warm-up to absorb one-time caches, then measured calls */
+        for (int w = 0; w < 2; w++) {
+            PyObject *good = Py_BuildValue("({s:d,s:d,s:d})", "a", 1.0, "b", 2.0, "c", 3.0);
+            PyObject *r = PyObject_CallObject(take, good);
+            Py_XDECREF(r); Py_DECREF(good); PyErr_Clear();
+        }
+        PyGC_Collect(); __lsan_do_recoverable_leak_check();  /* baseline */
+
+        /* success path */
+        PyObject *good = Py_BuildValue("({s:d,s:d,s:d})", "a", 1.0, "b", 2.0, "c", 3.0);
+        PyObject *r = PyObject_CallObject(take, good);
+        if (!r) { fprintf(stderr, "FAIL: take(good) raised\n"); PyErr_Print(); g_failures++; }
+        Py_XDECREF(r); Py_DECREF(good);
+        PyGC_Collect();
+        if (__lsan_do_recoverable_leak_check()) { fprintf(stderr, "LEAK after take(good)\n"); g_failures++; }
+
+        /* error path A: not a dict → TypeError before the carrier is built */
+        PyObject *bad1 = Py_BuildValue("(i)", 123);
+        r = PyObject_CallObject(take, bad1);
+        if (r) { fprintf(stderr, "FAIL: take(123) did not raise\n"); g_failures++; }
+        Py_XDECREF(r); Py_DECREF(bad1); PyErr_Clear();
+        PyGC_Collect();
+        if (__lsan_do_recoverable_leak_check()) { fprintf(stderr, "LEAK after take(123)\n"); g_failures++; }
+
+        /* error path B: bad value → PyFloat_AsDouble fails mid-build → guard frees
+         * the partially-built carrier (keys[0..i], keys, vals) */
+        PyObject *bad2 = Py_BuildValue("({s:d,s:s})", "a", 1.0, "b", "oops");
+        r = PyObject_CallObject(take, bad2);
+        if (r) { fprintf(stderr, "FAIL: take({bad value}) did not raise\n"); g_failures++; }
+        Py_XDECREF(r); Py_DECREF(bad2); PyErr_Clear();
+        PyGC_Collect();
+        if (__lsan_do_recoverable_leak_check()) { fprintf(stderr, "LEAK after take({bad})\n"); g_failures++; }
+
+        Py_DECREF(take);
+    }
 
     if (g_failures == 0) fprintf(stderr, "ASAN_GLUE_OK\n");
     /* _exit skips the at-exit LSan sweep (which would flag benign, still-reachable

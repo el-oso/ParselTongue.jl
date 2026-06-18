@@ -21,9 +21,16 @@ struct ArgPlan
     addrs::Vector{String}    # address expressions for ParseTuple
     setup::Vector{String}    # runs after ParseTuple, before the call (e.g. GetBuffer)
     callarg::String          # expression passed to the juliac function
-    cleanup::Vector{String}  # runs after the call (e.g. PyBuffer_Release)
+    cleanup::Vector{String}  # runs after the call on EVERY exit (also inserted into
+                             # later args' error paths) — e.g. PyBuffer_Release
+    disarm::Vector{String}   # runs ONLY after a successful call, NOT on error paths.
+                             # Used to "disarm" a __cleanup__ guard once ownership of
+                             # the carrier has transferred to the Julia callee (its
+                             # from_c frees it), so the guard does not double-free.
 end
-ArgPlan(decls, fmt, addrs, callarg) = ArgPlan(decls, fmt, addrs, String[], callarg, String[])
+ArgPlan(decls, fmt, addrs, callarg) = ArgPlan(decls, fmt, addrs, String[], callarg, String[], String[])
+ArgPlan(decls, fmt, addrs, setup, callarg, cleanup) =
+    ArgPlan(decls, fmt, addrs, setup, callarg, cleanup, String[])
 
 # How to return a C result of a given carrier as a Python object.
 struct RetPlan
@@ -416,23 +423,28 @@ function _ap_dict(tmp::String, @nospecialize(C::Type))
     klen = string(tmp, "_klen"); ks = string(tmp, "_ks")
     decls = [
         string("PyObject *", obj, " = NULL;"),
-        string(dcn, " ", tmp, " = {NULL, NULL, 0};"),
+        # RAII scope guard (borrowed from Rust, à la the Linux kernel's cleanup.h):
+        # any `return NULL` below auto-frees keys[0..len)/keys/vals via the compiler's
+        # __attribute__((cleanup)), so the construction code stays free of hand-written
+        # cascading frees. Disarmed (see `disarm`) once the Julia callee takes ownership.
+        string("__attribute__((cleanup(_pt_dictguard_", dcn, "))) ", dcn, " ", tmp,
+               " = {NULL, NULL, 0};"),
     ]
     vextract = if vc === Bool
         (string("int _vb_", tmp, " = PyObject_IsTrue(", vv, ");"),
-         string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+         "if (PyErr_Occurred()) return NULL;",
          string(tmp, ".vals[", ii, "] = (bool)_vb_", tmp, ";"))
     elseif cs.ctype in ("float", "double")
         (string("double _vd_", tmp, " = PyFloat_AsDouble(", vv, ");"),
-         string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+         "if (PyErr_Occurred()) return NULL;",
          string(tmp, ".vals[", ii, "] = (", cs.ctype, ")_vd_", tmp, ";"))
     elseif vc in (UInt8, UInt16, UInt32, UInt64)  # unsigned integer
         (string("unsigned long long _vu_", tmp, " = PyLong_AsUnsignedLongLong(", vv, ");"),
-         string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+         "if (PyErr_Occurred()) return NULL;",
          string(tmp, ".vals[", ii, "] = (", cs.ctype, ")_vu_", tmp, ";"))
     else  # signed integer
         (string("long long _vs_", tmp, " = PyLong_AsLongLong(", vv, ");"),
-         string("if (PyErr_Occurred()) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+         "if (PyErr_Occurred()) return NULL;",
          string(tmp, ".vals[", ii, "] = (", cs.ctype, ")_vs_", tmp, ";"))
     end
     setup = String[
@@ -440,22 +452,26 @@ function _ap_dict(tmp::String, @nospecialize(C::Type))
         string("Py_ssize_t ", ni, " = PyDict_Size(", obj, ");"),
         string(tmp, ".keys = (char **)malloc(", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
         string(tmp, ".vals = (", cs.ctype, " *)malloc(", ni, " > 0 ? (size_t)", ni, " * sizeof(", cs.ctype, ") : 1);"),
-        string("if (!", tmp, ".keys || !", tmp, ".vals) { free(", tmp, ".keys); free(", tmp, ".vals); PyErr_NoMemory(); return NULL; }"),
-        string(tmp, ".len = (int64_t)", ni, ";"),
+        string("if (!", tmp, ".keys || !", tmp, ".vals) { PyErr_NoMemory(); return NULL; }"),
+        # memset before setting len so the guard never iterates over uninitialised keys.
         string("memset(", tmp, ".keys, 0, ", ni, " > 0 ? (size_t)", ni, " * sizeof(char *) : 1);"),
+        string(tmp, ".len = (int64_t)", ni, ";"),
         string("{ PyObject *", kv, ", *", vv, "; Py_ssize_t ", pos, " = 0, ", ii, " = 0;"),
         string("while (PyDict_Next(", obj, ", &", pos, ", &", kv, ", &", vv, ")) {"),
         string("    Py_ssize_t ", klen, "; const char *", ks, " = PyUnicode_AsUTF8AndSize(", kv, ", &", klen, ");"),
-        string("    if (!", ks, ") { for (Py_ssize_t _fi = 0; _fi < ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); return NULL; }"),
+        string("    if (!", ks, ") return NULL;"),
         string("    ", tmp, ".keys[", ii, "] = (char *)malloc((size_t)(", klen, " + 1));"),
-        string("    if (!", tmp, ".keys[", ii, "]) { for (Py_ssize_t _fi = 0; _fi <= ", ii, "; _fi++) free(", tmp, ".keys[_fi]); free(", tmp, ".keys); free(", tmp, ".vals); PyErr_NoMemory(); return NULL; }"),
+        string("    if (!", tmp, ".keys[", ii, "]) { PyErr_NoMemory(); return NULL; }"),
         string("    memcpy(", tmp, ".keys[", ii, "], ", ks, ", (size_t)(", klen, " + 1));"),
         vextract[1], vextract[2], vextract[3],
         string("    ", ii, "++;"),
         "} }",
     ]
-    # No cleanup needed: Julia's from_c frees keys, vals, and each key string.
-    ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[])
+    # On success Julia's from_c takes ownership and frees keys/vals/strings, so disarm
+    # the scope guard after the call. Error paths (incl. a later arg failing before the
+    # call) still hit the guard, which frees the carrier — no cleanup field needed.
+    disarm = [string(tmp, ".keys = NULL; ", tmp, ".vals = NULL; ", tmp, ".len = 0;")]
+    ArgPlan(decls, "O", [string("&", obj)], setup, tmp, String[], disarm)
 end
 
 function _ap_pycallable(tmp::String)
@@ -831,6 +847,9 @@ function _wrapper_fn_varargs(e::PtExport; errors::Vector{PtError}=PtError[], abi
         println(io, "    r = ", call_expr, ";")
         println(io, "    Py_END_ALLOW_THREADS")
     end
+    # Disarm ownership-transfer scope guards now the call has consumed the carriers.
+    for plan in fixed_plans, s in plan.disarm; println(io, "    ", s); end
+    for plan in kw_plans, s in plan.disarm; println(io, "    ", s); end
     for s in all_cleanups; println(io, "    ", s); end
     println(io, "    free(_va_data);")
     println(io, "    if (_pt_err) {")
@@ -871,6 +890,7 @@ function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=
     kwnames = String[]
     per_arg_setups   = Vector{String}[]
     per_arg_cleanups = Vector{String}[]
+    disarms = String[]   # post-call-only (RAII guard ownership transfer); see ArgPlan
     for (i, a) in enumerate(e.args)
         logical = a.jl_type <: AbstractArray && !(a.jl_type <: Array)
         plan = _arg_plan(c_abi_type(a.jl_type), i; logical, mutable=a.mutable,
@@ -884,6 +904,7 @@ function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=
         append!(addrs, plan.addrs); append!(cleanups, plan.cleanup)
         push!(per_arg_setups, plan.setup)
         push!(per_arg_cleanups, plan.cleanup)
+        append!(disarms, plan.disarm)
         push!(callargs, plan.callarg)
         push!(kwnames, string(a.name))
     end
@@ -927,6 +948,8 @@ function _wrapper_fn(e::PtExport; errors::Vector{PtError}=PtError[], abi3::Bool=
         println(io, "    r = ", call_expr, ";")
         println(io, "    Py_END_ALLOW_THREADS")
     end
+    # Disarm ownership-transfer scope guards now the call has consumed the carriers.
+    for s in disarms; println(io, "    ", s); end
     for s in cleanups; println(io, "    ", s); end
     println(io, "    if (_pt_err) {")
     println(io, "        const char *_msg = _pt_errmsg ? _pt_errmsg : \"Julia exception\";")
@@ -1004,8 +1027,17 @@ function _dict_structs(carriers)
         if isdict(C) && C ∉ seen
             push!(seen, C)
             vc = _dict_val_c(C)
-            push!(out, string("typedef struct { char **keys; ", _c_ctype(vc),
-                              " *vals; int64_t len; } ", _dict_structname(C), ";"))
+            dcn = _dict_structname(C)
+            # typedef immediately followed by its scope-guard cleanup (Rust-style RAII
+            # via __attribute__((cleanup))) for a dict *argument* carrier: frees
+            # keys[0..len), keys, and vals. Safe at any point during construction —
+            # unfilled key slots are memset to NULL and free(NULL) is a no-op; len is 0
+            # until both arrays are allocated. The arg path disarms this (NULLs the
+            # fields) once the Julia callee takes ownership of the carrier.
+            push!(out, string(
+                "typedef struct { char **keys; ", _c_ctype(vc), " *vals; int64_t len; } ", dcn, ";\n",
+                "static void _pt_dictguard_", dcn, "(void *_p) { ", dcn, " *_d = (", dcn,
+                " *)_p; if (_d->keys) { for (int64_t _i = 0; _i < _d->len; _i++) free(_d->keys[_i]); free(_d->keys); } free(_d->vals); }"))
         end
     end
     sort!(out)

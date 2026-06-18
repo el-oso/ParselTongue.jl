@@ -149,6 +149,28 @@ method (`PtNamedMethod`, `_NAMED_METHODS`). `is_numeric_binary`/`is_numeric_refl
 return, named-method args) reference them; the carrier set is collected from exports **and**
 method/`__new__`/property/named-method signatures via `_carrier_set`.
 
+### RAII scope guards in the generated C (`__attribute__((cleanup))`)
+
+Generated wrappers acquire heap resources in `ArgPlan.setup` and historically unwound them by
+hand on every `return NULL` (via `_insert_cleanup_before_return`), the error-prone pattern that
+caused the A1/A2 leak fixes. **Newer arg paths instead use compiler scope guards** — the technique
+the Linux kernel borrowed from Rust (`cleanup.h`). Implemented for **dict arguments** (`_ap_dict`,
+POC): the carrier is declared `__attribute__((cleanup(_pt_dictguard_<C>)))`, so the compiler frees
+`keys`/`vals` on *any* scope exit; the setup code is plain `return NULL` with no manual frees, and
+the per-carrier `_pt_dictguard_*` helper is emitted next to the typedef in `_dict_structs`.
+
+Because `from_c` inside the Julia callee takes ownership of the dict on the **success** path, the
+guard is **disarmed** right after the call (NULL the carrier fields) via the new `ArgPlan.disarm`
+field — statements that run *only* post-call, never on error paths (unlike `ArgPlan.cleanup`,
+which is also inserted into later args' error paths). Both `_wrapper_fn` and `_wrapper_fn_varargs`
+emit `disarm` immediately after `Py_END_ALLOW_THREADS`. This is Rust's "borrow checker, pass it to
+the owner" idiom: the guard covers every error path (including a *later* arg failing before the
+call — a latent leak the old empty-`cleanup` dict path had), and the disarm prevents a double-free
+once ownership transfers. Compiler support: gcc/clang/MinGW (all supported targets; MSVC is not).
+The dict-argument path is exercised under ASan/LSan by `test/asan/` (the `take` fixture + driver).
+Extending this to the other always-release carriers (buffer/strarray/PyCallable) would let
+`_insert_cleanup_before_return` be retired.
+
 ### Python subclassing (`subclass=` / `dict=`, PyO3-style opt-in flags)
 
 `@pyhandle T subclass=true` / `@pymutable T subclass=true` add `Py_TPFLAGS_BASETYPE` and a
