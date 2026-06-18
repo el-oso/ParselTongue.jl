@@ -296,4 +296,25 @@ _no_refleak(feature.sum_f64, array.array("d", [1.0, 2.0, 3.0]))  # buffer arg
 _no_refleak(feature.join_words, ["a", "b", "c"])                 # list[str] arg
 _no_refleak(feature.words, "alpha beta gamma")                   # list[str] return
 _no_refleak(feature.apply, (lambda x: x * 2.0), 4.0)             # PyCallable INCREF/DECREF
+# Error-path refleak gate: when the Python callable RAISES, the call operator must
+# still drop the args tuple, the (null) result, and the GIL on the exception path.
+# A leak here would grow the argument refcounts and eventually deadlock the GIL.
+def _no_refleak_raises(fn, *args, n=2000):
+    def _boom(*_a, **_k):
+        raise ValueError("boom")
+    call_args = (_boom,) + args
+    try:
+        fn(*call_args)
+    except Exception:
+        pass
+    base = [sys.getrefcount(a) for a in call_args]
+    for _ in range(n):
+        try:
+            fn(*call_args)
+        except Exception:
+            pass
+    _gc.collect()
+    after = [sys.getrefcount(a) for a in call_args]
+    assert after == base, f"error-path refcount leak in {fn}: {base} -> {after}"
+_no_refleak_raises(feature.apply, 4.0)          # raising PyCallable: args/GIL freed on throw
 print("FEATURE_OK")

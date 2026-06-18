@@ -827,54 +827,56 @@ end
 # The generated body contains only ccalls and concrete _py_box/_py_unbox dispatch,
 # so --trim=safe accepts it. The C shim released the GIL before calling Julia, so
 # we re-acquire it here via PyGILState_Ensure.
+#
+# All resource release lives in a single `try/finally`: the GIL, the argument
+# tuple, and the call result are dropped on EVERY exit — including the exception
+# paths `convert(Ti, …)` (InexactError) and `_py_unbox(Ret, …)` (allocating
+# returns) — which the previous hand-written per-path releases skipped, leaking
+# the GIL (a process-wide hazard) and Python references. This is the Julia-side
+# analogue of the `__attribute__((cleanup))` scope guards in the C shim.
 @generated function (f::PyCallable{Args,Ret})(args...) where {Args,Ret}
     argtypes = (Args.parameters...,)
     nargs    = length(argtypes)
     if length(args) != nargs
+        # Arity is decided before the GIL is acquired, so no cleanup is needed.
         return :(error(string("PyCallable: expected ", $nargs, " argument(s), got ", $(length(args)))))
     end
-    body = Expr(:block)
-    push!(body.args, :(gstate = ccall(:PyGILState_Ensure, Int32, ())))
-    push!(body.args, :(args_tup = ccall(:PyTuple_New, Ptr{Cvoid}, (Int,), $nargs)))
-    push!(body.args, quote
-        if args_tup == Ptr{Cvoid}(0)
-            ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-            error("PyCallable: failed to build args tuple")
-        end
-    end)
+    boxsteps = Expr(:block)
     for i in 1:nargs
         Ti = argtypes[i]
-        push!(body.args, quote
+        push!(boxsteps.args, quote
             local item = _py_box(convert($Ti, args[$i]))
-            if item == Ptr{Cvoid}(0)
-                ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), args_tup)
-                ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-                error("PyCallable: failed to box argument")
-            end
+            item == Ptr{Cvoid}(0) && error("PyCallable: failed to box argument")
             # PyTuple_SetItem steals the reference to `item`.
             ccall(:PyTuple_SetItem, Int32, (Ptr{Cvoid}, Int, Ptr{Cvoid}), args_tup, $(i - 1), item)
         end)
     end
-    push!(body.args, quote
-        local result = ccall(:PyObject_Call, Ptr{Cvoid},
-                             (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}), f.ptr, args_tup, Ptr{Cvoid}(0))
-        ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), args_tup)
-        if result == Ptr{Cvoid}(0)
-            ccall(:PyErr_Clear, Cvoid, ())
+    return quote
+        local args_tup::Ptr{Cvoid} = Ptr{Cvoid}(0)
+        local result::Ptr{Cvoid}   = Ptr{Cvoid}(0)
+        local gstate = ccall(:PyGILState_Ensure, Int32, ())
+        try
+            args_tup = ccall(:PyTuple_New, Ptr{Cvoid}, (Int,), $nargs)
+            args_tup == Ptr{Cvoid}(0) && error("PyCallable: failed to build args tuple")
+            $boxsteps
+            result = ccall(:PyObject_Call, Ptr{Cvoid},
+                           (Ptr{Cvoid}, Ptr{Cvoid}, Ptr{Cvoid}), f.ptr, args_tup, Ptr{Cvoid}(0))
+            if result == Ptr{Cvoid}(0)
+                ccall(:PyErr_Clear, Cvoid, ())
+                error("PyCallable: Python callable raised an exception")
+            end
+            local r = _py_unbox($Ret, result)
+            if ccall(:PyErr_Occurred, Ptr{Cvoid}, ()) != C_NULL
+                ccall(:PyErr_Clear, Cvoid, ())
+                error("PyCallable: Python callable returned an incompatible value")
+            end
+            return r
+        finally
+            result   == Ptr{Cvoid}(0) || ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), result)
+            args_tup == Ptr{Cvoid}(0) || ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), args_tup)
             ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-            error("PyCallable: Python callable raised an exception")
         end
-        local r = _py_unbox($Ret, result)
-        ccall(:Py_DecRef, Cvoid, (Ptr{Cvoid},), result)
-        if ccall(:PyErr_Occurred, Ptr{Cvoid}, ()) != C_NULL
-            ccall(:PyErr_Clear, Cvoid, ())
-            ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-            error("PyCallable: Python callable returned an incompatible value")
-        end
-        ccall(:PyGILState_Release, Cvoid, (Int32,), gstate)
-        return r
-    end)
-    return body
+    end
 end
 
 # ── Boundary validation (build host) ──────────────────────────────────

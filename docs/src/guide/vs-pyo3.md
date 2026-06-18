@@ -280,6 +280,32 @@ When calling back into Python from Julia (via `PyCallable`), the GIL is
 re-acquired with `PyGILState_Ensure` / `PyGILState_Release`, exactly as PyO3
 does via `Python::with_gil`.
 
+The interesting comparison is *how each guarantees the GIL is released — and the
+temporary Python references dropped — on every exit path, including errors.* This
+is where Rust's safety story is strongest:
+
+- **PyO3** leans on the type system. `Python::with_gil(|py| …)` releases the GIL
+  when the closure's scope ends, and the `Bound<'py, PyAny>` / `Py<T>` smart
+  pointers `Drop` their references automatically. Combined with `PyResult<T>` and
+  the `?` operator, an early return on error *cannot* skip cleanup — the borrow
+  checker and `Drop` enforce it at compile time.
+- **ParselTongue** has no `Drop`, so the call operator wraps the whole callback in
+  a single `try/finally`: the GIL, the argument tuple, and the call result are
+  released in the `finally`, so they are dropped on success, on a Python-side
+  exception, *and* on a Julia-side throw (e.g. an `InexactError` while marshalling
+  an argument). This is the Julia analogue of the `__attribute__((cleanup))`
+  scope guards ParselTongue already uses in its generated C shim — the same
+  "release on scope exit" idiom Rust gets from `Drop`.
+
+We evaluated adopting Rust-style `Result`/`Option` (via
+[ErrorTypes.jl](https://github.com/jakobnissen/ErrorTypes.jl)) to mirror PyO3's
+`PyResult` more literally. The conclusion: `Result` models *return-value* failures,
+but the resource-safety guarantee here is a *cleanup* concern — in Rust it comes
+from `Drop`, not from `Result`, and Julia's `Drop`-analogue is `try/finally`. And
+without Rust's `#[must_use]`, a Julia `Result` can be silently dropped, so it adds
+no compile-time enforcement. `try/finally` is therefore both the simpler and the
+more honest mapping of PyO3's RAII model onto Julia.
+
 ## Python callables as arguments
 
 **PyO3** accepts arbitrary Python callables via `Py<PyAny>` and can call them
@@ -313,8 +339,10 @@ mymod.combine(lambda a, b: a + b, 3, 4)     # 7
 ```
 
 Internally, `f(a, b, …)` re-acquires the GIL and calls `PyObject_Call` through a
-chain of `ccall`s emitted by a `@generated` method — one straight-line, trim-safe
-body per concrete signature. Supported argument/return scalar types: `Int8`–`Int64`,
+chain of `ccall`s emitted by a `@generated` method — one trim-safe body per
+concrete signature, wrapped in a single `try/finally` that drops the GIL and every
+temporary reference on all exit paths (see *GIL management* above). Supported
+argument/return scalar types: `Int8`–`Int64`,
 `UInt8`–`UInt64`, `Bool`, `Float32`, `Float64`. Array/string/object arguments and
 returns to/from the callback are not yet supported.
 
