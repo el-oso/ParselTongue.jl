@@ -1,6 +1,7 @@
 # ParselTongue.jl
 
 [![CI](https://github.com/el-oso/ParselTongue.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/el-oso/ParselTongue.jl/actions/workflows/ci.yml)
+[![Coverage](https://coveralls.io/repos/github/el-oso/ParselTongue.jl/badge.svg?branch=master)](https://coveralls.io/github/el-oso/ParselTongue.jl?branch=master)
 [![Docs (stable)](https://github.com/el-oso/ParselTongue.jl/actions/workflows/Documentation.yml/badge.svg)](https://el-oso.github.io/ParselTongue.jl/stable/)
 [![Docs (dev)](https://img.shields.io/badge/docs-dev-blue.svg)](https://el-oso.github.io/ParselTongue.jl/dev/)
 [![Julia](https://img.shields.io/badge/Julia-%E2%89%A5%201.12-9558B2.svg?logo=julia&logoColor=white)](https://julialang.org)

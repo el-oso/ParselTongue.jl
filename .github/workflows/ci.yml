@@ -62,12 +62,22 @@ jobs:
       # Run the fast build-free unit tests first for quick feedback.
       # If these fail, the integration build step below is skipped automatically.
       - name: Unit tests (boundary types, macros, codegen — no build tools needed)
-        run: julia --project=. test/test_m2_boundary_macros.jl
+        run: julia --project=. --code-coverage=user test/test_m2_boundary_macros.jl
 
       # Full integration: juliac --trim build + Python import in a subprocess.
       # Skips gracefully when juliac / python3 / cc are unavailable (see _have_tools).
       - name: Integration tests (juliac build + Python import)
-        run: julia --project=. test/test_integration.jl
+        run: julia --project=. --code-coverage=user test/test_integration.jl
+      - uses: julia-actions/julia-processcoverage@v1
+        if: matrix.os == 'ubuntu-latest'
+      - name: Upload coverage to Coveralls
+        if: matrix.os == 'ubuntu-latest'
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          file: lcov.info
+          format: lcov
+          fail-on-error: false
 
   # Doctest gate: runs only the docstring doctests via Documenter.doctest — no
   # page build, no Vitepress/npm, no deploy. OS-independent, so a single runner.
